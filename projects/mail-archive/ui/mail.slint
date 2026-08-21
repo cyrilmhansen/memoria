@@ -9,8 +9,31 @@ struct SearchRow {
     attachment: string,
 }
 
+struct AttachmentRow {
+    id: int,
+    name: string,
+    mime: string,
+    size: string,
+    previewable: bool,
+}
+
+struct UiText {
+    window-title: string,
+    main-accessible: string,
+    file: string, new-archive: string, open-archive: string, recent-archives: string, quit: string,
+    archive: string, archive-state: string, sync-now: string, syncing: string, add-gmail: string, back-search: string,
+    search-menu: string, focus-search: string, clear-search: string, view: string, zoom-out: string, zoom-reset: string, zoom-in: string, help: string, about: string,
+    archive-choice: string, setup-description: string, create-archive: string, archive-sync: string, local-archive: string, gmail-source: string, add-account: string,
+    search-placeholder: string, search-accessible: string, clear: string, filters: string, filters-accessible: string,
+    from-placeholder: string, from-accessible: string, to-placeholder: string, to-accessible: string, since-placeholder: string, since-accessible: string, until-placeholder: string, until-accessible: string,
+    attachment-filter-prefix: string, attachment-filter-accessible: string, mime-placeholder: string, mime-accessible: string, reset-filters: string, labels-prefix: string, empty-search: string, results-accessible: string,
+    reader-accessible: string, select-message: string, open-html: string, reduce-zoom: string, reset-zoom: string, increase-zoom: string, body-placeholder: string,
+    attachment-accessible-prefix: string, preview: string, open: string, save-as: string, preview-accessible-prefix: string, preview-region-prefix: string, close: string,
+}
+
 export component MailWindow inherits Window {
-    title: "Memoria — Archive";
+    in property <UiText> texts;
+    title: root.texts.window-title;
     preferred-width: 1200px;
     preferred-height: 760px;
     min-width: 760px;
@@ -25,7 +48,9 @@ export component MailWindow inherits Window {
     in property <string> message-to;
     in property <string> message-subject;
     in property <string> message-body;
+    in property <bool> html-available: false;
     in property <string> message-attachments;
+    in property <[AttachmentRow]> attachment-rows;
     in property <string> message-zoom-label: "100 %";
     in property <length> message-font-size: 14px;
     in property <string> status: "Prêt";
@@ -41,7 +66,25 @@ export component MailWindow inherits Window {
     in property <string> archive-index: "Index non construit";
     in property <string> source-status: "Source Gmail non configurée";
     in property <string> sync-progress: "";
+    in property <int> sync-current: 0;
+    in property <int> sync-total: -1;
+    in property <float> sync-fraction: 0.0;
+    in property <bool> sync-determinate: false;
+    in property <bool> filters-open: false;
+    in-out property <string> from-filter;
+    in-out property <string> to-filter;
+    in-out property <string> date-from-filter;
+    in-out property <string> date-to-filter;
+    in property <string> attachment-filter: "Toutes";
+    in property <string> attachment-filter-label: "Toutes";
+    in-out property <string> attachment-mime-filter;
+    in property <[string]> label-options;
+    in property <int> active-filter-count: 0;
     in property <string> setup-status: "Choisissez une archive pour commencer.";
+    in property <bool> preview-visible: false;
+    in property <image> preview-image;
+    in property <string> preview-title;
+    in property <string> preview-status;
     in-out property <string> query;
 
     callback search-changed(string);
@@ -58,9 +101,19 @@ export component MailWindow inherits Window {
     callback create-archive-requested();
     callback add-source-requested();
     callback quit-requested();
+    callback open-attachment(int);
+    callback save-attachment(int);
+    callback open-html();
+    callback preview-attachment(int);
+    callback close-preview();
+    callback toggle-filters();
+    callback filters-changed();
+    callback reset-filters();
+    callback cycle-attachment-filter();
+    callback toggle-label(int);
 
     accessible-role: AccessibleRole.main;
-    accessible-label: "Recherche dans l’archive de messages";
+    accessible-label: root.texts.main-accessible;
 
     init => { search_field.focus(); }
 
@@ -79,57 +132,57 @@ export component MailWindow inherits Window {
 
     MenuBar {
         Menu {
-            title: "Fichier";
-            MenuItem { title: "Nouvelle archive…"; activated => { root.create-archive-requested(); } }
-            MenuItem { title: "Ouvrir une archive…"; activated => { root.open-archive-requested(); } }
-            MenuItem { title: "Archives récentes"; activated => { root.open-archive-requested(); } }
+            title: root.texts.file;
+            MenuItem { title: root.texts.new-archive; activated => { root.create-archive-requested(); } }
+            MenuItem { title: root.texts.open-archive; activated => { root.open-archive-requested(); } }
+            MenuItem { title: root.texts.recent-archives; activated => { root.open-archive-requested(); } }
             MenuSeparator { }
-            MenuItem { title: "Quitter"; activated => { root.quit-requested(); } }
+            MenuItem { title: root.texts.quit; activated => { root.quit-requested(); } }
         }
         Menu {
-            title: "Archive";
+            title: root.texts.archive;
             MenuItem {
-                title: "État de l’archive…";
+                title: root.texts.archive-state;
                 activated => { root.show-archive(); }
             }
             MenuItem {
-                title: "Synchroniser maintenant";
+                title: root.texts.sync-now;
                 enabled: root.source-configured && !root.syncing;
                 activated => { root.sync-requested(); }
             }
             MenuItem {
-                title: "Ajouter/configurer une source Gmail…";
+                title: root.texts.add-gmail;
                 enabled: !root.syncing;
                 activated => { root.add-source-requested(); }
             }
             MenuItem {
-                title: "Retour à la recherche";
+                title: root.texts.back-search;
                 enabled: root.archive-view;
                 activated => { root.show-search(); }
             }
         }
         Menu {
-            title: "Recherche";
+            title: root.texts.search-menu;
             MenuItem {
-                title: "Focus recherche";
+                title: root.texts.focus-search;
                 shortcut: @keys(Control + F);
                 activated => { search_field.focus(); }
             }
             MenuItem {
-                title: "Effacer la recherche";
+                title: root.texts.clear-search;
                 shortcut: @keys(Control + Backspace);
                 activated => { root.clear-search(); search_field.text = ""; search_field.focus(); }
             }
         }
         Menu {
-            title: "Affichage";
-            MenuItem { title: "Réduire le zoom du message"; enabled: false; }
-            MenuItem { title: "Réinitialiser le zoom du message"; enabled: false; }
-            MenuItem { title: "Augmenter le zoom du message"; enabled: false; }
+            title: root.texts.view;
+            MenuItem { title: root.texts.zoom-out; enabled: false; }
+            MenuItem { title: root.texts.zoom-reset; enabled: false; }
+            MenuItem { title: root.texts.zoom-in; enabled: false; }
         }
         Menu {
-            title: "Aide";
-            MenuItem { title: "À propos de Memoria"; enabled: false; }
+            title: root.texts.help;
+            MenuItem { title: root.texts.about; enabled: false; }
         }
     }
 
@@ -140,7 +193,7 @@ export component MailWindow inherits Window {
         height: parent.height;
         background: #f5f6f8;
         accessible-role: AccessibleRole.region;
-        accessible-label: "Choix de l’archive";
+        accessible-label: root.texts.archive-choice;
         VerticalBox {
             width: min(parent.width - 80px, 560px);
             x: (parent.width - self.width) / 2;
@@ -148,7 +201,7 @@ export component MailWindow inherits Window {
             spacing: 14px;
             Text { text: "Memoria"; color: #202633; font-size: 28px; }
             Text {
-                text: "Ouvrez une archive existante ou créez-en une nouvelle.";
+                text: root.texts.setup-description;
                 color: #667085;
                 wrap: word-wrap;
             }
@@ -156,13 +209,13 @@ export component MailWindow inherits Window {
             HorizontalBox {
                 spacing: 12px;
                 Button {
-                    text: "Ouvrir une archive…";
-                    accessible-label: "Ouvrir une archive";
+                    text: root.texts.open-archive;
+                    accessible-label: root.texts.open-archive;
                     clicked => { root.open-archive-requested(); }
                 }
                 Button {
-                    text: "Créer une archive…";
-                    accessible-label: "Créer une archive";
+                    text: root.texts.create-archive;
+                    accessible-label: root.texts.create-archive;
                     clicked => { root.create-archive-requested(); }
                 }
             }
@@ -176,12 +229,12 @@ export component MailWindow inherits Window {
         height: parent.height;
         background: #f5f6f8;
         accessible-role: AccessibleRole.region;
-        accessible-label: "Archive et synchronisation";
+        accessible-label: root.texts.archive-sync;
         VerticalBox {
             padding: 28px;
             spacing: 18px;
             Text {
-                text: "Archive / Synchronisation";
+                text: root.texts.archive-sync;
                 color: #202633;
                 font-size: 24px;
                 vertical-alignment: center;
@@ -197,7 +250,7 @@ export component MailWindow inherits Window {
                     VerticalBox {
                         padding: 18px;
                         spacing: 10px;
-                        Text { text: "Archive locale"; color: #202633; font-size: 17px; }
+                        Text { text: root.texts.local-archive; color: #202633; font-size: 17px; }
                         Text { text: root.archive-message-count; color: #344054; }
                         Text { text: root.archive-size; color: #344054; }
                         Text { text: root.archive-segments; color: #344054; }
@@ -214,7 +267,7 @@ export component MailWindow inherits Window {
                     VerticalBox {
                         padding: 18px;
                         spacing: 10px;
-                        Text { text: "Source Gmail"; color: #202633; font-size: 17px; }
+                        Text { text: root.texts.gmail-source; color: #202633; font-size: 17px; }
                         Text {
                             text: root.source-status;
                             color: root.source-configured ? #344054 : #9a3412;
@@ -225,15 +278,26 @@ export component MailWindow inherits Window {
                             color: #667085;
                             wrap: word-wrap;
                         }
+                        Rectangle {
+                            height: 8px;
+                            background: #e5e7eb;
+                            border-radius: 4px;
+                            Rectangle {
+                                width: root.sync-determinate ? parent.width * root.sync-fraction : (root.syncing ? parent.width * 0.35 : 0px);
+                                height: parent.height;
+                                background: #0f766e;
+                                border-radius: 4px;
+                            }
+                        }
                         if !root.source-configured: Button {
-                            text: "Ajouter un compte Gmail…";
-                            accessible-label: "Ajouter ou configurer une source Gmail";
+                            text: root.texts.add-account;
+                            accessible-label: root.texts.add-gmail;
                             clicked => { root.add-source-requested(); }
                         }
                         Button {
-                            text: root.syncing ? "Synchronisation…" : "Synchroniser maintenant";
+                            text: root.syncing ? root.texts.syncing : root.texts.sync-now;
                             enabled: root.source-configured && !root.syncing;
-                            accessible-label: "Synchroniser maintenant avec Gmail";
+                            accessible-label: root.texts.sync-now;
                             clicked => { root.sync-requested(); }
                         }
                     }
@@ -249,7 +313,9 @@ export component MailWindow inherits Window {
         visible: !root.archive-view && !root.setup-view;
         capture-key-pressed(event) => {
             if event.text == Key.Escape {
-                if root.message-subject != "" {
+                if root.preview-visible {
+                    root.close-preview();
+                } else if root.message-subject != "" {
                     result_scope.focus();
                 } else {
                     root.clear-search();
@@ -322,7 +388,7 @@ export component MailWindow inherits Window {
             HorizontalBox {
                 height: 44px;
                 Text {
-                    text: "Memoria";
+                    text: root.texts.window-title;
                     color: #202633;
                     font-size: 22px;
                     vertical-alignment: center;
@@ -332,15 +398,91 @@ export component MailWindow inherits Window {
                     horizontal-stretch: 1;
                     height: 36px;
                     text: root.query;
-                    placeholder-text: "Rechercher dans les messages…";
-                    accessible-label: "Recherche dans les messages";
+                    placeholder-text: root.texts.search-placeholder;
+                    accessible-label: root.texts.search-accessible;
                     edited(text) => { root.query = text; root.search-changed(text); }
                     accepted => { root.search-submitted(self.text); }
                 }
                 Button {
-                    text: "Effacer";
-                    accessible-label: "Effacer la recherche";
+                    text: root.texts.clear;
+                    accessible-label: root.texts.clear-search;
                     clicked => { root.clear-search(); search_field.text = ""; search_field.focus(); }
+                }
+                Button {
+                    text: root.filters-open ? root.texts.filters + " ▲" : (root.active-filter-count > 0 ? root.texts.filters + " (" + root.active-filter-count + ")" : root.texts.filters);
+                    accessible-label: root.texts.filters-accessible;
+                    clicked => { root.toggle-filters(); }
+                }
+            }
+
+            if root.filters-open: Rectangle {
+                height: 118px;
+                background: #eef1f5;
+                border-width: 1px;
+                border-color: #d9dde5;
+                border-radius: 5px;
+                VerticalBox {
+                    padding: 8px;
+                    spacing: 5px;
+                    HorizontalBox {
+                        spacing: 6px;
+                        LineEdit {
+                            horizontal-stretch: 1;
+                            text: root.from-filter;
+                            placeholder-text: root.texts.from-placeholder;
+                            accessible-label: root.texts.from-accessible;
+                            edited(text) => { root.from-filter = text; root.filters-changed(); }
+                        }
+                        LineEdit {
+                            horizontal-stretch: 1;
+                            text: root.to-filter;
+                            placeholder-text: root.texts.to-placeholder;
+                            accessible-label: root.texts.to-accessible;
+                            edited(text) => { root.to-filter = text; root.filters-changed(); }
+                        }
+                        LineEdit {
+                            horizontal-stretch: 1;
+                            text: root.date-from-filter;
+                            placeholder-text: root.texts.since-placeholder;
+                            accessible-label: root.texts.since-accessible;
+                            edited(text) => { root.date-from-filter = text; root.filters-changed(); }
+                        }
+                        LineEdit {
+                            horizontal-stretch: 1;
+                            text: root.date-to-filter;
+                            placeholder-text: root.texts.until-placeholder;
+                            accessible-label: root.texts.until-accessible;
+                            edited(text) => { root.date-to-filter = text; root.filters-changed(); }
+                        }
+                    }
+                    HorizontalBox {
+                        spacing: 6px;
+                        Button {
+                            text: root.texts.attachment-filter-prefix + root.attachment-filter-label;
+                            accessible-label: root.texts.attachment-filter-accessible;
+                            clicked => { root.cycle-attachment-filter(); }
+                        }
+                        LineEdit {
+                            horizontal-stretch: 1;
+                            text: root.attachment-mime-filter;
+                            placeholder-text: root.texts.mime-placeholder;
+                            accessible-label: root.texts.mime-accessible;
+                            edited(text) => { root.attachment-mime-filter = text; root.filters-changed(); }
+                        }
+                        Button {
+                            text: root.texts.reset-filters;
+                            accessible-label: root.texts.reset-filters;
+                            clicked => { root.reset-filters(); }
+                        }
+                    }
+                    HorizontalBox {
+                        spacing: 4px;
+                        Text { text: root.label-options.length > 0 ? root.texts.labels-prefix : ""; color: #667085; vertical-alignment: center; }
+                        for option[index] in root.label-options : Button {
+                            text: option;
+                            clicked => { root.toggle-label(index); }
+                        }
+                    }
                 }
             }
 
@@ -362,18 +504,18 @@ export component MailWindow inherits Window {
                         border-color: #d9dde5;
                         border-radius: 6px;
                         Text {
-                            text: root.results.length == 0 ? "Saisissez une recherche pour afficher les messages." : "";
+                            text: root.results.length == 0 ? root.texts.empty-search : "";
                             color: #667085;
                             horizontal-alignment: center;
                             vertical-alignment: center;
                             width: parent.width;
-                            accessible-label: "Aucun résultat. Saisissez une recherche pour afficher les messages.";
+                            accessible-label: root.texts.empty-search;
                         }
                         result_scope := FocusScope {
                             width: parent.width;
                             height: parent.height;
                             results_view := ListView {
-                            accessible-label: "Liste des résultats de recherche";
+                            accessible-label: root.texts.results-accessible;
                             for row[index] in root.results : Rectangle {
                                 width: parent.width;
                                 height: 82px;
@@ -420,31 +562,37 @@ export component MailWindow inherits Window {
                     border-color: #d9dde5;
                     border-radius: 6px;
                     accessible-role: AccessibleRole.region;
-                    accessible-label: "Panneau de lecture du message";
+                    accessible-label: root.texts.reader-accessible;
                     VerticalBox {
                         padding: 18px;
                         spacing: 8px;
                         HorizontalBox {
                             Text {
-                                text: root.message-subject == "" ? "Sélectionnez un message" : root.message-subject;
+                                text: root.message-subject == "" ? root.texts.select-message : root.message-subject;
                                 color: #202633;
                                 font-size: 18px;
                                 wrap: word-wrap;
                                 horizontal-stretch: 1;
                             }
                             Button {
+                                text: root.texts.open-html;
+                                enabled: root.html-available;
+                                accessible-label: "Ouvrir le message HTML dans le navigateur";
+                                clicked => { root.open-html(); }
+                            }
+                            Button {
                                 text: "−";
-                                accessible-label: "Réduire le zoom du message";
+                                accessible-label: root.texts.reduce-zoom;
                                 clicked => { root.zoom-change(-1); }
                             }
                             Button {
                                 text: root.message-zoom-label;
-                                accessible-label: "Réinitialiser le zoom du message";
+                                accessible-label: root.texts.reset-zoom;
                                 clicked => { root.zoom-change(0); }
                             }
                             Button {
                                 text: "+";
-                                accessible-label: "Augmenter le zoom du message";
+                                accessible-label: root.texts.increase-zoom;
                                 clicked => { root.zoom-change(1); }
                             }
                         }
@@ -452,11 +600,49 @@ export component MailWindow inherits Window {
                         Text { text: root.message-from; color: #344054; font-size: 12px; overflow: elide; }
                         Text { text: root.message-to; color: #344054; font-size: 12px; overflow: elide; }
                         Text { text: root.message-attachments; color: #667085; font-size: 11px; }
+                        if root.attachment-rows.length > 0: Rectangle {
+                            height: min(112px, 28px + root.attachment-rows.length * 28px);
+                            border-width: 1px;
+                            border-color: #e5e7eb;
+                            border-radius: 4px;
+                            VerticalBox {
+                                padding: 5px;
+                                spacing: 2px;
+                                for attachment[index] in root.attachment-rows : HorizontalBox {
+                                    height: 24px;
+                                    spacing: 6px;
+                                    Text {
+                                        text: attachment.name + " · " + attachment.mime + " · " + attachment.size;
+                                        color: #344054;
+                                        overflow: elide;
+                                        horizontal-stretch: 1;
+                                        vertical-alignment: center;
+                                        accessible-label: root.texts.attachment-accessible-prefix + attachment.name;
+                                    }
+                                    Button {
+                                        text: root.texts.preview;
+                                        enabled: attachment.previewable;
+                                        accessible-label: root.texts.preview-accessible-prefix + attachment.name;
+                                        clicked => { root.preview-attachment(attachment.id); }
+                                    }
+                                    Button {
+                                        text: root.texts.open;
+                                        accessible-label: root.texts.open + " " + root.texts.attachment-accessible-prefix + attachment.name;
+                                        clicked => { root.open-attachment(attachment.id); }
+                                    }
+                                    Button {
+                                        text: root.texts.save-as;
+                                        accessible-label: root.texts.save-as + " " + root.texts.attachment-accessible-prefix + attachment.name;
+                                        clicked => { root.save-attachment(attachment.id); }
+                                    }
+                                }
+                            }
+                        }
                         Rectangle { height: 1px; background: #e5e7eb; }
                         TextEdit {
                             vertical-stretch: 1;
                             read-only: true;
-                            text: root.message-body == "" ? "Le contenu dérivé du message apparaîtra ici." : root.message-body;
+                            text: root.message-body == "" ? root.texts.body-placeholder : root.message-body;
                             font-size: root.message-font-size;
                             wrap: word-wrap;
                             accessible-label: "Corps du message (sélectionnable et copiable)";
@@ -465,6 +651,102 @@ export component MailWindow inherits Window {
                 }
             }
             }
+        }
+    }
+
+    if root.preview-visible: Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        background: #101828cc;
+        accessible-role: AccessibleRole.region;
+        accessible-label: root.texts.preview-region-prefix + root.preview-title;
+        TouchArea {
+            width: parent.width;
+            height: parent.height;
+            clicked => { root.close-preview(); }
+        }
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: min(parent.width - 48px, 980px);
+            height: min(parent.height - 48px, 760px);
+            background: #ffffff;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: #d0d5dd;
+            VerticalBox {
+                padding: 12px;
+                spacing: 8px;
+                HorizontalBox {
+                    height: 32px;
+                    Text {
+                        text: root.preview-title;
+                        font-size: 14px;
+                        color: #202633;
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                    Button {
+                        text: root.texts.close;
+                        accessible-label: root.texts.close;
+                        clicked => { root.close-preview(); }
+                    }
+                }
+                Rectangle {
+                    background: #f2f4f7;
+                    horizontal-stretch: 1;
+                    vertical-stretch: 1;
+                    clip: true;
+                    Image {
+                        source: root.preview-image;
+                        image-fit: ImageFit.contain;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: parent.width;
+                        height: parent.height;
+                    }
+                    if root.preview-status != "": Text {
+                        text: root.preview-status;
+                        color: #667085;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+        // Keep the modal panel interactive while making each surrounding edge
+        // an explicit outside-click target. This is more reliable than a
+        // full-surface TouchArea placed behind the panel on native backends.
+        TouchArea {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: (parent.height - min(parent.height - 48px, 760px)) / 2;
+            clicked => { root.close-preview(); }
+        }
+        TouchArea {
+            x: 0px;
+            y: (parent.height + min(parent.height - 48px, 760px)) / 2;
+            width: parent.width;
+            height: (parent.height - min(parent.height - 48px, 760px)) / 2;
+            clicked => { root.close-preview(); }
+        }
+        TouchArea {
+            x: 0px;
+            y: (parent.height - min(parent.height - 48px, 760px)) / 2;
+            width: (parent.width - min(parent.width - 48px, 980px)) / 2;
+            height: min(parent.height - 48px, 760px);
+            clicked => { root.close-preview(); }
+        }
+        TouchArea {
+            x: (parent.width + min(parent.width - 48px, 980px)) / 2;
+            y: (parent.height - min(parent.height - 48px, 760px)) / 2;
+            width: (parent.width - min(parent.width - 48px, 980px)) / 2;
+            height: min(parent.height - 48px, 760px);
+            clicked => { root.close-preview(); }
         }
     }
 

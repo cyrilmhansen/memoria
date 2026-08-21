@@ -314,3 +314,160 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
 - **Limite :** aucun run GitHub Actions ni test Windows natif n’a encore été
   exécuté depuis cet environnement local.
 - **Détails :** `experiments/2026-08-21-mail-archive-windows-port.md`.
+
+## 2026-08-21 — Memoria : audit ciblé des dépendances
+
+- **Fait vérifié :** Slint est déjà en features explicites sans femtovg ni
+  system-tray ; Reqwest utilise uniquement Rustls ; rfd conserve Wayland et
+  xdg-portal pour les dialogues Linux.
+- **Expérience :** retirer stemmer/stopwords de Tantivy économise environ
+  346 KiB mais ne change pratiquement pas l’index ni les latences ; les
+  defaults sont conservés.
+- **Limite :** `cargo deny` n’est pas installé ; aucun audit advisories/licences
+  n’a été exécuté.
+- **Détails :** `experiments/2026-08-21-mail-archive-dependency-audit.md`.
+
+## 2026-08-21 — Memoria : pièces jointes et progression sync
+
+- **Fait vérifié :** l'ouverture d'une pièce jointe passe maintenant par
+  l'association desktop (`open::that_detached`) ; le test KDE a lancé
+  Gwenview pour une image locale.
+- **Fait vérifié :** les noms réservés Windows avec extension, `COM1..9`,
+  `LPT1..9`, séparateurs et suffixes espace/point sont couverts par des tests.
+- **Fait vérifié :** une full sync émet désormais `examined/total` après une
+  énumération paginée unique ; history reste indéterminé sans second parcours.
+- **Détails :** `experiments/2026-08-21-mail-archive-attachments-ui.md` et
+  `experiments/2026-08-21-mail-archive-sync-progress.md`.
+
+## 2026-08-21 — Mail archive : recherche structurée
+
+- **Fait vérifié :** `SearchRequest` combine texte, expéditeur, destinataire,
+  dates, présence/MIME de pièce jointe et labels directement dans Tantivy,
+  avant la limite de résultats. Les fixtures couvrent aussi une ressource
+  inline/CID exclue des pièces jointes utilisateur.
+- **Fait vérifié :** l’ancien schéma Tantivy est reconstruit depuis RAW +
+  catalogue ; le format RAW et le catalogue ne changent pas. L’index Gmail
+  réel reconstruit fait 11 225 345 octets.
+- **Limite rencontrée :** la tentative de campagne synthétique 1M a saturé le
+  tmpfs ; la mesure 100k a réussi mais ne contient pas une distribution Gmail
+  exploitable pour labels/MIME.
+- **Détails :** `experiments/2026-08-21-mail-archive-advanced-search.md`.
+
+## 2026-08-21 — Campagne recherche structurée 1M
+
+- **Fait vérifié :** un probe dédié génère 1M de messages MIME avec labels,
+  dates pondérées, MIME, pièces jointes et correspondants déterministes, puis
+  mesure le pipeline réel `archive → catalogue → mailparse → Tantivy`.
+- **Incident corrigé :** une adresse complète de correspondant ne répondait
+  pas dans le premier probe ; le workload utilisait un identifiant différent
+  de celui généré. Le filtre adresse est maintenant couvert par fixture et
+  smoke test.
+- **Fait vérifié :** 1M atteint 136,6 MB d’index et environ 1,2 GiB RSS de
+  pointe ; les requêtes combinées restent sous 12,2 ms au p95 dans ce corpus.
+- **Décision :** aucune modification d’architecture Tantivy/SQLite ; le RSS
+  est la prochaine incertitude prioritaire.
+- **Détails :** `experiments/2026-08-21-mail-archive-structured-search-1m.md`.
+
+## 2026-08-21 — Mémoire de reconstruction Tantivy 1M
+
+- **Fait vérifié :** la chronologie instrumentée a isolé la collecte complète
+  de `gmail_catalog_rows` (~259 MiB à 1M) et le vecteur `state_upserts` comme
+  deux matérialisations inutiles.
+- **Correction validée :** le catalogue est parcouru ligne par ligne et les
+  mises à jour de l'état Tantivy sont exécutées dans une transaction bornée.
+  Le schéma RAW/catalogue et les résultats de recherche restent inchangés.
+- **Mesure :** le pic passe d'environ 1 255 920 KiB à 816 236 KiB à 1M ;
+  100k/300k/500k corrigés donnent respectivement 160 844/379 092/667 992
+  KiB. Tantivy reste le principal poste mémoire pendant `add_document` et la
+  fusion.
+- **Détails :** `experiments/2026-08-21-mail-archive-index-memory-1m.md`.
+
+## 2026-08-21 — Réglage IndexWriter Tantivy 1M
+
+- **Fait vérifié :** Tantivy 0.26.1 utilise actuellement 50 000 000 octets,
+  3 workers effectifs sur cette machine et 4 threads de merge par défaut.
+- **Mesure :** 64 MiB et 1 worker augmentent fortement le RSS ; le minimum
+  valide à 3 workers ralentit l'indexation ; 1 merger est pratiquement neutre
+  ; `NoMergePolicy` est défavorable avec 157 segments.
+- **Décision :** conserver le réglage produit dynamique actuel ; aucun
+  changement de budget/concurrence n'est justifié.
+- **Détails :** `experiments/2026-08-21-mail-archive-tantivy-writer-tuning.md`.
+
+## 2026-08-21 — Probe miniature système
+
+- **Action :** création d'un probe isolé Rust Linux/Windows, sans modification
+  de Memoria, puis inventaire et mesure des providers KDE réellement installés.
+- **Résultat :** images, SVG/TGA, vidéo, MP3 avec pochette et ODS réussissent ;
+  PDF est indisponible et certains providers audio/Office échouent proprement.
+  Le cache freedesktop est reconnu au second accès.
+- **À retenir :** l'appel Linux est déjà isolé par provider enfant avec timeout ;
+  un helper supplémentaire reste une option surtout à confirmer pour Windows.
+- **Rapport :** `experiments/2026-08-21-system-thumbnail-service.md`.
+
+## 2026-08-21 — Audit IPC KIO
+
+- **Fait vérifié :** `KIO::PreviewJob` ne fournit pas de service D-Bus public
+  pour les miniatures ; il lance `kioworker` et utilise des sockets Unix
+  privés. Le worker lance ensuite les ThumbnailCreator/providers.
+- **Mesure :** le helper KF6 release fait 122 560 octets, dépend d'environ
+  91 bibliothèques ELF transitives et consomme environ 61 MiB RSS sur le PDF.
+- **Décision :** ne pas créer de client Rust du protocole KIO ; conserver un
+  helper Qt/KF6 séparé comme frontière d'adaptation, avec timeout et option de
+  désactivation.
+- **Rapport :** `experiments/2026-08-21-system-thumbnail-service.md`.
+
+## 2026-08-21 — Correction du probe PDF KDE/KIO
+
+- **Erreur corrigée :** le premier probe avait conclu `PDF unavailable` après
+  avoir sondé uniquement les fichiers freedesktop `.thumbnailer`.
+- **Fait vérifié :** `kdegraphics-thumbnailers` installe
+  `gsthumbnail.so`, qui annonce `application/pdf`; `KIO::PreviewJob` produit
+  une miniature du même fixture PDF et Dolphin remplit son cache.
+- **Isolation observée :** `KIO::PreviewJob` lance `/usr/lib/kf6/kioworker`
+  hors processus, puis le creator PDF lance Ghostscript hors processus.
+- **Décision provisoire :** ordre KDE = KIO puis freedesktop ; `unavailable`
+  seulement après épuisement des deux backends.
+- **Rapport :** `experiments/2026-08-21-system-thumbnail-service.md`.
+## 2026-08-21 — Intégration preview pièces jointes
+
+- Raccordé l'overlay Slint au helper KIO/freedesktop existant, sans Qt/KF6
+  dans Memoria et sans modification du stockage.
+- Ajouté timeout, désactivation explicite, fallback provider et fermeture par
+  Escape/clic extérieur/bouton.
+- Vérifié : `cargo test --workspace`, `cargo check --workspace`, build release
+  Memoria et helper KIO. Une validation interactive image/PDF sur archive réelle
+  reste une étape manuelle, sans contenu à consigner.
+- Validation KDE Wayland effectuée via AT-SPI : un PDF réel a été affiché dans
+  l'overlay après passage KIO ; un défaut de clic extérieur a été corrigé par
+  des zones de hit-testing explicites. La résolution du helper a aussi été
+  durcie : nom d'environnement, voisin de l'exécutable, puis PATH, sans faux
+  positif sur un nom absent.
+
+## 2026-08-21 — HTML dans le navigateur système
+
+- Ajouté un serveur localhost éphémère avec sessions opaques, CSP stricte et
+  routes CID en mémoire ; aucun WebView ni moteur HTML n'est lié à Memoria.
+- `ammonia` nettoie le document avant ouverture explicite dans le navigateur.
+- Fixtures HTML/CID/sécurité et smoke tests sur HTML réel, dont un message avec
+  ressource embarquée, passés sans journaliser le contenu.
+
+## 2026-08-21 — Passe i18n FR/EN et identifiants
+
+- Ajouté le catalogue applicatif `src/i18n.rs`, détection FR/EN et pluriels
+  principaux ; aucune dépendance Cargo supplémentaire.
+- Migré le chrome Slint, menus, filtres et libellés de pièces jointes vers les
+  textes localisés ; les valeurs MIME/Gmail restent stables.
+- Borné les sessions HTML à 8 entrées/10 minutes et renforcé le test CSP.
+- Validations : `cargo test -p mail-archive-experiment`, `cargo check --workspace`.
+- Rapport : `experiments/2026-08-21-mail-archive-i18n-identifiers.md`.
+
+## 2026-08-21 — Audit dépendances, binaire et sécurité
+
+- Capturés `cargo tree`, `cargo tree -d`, `cargo tree -e features`,
+  `cargo bloat`, `ldd` et les métadonnées Cargo du paquet Memoria.
+- `cargo-audit 0.22.2` installé hors dépôt puis exécuté : aucune vulnérabilité
+  connue ; warnings de maintenance et alerte `lru 0.16.4` documentés.
+- Tentative de mise à jour directe vers `lru 0.18.2` refusée par la contrainte
+  `tantivy 0.26.1` (`lru ^0.16.3`) ; aucun changement de dépendance conservé.
+- Binaire release restauré après l’analyse bloat : 31 070 752 octets.
+- Rapport : `experiments/2026-08-21-mail-archive-dependency-security-audit.md`.

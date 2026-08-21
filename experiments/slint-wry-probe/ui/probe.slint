@@ -1,0 +1,48 @@
+import { Button, HorizontalBox, VerticalBox } from "std-widgets.slint";
+
+export component MainWindow inherits Window {
+    title: "Slint + system WebView probe";
+    width: 1000px;
+    height: 640px;
+
+    callback toggle-webview();
+    callback change-document();
+
+    HorizontalBox {
+        spacing: 0px;
+
+        Rectangle {
+            width: parent.width / 2;
+            background: #20252b;
+
+            VerticalBox {
+                padding: 20px;
+                spacing: 12px;
+                Text { text: "Slint fallback"; color: white; font-size: 24px; }
+                Text {
+                    text: "Ce panneau reste disponible si la WebView système ne peut pas être intégrée.";
+                    color: #cbd5e1;
+                    wrap: word-wrap;
+                }
+                Button { text: "Masquer / afficher la WebView"; clicked => { root.toggle-webview(); } }
+                Button { text: "Changer le document local"; clicked => { root.change-document(); } }
+                Rectangle { height: 1px; background: #53606d; }
+                Text {
+                    text: "Le document HTML à droite est local, sans JavaScript ni réseau.";
+                    color: #9ca3af;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        Rectangle {
+            background: #f4f4f4;
+            Text {
+                text: "WebView système indisponible ou non intégrée";
+                color: #7a7a7a;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+}

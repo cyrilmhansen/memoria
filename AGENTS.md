@@ -39,3 +39,8 @@ framework partagé.
 - Après chaque étape significative, laisser le dépôt dans un état compilable.
 - Documenter dans le journal ce qui a été appris, y compris lorsqu'il n'y a
   encore aucune conclusion technique.
+
+Toute nouvelle chaîne visible par l’utilisateur passe par le mécanisme i18n.
+Toute chaîne constituant un identifiant de format, protocole, schéma ou
+configuration reste indépendante de la langue et est centralisée dans son
+module propriétaire lorsqu’elle est structurellement partagée.

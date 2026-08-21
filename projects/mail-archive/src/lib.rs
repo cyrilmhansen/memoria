@@ -9,14 +9,17 @@ use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tantivy::collector::TopDocs;
-use tantivy::query::{BooleanQuery, QueryParser, RangeQuery};
+use tantivy::indexer::{IndexWriterOptions, NoMergePolicy};
+use tantivy::query::{AllQuery, BooleanQuery, Query, QueryParser, RangeQuery, TermQuery};
 use tantivy::schema::{
-    Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, INDEXED, STORED,
+    Field, IndexRecordOption, Schema, TextFieldIndexing, TextOptions, Value, FAST, INDEXED, STORED,
 };
-use tantivy::{doc, Index, IndexReader, IndexWriter, TantivyDocument, Term};
+use tantivy::{doc, Index, IndexReader, IndexWriter, Order, TantivyDocument, Term};
 
 pub mod app_config;
 pub mod gmail;
+pub mod html_preview;
+pub mod i18n;
 
 pub const DEFAULT_SEED: u64 = 0x4d_41_49_4c_41_52_43;
 const FRAME_MAGIC: &[u8; 8] = b"MAARC001";
@@ -191,6 +194,57 @@ pub struct GmailSearchResult {
     pub attachment_count: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AttachmentFilter {
+    #[default]
+    All,
+    With,
+    Without,
+}
+
+/// Structured search contract shared by the CLI, controller and future UIs.
+/// Date bounds are Unix milliseconds; `date_to` is exclusive.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SearchRequest {
+    pub text: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub date_from: Option<i64>,
+    pub date_to: Option<i64>,
+    pub attachment: AttachmentFilter,
+    pub attachment_mime: Option<String>,
+    pub labels: Vec<String>,
+    pub limit: usize,
+}
+
+impl Default for SearchRequest {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            from: None,
+            to: None,
+            date_from: None,
+            date_to: None,
+            attachment: AttachmentFilter::All,
+            attachment_mime: None,
+            labels: Vec::new(),
+            limit: 50,
+        }
+    }
+}
+
+impl SearchRequest {
+    pub fn has_filters(&self) -> bool {
+        self.from.is_some()
+            || self.to.is_some()
+            || self.date_from.is_some()
+            || self.date_to.is_some()
+            || self.attachment != AttachmentFilter::All
+            || self.attachment_mime.is_some()
+            || !self.labels.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct GmailIndexStats {
     pub examined: u64,
@@ -204,6 +258,29 @@ pub struct GmailIndexStats {
     pub open_us: u128,
     pub first_query_us: u128,
     pub index_bytes: u64,
+    pub segments_before_commit: u64,
+    pub segments_after_commit: u64,
+    pub segments_after_index: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GmailIndexWriterConfig {
+    pub memory_budget_bytes: usize,
+    /// `None` preserves Tantivy's hardware-dependent `Index::writer` choice.
+    pub worker_threads: Option<usize>,
+    pub merge_threads: usize,
+    pub no_merge_policy: bool,
+}
+
+impl Default for GmailIndexWriterConfig {
+    fn default() -> Self {
+        Self {
+            memory_budget_bytes: 50_000_000,
+            worker_threads: None,
+            merge_threads: 4,
+            no_merge_policy: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -225,6 +302,209 @@ pub struct GmailParsedMessage {
     pub attachment_count: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachmentInfo {
+    pub id: u32,
+    pub filename: Option<String>,
+    pub mime: String,
+    pub decoded_bytes: u64,
+    pub content_id: Option<String>,
+    pub inline: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MimeResourceInfo {
+    pub id: u32,
+    pub mime: String,
+    pub content_id: String,
+    pub decoded_bytes: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HtmlResource {
+    pub mime: String,
+    pub content_id: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HtmlDocument {
+    pub html: String,
+    pub resources: Vec<HtmlResource>,
+}
+
+fn mime_filename(part: &ParsedMail<'_>) -> Option<String> {
+    part.get_content_disposition()
+        .params
+        .get("filename")
+        .cloned()
+        .or_else(|| part.ctype.params.get("name").cloned())
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn mime_content_id(part: &ParsedMail<'_>) -> Option<String> {
+    part.headers
+        .get_first_value("Content-ID")
+        .map(|value| {
+            value
+                .trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .to_string()
+        })
+        .filter(|value| !value.is_empty())
+}
+
+fn mime_part_bytes(part: &ParsedMail<'_>) -> io::Result<Vec<u8>> {
+    part.get_body_raw()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+}
+
+fn walk_mime_parts(
+    part: &ParsedMail<'_>,
+    next_id: &mut u32,
+    attachments: &mut Vec<AttachmentInfo>,
+    resources: &mut Vec<MimeResourceInfo>,
+) -> io::Result<()> {
+    if !part.subparts.is_empty() {
+        for child in &part.subparts {
+            walk_mime_parts(child, next_id, attachments, resources)?;
+        }
+        return Ok(());
+    }
+    let disposition = part.get_content_disposition();
+    let filename = mime_filename(part);
+    let content_id = mime_content_id(part);
+    let inline = matches!(disposition.disposition, mailparse::DispositionType::Inline);
+    let bytes = mime_part_bytes(part)?;
+    let id = *next_id;
+    *next_id += 1;
+    if let Some(content_id) = content_id.clone() {
+        resources.push(MimeResourceInfo {
+            id,
+            mime: part.ctype.mimetype.to_ascii_lowercase(),
+            content_id,
+            decoded_bytes: bytes.len() as u64,
+        });
+    }
+    // Inline CID resources are retained in the resource map but are not shown
+    // as ordinary downloadable attachments. A strict attachment remains
+    // downloadable even if a sender also supplied a Content-ID.
+    let downloadable = matches!(
+        disposition.disposition,
+        mailparse::DispositionType::Attachment
+    ) || (filename.is_some() && !(inline && content_id.is_some()));
+    if downloadable {
+        attachments.push(AttachmentInfo {
+            id,
+            filename,
+            mime: part.ctype.mimetype.to_ascii_lowercase(),
+            decoded_bytes: bytes.len() as u64,
+            content_id,
+            inline,
+        });
+    }
+    Ok(())
+}
+
+pub fn list_attachments(root: &Path, doc_id: u64) -> io::Result<Vec<AttachmentInfo>> {
+    let raw = read_archived_raw(root, doc_id)?;
+    let parsed = parse_mail(&raw)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let mut attachments = Vec::new();
+    let mut resources = Vec::new();
+    walk_mime_parts(&parsed, &mut 0, &mut attachments, &mut resources)?;
+    Ok(attachments)
+}
+
+pub fn list_mime_resources(root: &Path, doc_id: u64) -> io::Result<Vec<MimeResourceInfo>> {
+    let raw = read_archived_raw(root, doc_id)?;
+    let parsed = parse_mail(&raw)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let mut attachments = Vec::new();
+    let mut resources = Vec::new();
+    walk_mime_parts(&parsed, &mut 0, &mut attachments, &mut resources)?;
+    Ok(resources)
+}
+
+fn collect_html_document(
+    part: &ParsedMail<'_>,
+    html: &mut Option<String>,
+    resources: &mut Vec<HtmlResource>,
+) -> io::Result<()> {
+    if !part.subparts.is_empty() {
+        for child in &part.subparts {
+            collect_html_document(child, html, resources)?;
+        }
+        return Ok(());
+    }
+    let disposition = part.get_content_disposition();
+    let filename = mime_filename(part);
+    let content_id = mime_content_id(part);
+    let inline = matches!(disposition.disposition, mailparse::DispositionType::Inline);
+    let downloadable = matches!(
+        disposition.disposition,
+        mailparse::DispositionType::Attachment
+    ) || (filename.is_some() && !(inline && content_id.is_some()));
+    let mime = part.ctype.mimetype.to_ascii_lowercase();
+    if mime == "text/html" && !downloadable {
+        *html = Some(
+            part.get_body()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?,
+        );
+    } else if let Some(content_id) = content_id {
+        resources.push(HtmlResource {
+            mime,
+            content_id,
+            bytes: mime_part_bytes(part)?,
+        });
+    }
+    Ok(())
+}
+
+pub fn read_html_document(root: &Path, doc_id: u64) -> io::Result<Option<HtmlDocument>> {
+    let raw = read_archived_raw(root, doc_id)?;
+    let parsed = parse_mail(&raw)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let mut html = None;
+    let mut resources = Vec::new();
+    collect_html_document(&parsed, &mut html, &mut resources)?;
+    Ok(html.map(|html| HtmlDocument { html, resources }))
+}
+
+pub fn read_attachment(root: &Path, doc_id: u64, attachment_id: u32) -> io::Result<Vec<u8>> {
+    let raw = read_archived_raw(root, doc_id)?;
+    let parsed = parse_mail(&raw)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    let mut next_id = 0;
+    fn find(part: &ParsedMail<'_>, next_id: &mut u32, wanted: u32) -> io::Result<Option<Vec<u8>>> {
+        if !part.subparts.is_empty() {
+            for child in &part.subparts {
+                if let Some(value) = find(child, next_id, wanted)? {
+                    return Ok(Some(value));
+                }
+            }
+            return Ok(None);
+        }
+        let disposition = part.get_content_disposition();
+        let filename = mime_filename(part);
+        let content_id = mime_content_id(part);
+        let inline = matches!(disposition.disposition, mailparse::DispositionType::Inline);
+        let downloadable = matches!(
+            disposition.disposition,
+            mailparse::DispositionType::Attachment
+        ) || (filename.is_some() && !(inline && content_id.is_some()));
+        let id = *next_id;
+        *next_id += 1;
+        if downloadable && id == wanted {
+            return mime_part_bytes(part).map(Some);
+        }
+        Ok(None)
+    }
+    find(&parsed, &mut next_id, attachment_id)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "attachment not found"))
+}
+
 pub struct GmailSearchIndex {
     index: Index,
     reader: IndexReader,
@@ -240,6 +520,26 @@ impl GmailSearchIndex {
             .reader()
             .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
         let catalog = Connection::open(root.join("metadata.sqlite")).map_err(sqlite_io)?;
+        let source_rows: i64 = catalog
+            .query_row(
+                "SELECT COUNT(*) FROM gmail_messages WHERE source_state='present'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if reader.searcher().num_docs() == 0 && source_rows > 0 {
+            drop(reader);
+            drop(catalog);
+            drop(index);
+            let stats = index_gmail_archive(root)?;
+            if stats.indexed == 0 && stats.parse_failures > 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "derived Tantivy index could not be rebuilt",
+                ));
+            }
+            return Self::open(root);
+        }
         Ok(Self {
             index,
             reader,
@@ -249,12 +549,48 @@ impl GmailSearchIndex {
     }
 
     pub fn search(&self, query: &str, limit: usize) -> io::Result<Vec<GmailSearchResult>> {
+        let mut request = SearchRequest {
+            text: query.to_string(),
+            limit,
+            ..SearchRequest::default()
+        };
+        // Keep the historical CLI syntax as a compatibility wrapper. New code
+        // should construct SearchRequest directly.
+        let (text, from, to, date_from, date_to) = legacy_request_parts(query);
+        request.text = text;
+        request.from = from;
+        request.to = to;
+        request.date_from = date_from;
+        request.date_to = date_to;
+        self.search_request(&request)
+    }
+
+    pub fn search_request(&self, request: &SearchRequest) -> io::Result<Vec<GmailSearchResult>> {
+        if request.limit == 0 || (request.text.trim().is_empty() && !request.has_filters()) {
+            return Ok(Vec::new());
+        }
         let searcher = self.reader.searcher();
-        let parsed = gmail_query(&self.index, self.fields, query)
+        let parsed = structured_query(&self.index, self.fields, request)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        let top_docs = searcher
-            .search(&parsed, &TopDocs::with_limit(limit).order_by_score())
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+        let top_docs: Vec<(f32, tantivy::DocAddress)> = if request.text.trim().is_empty() {
+            searcher
+                .search(
+                    &parsed,
+                    &TopDocs::with_limit(request.limit)
+                        .order_by_fast_field::<i64>("timestamp", Order::Desc),
+                )
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?
+                .into_iter()
+                .map(|(_, address)| (0.0, address))
+                .collect()
+        } else {
+            searcher
+                .search(
+                    &parsed,
+                    &TopDocs::with_limit(request.limit).order_by_score(),
+                )
+                .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?
+        };
         let mut results = Vec::new();
         for (score, address) in top_docs {
             let document: TantivyDocument = searcher
@@ -374,6 +710,26 @@ pub fn archive_summary(root: &Path) -> io::Result<ArchiveSummary> {
         index_bytes: directory_bytes(&index_root)?,
         index_present: index_root.join("meta.json").exists(),
     })
+}
+
+pub fn available_gmail_labels(root: &Path) -> io::Result<Vec<String>> {
+    let catalog = Connection::open(root.join("metadata.sqlite")).map_err(sqlite_io)?;
+    let mut statement = catalog
+        .prepare("SELECT label_ids FROM gmail_messages WHERE source_state='present'")
+        .map_err(sqlite_io)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(sqlite_io)?;
+    let mut labels = HashSet::new();
+    for row in rows {
+        let value = row.map_err(sqlite_io)?;
+        for label in labels_for_index(&value) {
+            labels.insert(label);
+        }
+    }
+    let mut labels: Vec<_> = labels.into_iter().collect();
+    labels.sort();
+    Ok(labels)
 }
 
 #[derive(Clone, Debug)]
@@ -1269,11 +1625,13 @@ fn collect_mime_text(
     attachment_count: &mut u64,
 ) -> Result<(), mailparse::MailParseError> {
     let disposition = part.get_content_disposition();
+    let filename = mime_filename(part);
+    let content_id = mime_content_id(part);
+    let inline = matches!(disposition.disposition, mailparse::DispositionType::Inline);
     let is_attachment = matches!(
         disposition.disposition,
         mailparse::DispositionType::Attachment
-    ) || disposition.params.contains_key("filename")
-        || part.ctype.params.contains_key("name");
+    ) || (filename.is_some() && !(inline && content_id.is_some()));
     if is_attachment && part.subparts.is_empty() {
         *attachment_count += 1;
         attachment_types.push(part.ctype.mimetype.to_ascii_lowercase());
@@ -1665,9 +2023,16 @@ pub fn create_tantivy(path: &Path) -> tantivy::Result<(Index, TantivyFields)> {
                 .set_index_option(IndexRecordOption::WithFreqsAndPositions),
         )
         .set_stored();
+    let raw_options = TextOptions::default()
+        .set_indexing_options(
+            TextFieldIndexing::default()
+                .set_tokenizer("raw")
+                .set_index_option(IndexRecordOption::Basic),
+        )
+        .set_stored();
     let fields = TantivyFields {
         doc_id: schema_builder.add_u64_field("doc_id", INDEXED | STORED),
-        timestamp: schema_builder.add_i64_field("timestamp", INDEXED | STORED),
+        timestamp: schema_builder.add_i64_field("timestamp", INDEXED | FAST | STORED),
         sender: schema_builder.add_text_field("sender", text_options.clone()),
         recipients: schema_builder.add_text_field("recipients", text_options.clone()),
         subject: schema_builder.add_text_field("subject", text_options.clone()),
@@ -1677,6 +2042,12 @@ pub fn create_tantivy(path: &Path) -> tantivy::Result<(Index, TantivyFields)> {
         labels: schema_builder.add_text_field("label", text_options.clone()),
         attachment_types: schema_builder.add_text_field("attachment_type", text_options),
         attachment_count: schema_builder.add_u64_field("attachment_count", INDEXED | STORED),
+        has_attachment: schema_builder.add_u64_field("has_attachment", INDEXED | FAST | STORED),
+        attachment_mime: schema_builder.add_text_field("attachment_mime", raw_options.clone()),
+        attachment_family: schema_builder.add_text_field("attachment_family", raw_options.clone()),
+        labels_exact: schema_builder.add_text_field("label_exact", raw_options.clone()),
+        sender_filter: schema_builder.add_text_field("sender_filter", raw_options.clone()),
+        recipient_filter: schema_builder.add_text_field("recipient_filter", raw_options),
     };
     let schema = schema_builder.build();
     let index = Index::create_in_dir(path, schema)?;
@@ -1696,6 +2067,12 @@ pub struct TantivyFields {
     pub labels: Field,
     pub attachment_types: Field,
     pub attachment_count: Field,
+    pub has_attachment: Field,
+    pub attachment_mime: Field,
+    pub attachment_family: Field,
+    pub labels_exact: Field,
+    pub sender_filter: Field,
+    pub recipient_filter: Field,
 }
 
 pub fn index_tantivy(
@@ -1779,6 +2156,12 @@ fn tantivy_fields_from_schema(schema: &Schema) -> tantivy::Result<TantivyFields>
         labels: field("label")?,
         attachment_types: field("attachment_type")?,
         attachment_count: field("attachment_count")?,
+        has_attachment: field("has_attachment")?,
+        attachment_mime: field("attachment_mime")?,
+        attachment_family: field("attachment_family")?,
+        labels_exact: field("label_exact")?,
+        sender_filter: field("sender_filter")?,
+        recipient_filter: field("recipient_filter")?,
     })
 }
 
@@ -1788,8 +2171,23 @@ fn open_or_create_gmail_tantivy(root: &Path) -> tantivy::Result<(Index, TantivyF
         .map_err(|error| tantivy::TantivyError::SystemError(error.to_string()))?;
     if path.join("meta.json").exists() {
         let index = Index::open_in_dir(&path)?;
-        let fields = tantivy_fields_from_schema(&index.schema())?;
-        Ok((index, fields))
+        match tantivy_fields_from_schema(&index.schema()) {
+            Ok(fields) => Ok((index, fields)),
+            Err(_) => {
+                // Derived-only schema migration. The archive and catalogue
+                // remain untouched; the normal indexer reconstructs this tree.
+                drop(index);
+                fs::remove_dir_all(&path)
+                    .map_err(|error| tantivy::TantivyError::SystemError(error.to_string()))?;
+                let state = gmail_index_state_path(root);
+                if state.exists() {
+                    let _ = fs::remove_file(state);
+                }
+                fs::create_dir_all(&path)
+                    .map_err(|error| tantivy::TantivyError::SystemError(error.to_string()))?;
+                create_tantivy(&path)
+            }
+        }
     } else {
         create_tantivy(&path)
     }
@@ -1823,7 +2221,10 @@ struct GmailCatalogRow {
     location: ArchiveLocation,
 }
 
-fn gmail_catalog_rows(root: &Path) -> io::Result<Vec<GmailCatalogRow>> {
+fn for_each_gmail_catalog_row<F>(root: &Path, mut visit: F) -> io::Result<()>
+where
+    F: FnMut(GmailCatalogRow) -> io::Result<()>,
+{
     let connection = Connection::open(root.join("metadata.sqlite")).map_err(sqlite_io)?;
     let mut statement = connection
         .prepare(
@@ -1850,14 +2251,56 @@ fn gmail_catalog_rows(root: &Path) -> io::Result<Vec<GmailCatalogRow>> {
             })
         })
         .map_err(sqlite_io)?;
-    rows.map(|row| row.map_err(sqlite_io)).collect()
+    for row in rows {
+        visit(row.map_err(sqlite_io)?)?;
+    }
+    Ok(())
 }
 
 fn labels_for_index(value: &str) -> Vec<String> {
     serde_json::from_str(value).unwrap_or_default()
 }
 
+fn search_filter_tokens(value: &str) -> impl Iterator<Item = String> + '_ {
+    value
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+}
+
+fn search_filter_values(value: &str) -> Vec<String> {
+    let mut values: Vec<String> = search_filter_tokens(value).collect();
+    if let (Some(start), Some(end)) = (value.find('<'), value.rfind('>')) {
+        if start < end {
+            values.push(value[start + 1..end].trim().to_ascii_lowercase());
+        }
+    }
+    values.sort();
+    values.dedup();
+    values
+}
+
 pub fn index_gmail_archive(root: &Path) -> io::Result<GmailIndexStats> {
+    index_gmail_archive_with_observer_and_config(root, |_| {}, GmailIndexWriterConfig::default())
+}
+
+/// Indexe l'archive et signale des phases de diagnostic au code expérimental.
+/// Le callback n'influence pas le pipeline produit et peut rester un no-op.
+pub fn index_gmail_archive_with_observer<F>(root: &Path, observe: F) -> io::Result<GmailIndexStats>
+where
+    F: FnMut(&str),
+{
+    index_gmail_archive_with_observer_and_config(root, observe, GmailIndexWriterConfig::default())
+}
+
+pub fn index_gmail_archive_with_observer_and_config<F>(
+    root: &Path,
+    mut observe: F,
+    writer_config: GmailIndexWriterConfig,
+) -> io::Result<GmailIndexStats>
+where
+    F: FnMut(&str),
+{
     let open_started = Instant::now();
     let (index, fields) = open_or_create_gmail_tantivy(root)
         .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
@@ -1888,16 +2331,38 @@ pub fn index_gmail_archive(root: &Path) -> io::Result<GmailIndexStats> {
             known.insert(row.0, row);
         }
     }
-    let rows = gmail_catalog_rows(root)?;
-    let current: HashSet<u64> = rows.iter().map(|row| row.doc_id).collect();
-    let mut writer = index
-        .writer(50_000_000)
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    observe("catalog_stream_opened");
+    let track_current = !known.is_empty();
+    let mut current = HashSet::with_capacity(if track_current { known.len() } else { 0 });
+    let mut writer = if let Some(worker_threads) = writer_config.worker_threads {
+        let memory_budget_per_thread = writer_config
+            .memory_budget_bytes
+            .checked_div(worker_threads.max(1))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid writer threads"))?;
+        let options = IndexWriterOptions::builder()
+            .memory_budget_per_thread(memory_budget_per_thread)
+            .num_worker_threads(worker_threads)
+            .num_merge_threads(writer_config.merge_threads)
+            .build();
+        index
+            .writer_with_options(options)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?
+    } else {
+        index
+            .writer(writer_config.memory_budget_bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?
+    };
+    if writer_config.no_merge_policy {
+        writer.set_merge_policy(Box::new(NoMergePolicy));
+    }
+    observe("writer_opened");
     let mut changed = false;
-    let mut state_deletes = Vec::new();
-    let mut state_upserts = Vec::new();
+    let state_transaction = state.transaction().map_err(sqlite_io)?;
     let index_started = Instant::now();
-    for row in &rows {
+    for_each_gmail_catalog_row(root, |row| {
+        if track_current {
+            current.insert(row.doc_id);
+        }
         stats.examined += 1;
         let fingerprint = (
             row.location.segment.as_str(),
@@ -1911,14 +2376,19 @@ pub fn index_gmail_archive(root: &Path) -> io::Result<GmailIndexStats> {
         });
         if unchanged {
             stats.skipped += 1;
-            continue;
+            return Ok(());
         }
         writer.delete_term(Term::from_field_u64(fields.doc_id, row.doc_id));
         if row.source_state != "present" {
-            state_deletes.push(row.doc_id);
+            state_transaction
+                .execute(
+                    "DELETE FROM indexed_docs WHERE doc_id=?1",
+                    [row.doc_id as i64],
+                )
+                .map_err(sqlite_io)?;
             stats.removed += 1;
             changed = true;
-            continue;
+            return Ok(());
         }
         let read_started = Instant::now();
         let (record_id, raw) = read_record(&root.join("archive"), &row.location)?;
@@ -1934,70 +2404,94 @@ pub fn index_gmail_archive(root: &Path) -> io::Result<GmailIndexStats> {
             Ok(parsed) => parsed,
             Err(_) => {
                 stats.parse_failures += 1;
-                continue;
+                return Ok(());
             }
         };
         stats.parse_us += parse_started.elapsed().as_micros();
+        let mut document = doc!(
+            fields.doc_id => row.doc_id,
+            fields.timestamp => row.timestamp,
+            fields.sender => parsed.sender,
+            fields.recipients => parsed.recipients,
+            fields.subject => parsed.subject,
+            fields.body => parsed.body,
+            fields.account => row.source_account,
+            fields.labels => parsed.labels.join(" "),
+            fields.attachment_types => parsed.attachment_types.join(" "),
+            fields.attachment_count => parsed.attachment_count,
+            fields.has_attachment => u64::from(parsed.attachment_count > 0),
+        );
+        for token in search_filter_values(&parsed.sender) {
+            document.add_text(fields.sender_filter, token);
+        }
+        for token in search_filter_values(&parsed.recipients) {
+            document.add_text(fields.recipient_filter, token);
+        }
+        for label in &parsed.labels {
+            document.add_text(fields.labels_exact, label);
+        }
+        for mime in &parsed.attachment_types {
+            document.add_text(fields.attachment_mime, mime);
+            if let Some(family) = mime.split('/').next() {
+                document.add_text(fields.attachment_family, family);
+            }
+        }
         writer
-            .add_document(doc!(
-                fields.doc_id => row.doc_id,
-                fields.timestamp => row.timestamp,
-                fields.sender => parsed.sender,
-                fields.recipients => parsed.recipients,
-                fields.subject => parsed.subject,
-                fields.body => parsed.body,
-                fields.account => row.source_account,
-                fields.labels => parsed.labels.join(" "),
-                fields.attachment_types => parsed.attachment_types.join(" "),
-                fields.attachment_count => parsed.attachment_count
-            ))
+            .add_document(document)
             .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
-        state_upserts.push((
-            row.doc_id,
-            row.location.segment.clone(),
-            row.location.offset,
-            row.location.frame_bytes,
-            row.labels.clone(),
-            row.source_state.clone(),
-        ));
+        state_transaction
+            .execute(
+                "INSERT OR REPLACE INTO indexed_docs VALUES (?1,?2,?3,?4,?5,?6)",
+                params![
+                    row.doc_id as i64,
+                    row.location.segment,
+                    row.location.offset as i64,
+                    row.location.frame_bytes as i64,
+                    row.labels,
+                    row.source_state
+                ],
+            )
+            .map_err(sqlite_io)?;
         stats.indexed += 1;
         changed = true;
-    }
-    for (doc_id, _) in &known {
-        if !current.contains(doc_id) {
-            writer.delete_term(Term::from_field_u64(fields.doc_id, *doc_id));
-            state_deletes.push(*doc_id);
-            stats.removed += 1;
-            changed = true;
+        if stats.examined % 100_000 == 0 {
+            observe("indexing_100k_boundary");
+        }
+        Ok(())
+    })?;
+    if track_current {
+        for (doc_id, _) in &known {
+            if !current.contains(doc_id) {
+                writer.delete_term(Term::from_field_u64(fields.doc_id, *doc_id));
+                state_transaction
+                    .execute("DELETE FROM indexed_docs WHERE doc_id=?1", [*doc_id as i64])
+                    .map_err(sqlite_io)?;
+                stats.removed += 1;
+                changed = true;
+            }
         }
     }
     if changed {
+        observe("before_commit");
+        stats.segments_before_commit = index
+            .load_metas()
+            .map(|meta| meta.segments.len() as u64)
+            .unwrap_or(0);
         writer
             .commit()
             .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
-        let transaction = state.transaction().map_err(sqlite_io)?;
-        for doc_id in state_deletes {
-            transaction
-                .execute("DELETE FROM indexed_docs WHERE doc_id=?1", [doc_id as i64])
-                .map_err(sqlite_io)?;
-        }
-        for (doc_id, segment, offset, frame_bytes, labels, source_state) in state_upserts {
-            transaction
-                .execute(
-                    "INSERT OR REPLACE INTO indexed_docs VALUES (?1,?2,?3,?4,?5,?6)",
-                    params![
-                        doc_id as i64,
-                        segment,
-                        offset as i64,
-                        frame_bytes as i64,
-                        labels,
-                        source_state
-                    ],
-                )
-                .map_err(sqlite_io)?;
-        }
-        transaction.commit().map_err(sqlite_io)?;
+        observe("after_commit");
+        stats.segments_after_commit = index
+            .load_metas()
+            .map(|meta| meta.segments.len() as u64)
+            .unwrap_or(0);
     }
+    state_transaction.commit().map_err(sqlite_io)?;
+    drop(writer);
+    stats.segments_after_index = index
+        .load_metas()
+        .map(|meta| meta.segments.len() as u64)
+        .unwrap_or(0);
     stats.index_us = index_started.elapsed().as_micros();
     stats.index_bytes = directory_bytes(&gmail_index_dir(root))?;
     Ok(stats)
@@ -2024,57 +2518,142 @@ fn parse_date_token(value: &str) -> Option<i64> {
     Some((era * 146097 + day_of_era - 719468) * 86_400)
 }
 
-fn gmail_query(
-    index: &Index,
-    fields: TantivyFields,
+pub fn parse_search_date_ms(value: &str) -> Option<i64> {
+    parse_date_token(value.trim()).map(|seconds| seconds * 1000)
+}
+
+fn legacy_request_parts(
     query: &str,
-) -> tantivy::Result<Box<dyn tantivy::query::Query>> {
-    let mut text_tokens = Vec::new();
-    let mut after = None;
-    let mut before = None;
+) -> (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+) {
+    let mut text = Vec::new();
+    let mut from = None;
+    let mut to = None;
+    let mut date_from = None;
+    let mut date_to = None;
     for token in query.split_whitespace() {
         if let Some(value) = token.strip_prefix("after:") {
-            after = parse_date_token(value).map(|value| value * 1000);
+            date_from = parse_date_token(value).map(|seconds| seconds * 1000);
         } else if let Some(value) = token.strip_prefix("before:") {
-            before = parse_date_token(value).map(|value| value * 1000);
-        } else if token.starts_with("from:") {
-            text_tokens.push(token.replacen("from:", "sender:", 1));
-        } else if token.starts_with("to:") {
-            text_tokens.push(token.replacen("to:", "recipients:", 1));
+            date_to = parse_date_token(value).map(|seconds| seconds * 1000);
+        } else if let Some(value) = token.strip_prefix("from:") {
+            from = Some(value.to_string());
+        } else if let Some(value) = token.strip_prefix("to:") {
+            to = Some(value.to_string());
         } else {
-            text_tokens.push(token.to_string());
+            text.push(token.to_string());
         }
     }
-    let parser = QueryParser::for_index(
-        index,
-        vec![
-            fields.sender,
-            fields.recipients,
-            fields.subject,
-            fields.body,
-            fields.account,
-            fields.labels,
-            fields.attachment_types,
-        ],
-    );
-    let mut queries: Vec<Box<dyn tantivy::query::Query>> = Vec::new();
-    if !text_tokens.is_empty() {
-        queries.push(parser.parse_query(&text_tokens.join(" "))?);
+    (text.join(" "), from, to, date_from, date_to)
+}
+
+fn field_filter_query(
+    _index: &Index,
+    field: Field,
+    value: &str,
+) -> tantivy::Result<Option<Box<dyn Query>>> {
+    let normalized = value
+        .trim()
+        .trim_matches('<')
+        .trim_matches('>')
+        .to_ascii_lowercase();
+    if normalized.contains('@') {
+        return Ok(Some(exact_term(field, &normalized)));
     }
-    if after.is_some() || before.is_some() {
+    let queries = value
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(|token| exact_term(field, &token.to_ascii_lowercase()))
+        .collect::<Vec<_>>();
+    Ok(match queries.len() {
+        0 => None,
+        1 => Some(queries.into_iter().next().unwrap()),
+        _ => Some(Box::new(BooleanQuery::intersection(queries))),
+    })
+}
+
+fn exact_term(field: Field, value: &str) -> Box<dyn Query> {
+    Box::new(TermQuery::new(
+        Term::from_field_text(field, value),
+        IndexRecordOption::Basic,
+    ))
+}
+
+fn exact_u64_term(field: Field, value: u64) -> Box<dyn Query> {
+    Box::new(TermQuery::new(
+        Term::from_field_u64(field, value),
+        IndexRecordOption::Basic,
+    ))
+}
+
+fn structured_query(
+    index: &Index,
+    fields: TantivyFields,
+    request: &SearchRequest,
+) -> tantivy::Result<Box<dyn Query>> {
+    let mut queries = Vec::<Box<dyn Query>>::new();
+    if !request.text.trim().is_empty() {
+        let parser = QueryParser::for_index(
+            index,
+            vec![
+                fields.sender,
+                fields.recipients,
+                fields.subject,
+                fields.body,
+                fields.account,
+                fields.labels,
+                fields.attachment_types,
+            ],
+        );
+        queries.push(parser.parse_query(&request.text)?);
+    }
+    if let Some(value) = request.from.as_deref() {
+        if let Some(query) = field_filter_query(index, fields.sender_filter, value)? {
+            queries.push(query);
+        }
+    }
+    if let Some(value) = request.to.as_deref() {
+        if let Some(query) = field_filter_query(index, fields.recipient_filter, value)? {
+            queries.push(query);
+        }
+    }
+    if request.date_from.is_some() || request.date_to.is_some() {
         queries.push(Box::new(RangeQuery::new(
-            after.map_or(Bound::Unbounded, |value| {
+            request.date_from.map_or(Bound::Unbounded, |value| {
                 Bound::Included(Term::from_field_i64(fields.timestamp, value))
             }),
-            before.map_or(Bound::Unbounded, |value| {
+            request.date_to.map_or(Bound::Unbounded, |value| {
                 Bound::Excluded(Term::from_field_i64(fields.timestamp, value))
             }),
         )));
     }
-    Ok(if queries.len() == 1 {
-        queries.pop().unwrap()
-    } else {
-        Box::new(BooleanQuery::intersection(queries))
+    match request.attachment {
+        AttachmentFilter::All => {}
+        AttachmentFilter::With => queries.push(exact_u64_term(fields.has_attachment, 1)),
+        AttachmentFilter::Without => queries.push(exact_u64_term(fields.has_attachment, 0)),
+    }
+    if let Some(value) = request.attachment_mime.as_deref() {
+        let value = value.trim().to_ascii_lowercase();
+        if let Some(family) = value.strip_suffix("/*") {
+            queries.push(exact_term(fields.attachment_family, family));
+        } else if !value.is_empty() {
+            queries.push(exact_term(fields.attachment_mime, &value));
+        }
+    }
+    for label in &request.labels {
+        if !label.trim().is_empty() {
+            queries.push(exact_term(fields.labels_exact, label.trim()));
+        }
+    }
+    Ok(match queries.len() {
+        0 => Box::new(AllQuery),
+        1 => queries.pop().unwrap(),
+        _ => Box::new(BooleanQuery::intersection(queries)),
     })
 }
 
@@ -2476,6 +3055,53 @@ mod tests {
     }
 
     #[test]
+    fn attachment_api_lists_downloadables_and_cid_resources_without_changing_raw() {
+        let root =
+            std::env::temp_dir().join(format!("mail-attachment-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("archive")).unwrap();
+        create_metadata(&root.join("metadata.sqlite")).unwrap();
+        let raw = b"From: test@example.test\r\nSubject: attachments\r\nContent-Type: multipart/mixed; boundary=outer\r\n\r\n--outer\r\nContent-Type: text/plain\r\n\r\nHello\r\n--outer\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=report.pdf\r\nContent-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQ=\r\n--outer\r\nContent-Type: image/png\r\nContent-ID: <logo@example.test>\r\nContent-Disposition: inline\r\nContent-Transfer-Encoding: base64\r\n\r\niVBORw==\r\n--outer\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment\r\nContent-Transfer-Encoding: base64\r\n\r\nAQID\r\n--outer\r\nContent-Type: text/plain; name*=UTF-8''r%C3%A9sum%C3%A9.txt\r\nContent-Disposition: attachment; filename*=UTF-8''r%C3%A9sum%C3%A9.txt\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\ncaf=C3=A9\r\n--outer\r\nContent-Type: text/plain\r\nContent-Disposition: attachment; filename=../evil.txt\r\n\r\nblocked-name\r\n--outer--\r\n";
+        let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        let message = Message {
+            id: 7,
+            message_id: "fixture-attachment".into(),
+            timestamp: 0,
+            sender: "test@example.test".into(),
+            recipients: vec!["recipient@example.test".into()],
+            subject: "attachments".into(),
+            text_body: "Hello".into(),
+            html_body: None,
+            account: "fixture".into(),
+            folder: "Inbox".into(),
+            thread: "thread".into(),
+            attachments: Vec::new(),
+            raw: raw.to_vec(),
+        };
+        let location = writer.append(&message).unwrap();
+        writer.sync().unwrap();
+        let connection = create_metadata(&root.join("metadata.sqlite")).unwrap();
+        insert_metadata(&connection, &message, &location).unwrap();
+        let attachments = list_attachments(&root, 7).unwrap();
+        assert_eq!(attachments.len(), 4);
+        assert_eq!(attachments[0].mime, "application/pdf");
+        assert_eq!(attachments[0].decoded_bytes, 8);
+        assert!(attachments
+            .iter()
+            .any(|item| item.filename.as_deref() == Some("résumé.txt")));
+        assert_eq!(
+            read_attachment(&root, 7, attachments[0].id).unwrap(),
+            b"%PDF-1.4"
+        );
+        let resources = list_mime_resources(&root, 7).unwrap();
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0].content_id, "logo@example.test");
+        assert_eq!(resources[0].mime, "image/png");
+        assert_eq!(read_archived_raw(&root, 7).unwrap(), raw);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn html_display_hides_raw_urls_without_changing_plain_text() {
         assert_eq!(
             html_text("<p>Read https://example.test/path and www.example.test.</p>"),
@@ -2649,6 +3275,155 @@ mod tests {
             1
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn structured_search_combines_filters_without_post_filter_false_negatives() {
+        let root =
+            std::env::temp_dir().join(format!("mail-structured-search-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let catalog = create_metadata(&root.join("metadata.sqlite")).unwrap();
+        let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        let messages = [
+            (
+                "From: Alice Example <alice@example.test>\r\nTo: reader@example.test\r\nSubject: Invoice alpha\r\nDate: Thu, 01 Jan 1970 00:00:01 +0000\r\n\r\nalpha",
+                "[\"INBOX\",\"STARRED\"]",
+                1_000,
+            ),
+            (
+                "From: Bob Example <bob@example.test>\r\nTo: reader@example.test\r\nSubject: Invoice beta\r\nDate: Thu, 01 Jan 1970 00:00:02 +0000\r\nContent-Type: multipart/mixed; boundary=part\r\n\r\n--part\r\nContent-Type: text/plain\r\n\r\nbeta\r\n--part\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=report.pdf\r\nContent-Transfer-Encoding: base64\r\n\r\nJVBERi0=\r\n--part--\r\n",
+                "[\"INBOX\",\"WORK\"]",
+                2_000,
+            ),
+            (
+                "From: Alice Example <alice@example.test>\r\nTo: other@example.test\r\nSubject: Invoice gamma\r\nDate: Thu, 01 Jan 1970 00:03:00 +0000\r\nContent-Type: multipart/related; boundary=part\r\n\r\n--part\r\nContent-Type: text/html\r\n\r\n<img src=\"cid:logo@example.test\">\r\n--part\r\nContent-Type: image/png\r\nContent-ID: <logo@example.test>\r\nContent-Disposition: inline\r\n\r\nPNG\r\n--part--\r\n",
+                "[\"SENT\"]",
+                3_000,
+            ),
+        ];
+        for (id, (raw, labels, timestamp)) in messages.into_iter().enumerate() {
+            let raw = raw.as_bytes();
+            let location = writer.append_raw(id as u64, raw).unwrap();
+            insert_gmail_metadata(
+                &catalog,
+                "fixture-account",
+                &format!("gmail-{id}"),
+                id as i64,
+                &format!("thread-{id}"),
+                labels,
+                Some(timestamp),
+                Some(&format!("{id}")),
+                &location,
+            )
+            .unwrap();
+        }
+        writer.sync().unwrap();
+        index_gmail_archive(&root).unwrap();
+        let index = GmailSearchIndex::open(&root).unwrap();
+        let result = index
+            .search_request(&SearchRequest {
+                text: "invoice".into(),
+                from: Some("alice".into()),
+                date_to: Some(2_500),
+                ..SearchRequest {
+                    limit: 10,
+                    ..Default::default()
+                }
+            })
+            .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].doc_id, 0);
+        assert_eq!(
+            index
+                .search_request(&SearchRequest {
+                    from: Some("alice@example.test".into()),
+                    limit: 10,
+                    ..Default::default()
+                })
+                .unwrap()
+                .iter()
+                .map(|item| item.doc_id)
+                .collect::<Vec<_>>(),
+            vec![2, 0]
+        );
+        assert_eq!(
+            index
+                .search_request(&SearchRequest {
+                    attachment: AttachmentFilter::With,
+                    attachment_mime: Some("application/pdf".into()),
+                    limit: 10,
+                    ..Default::default()
+                })
+                .unwrap()
+                .iter()
+                .map(|item| item.doc_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert!(
+            index
+                .search_request(&SearchRequest {
+                    attachment: AttachmentFilter::With,
+                    limit: 10,
+                    ..Default::default()
+                })
+                .unwrap()
+                .is_empty()
+                == false
+        );
+        assert_eq!(
+            index
+                .search_request(&SearchRequest {
+                    attachment: AttachmentFilter::Without,
+                    limit: 10,
+                    ..Default::default()
+                })
+                .unwrap()
+                .iter()
+                .map(|item| item.doc_id)
+                .collect::<Vec<_>>(),
+            vec![2, 0]
+        );
+        assert_eq!(
+            index
+                .search_request(&SearchRequest {
+                    labels: vec!["WORK".into()],
+                    limit: 10,
+                    ..Default::default()
+                })
+                .unwrap()
+                .first()
+                .map(|item| item.doc_id),
+            Some(1)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn real_archive_structured_search_smoke_is_offline_only() {
+        let root = Path::new(".local/gmail-real-20260820");
+        if !root.join("metadata.sqlite").exists() {
+            return;
+        }
+        let index = GmailSearchIndex::open(root).unwrap();
+        let _ = index
+            .search_request(&SearchRequest {
+                attachment: AttachmentFilter::With,
+                attachment_mime: Some("image/*".into()),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
+        let labels = available_gmail_labels(root).unwrap();
+        if let Some(label) = labels.first() {
+            let _ = index
+                .search_request(&SearchRequest {
+                    labels: vec![label.clone()],
+                    limit: 10,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
     }
 
     #[test]

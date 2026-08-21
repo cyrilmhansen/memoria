@@ -1,0 +1,19 @@
+[package]
+name = "slint-wry-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+slint = { version = "1.17.1", default-features = false, features = ["std", "backend-winit", "backend-winit-wayland", "backend-winit-x11", "renderer-software", "accessibility", "compat-1-2", "raw-window-handle-06"] }
+fontique = { version = "0.10.0", default-features = false, features = ["fontconfig-dlopen"] }
+url = "2.5"
+wry = { version = "0.56.1", default-features = true }
+
+[build-dependencies]
+slint-build = "1.17.1"
+
+[workspace]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <title>Document WebView local</title>
+  <style>
+    body { font: 16px sans-serif; color: #20252b; margin: 28px; }
+    h1 { color: #175cd3; }
+    .callout { background: #e8f1ff; border-left: 5px solid #175cd3; padding: 12px; }
+    table { border-collapse: collapse; margin-top: 16px; }
+    td, th { border: 1px solid #aab4c0; padding: 7px 12px; }
+  </style>
+</head>
+<body>
+  <h1>WebView système</h1>
+  <p>Un texte <strong>gras</strong>, une couleur, un tableau et une image locale.</p>
+  <p>Focus : <input aria-label="Champ local de test" value="cliquez ici"></p>
+  <p class="callout">JavaScript est désactivé et les navigations sont limitées aux fichiers locaux.</p>
+  <table><tr><th>Élément</th><th>État</th></tr><tr><td>HTML</td><td>chargé</td></tr><tr><td>Image</td><td>locale</td></tr></table>
+  <p><a href="https://example.com/">Ce lien externe doit être intercepté</a></p>
+  <img src="sample.svg" width="220" height="120" alt="Illustration locale">
+  <div>
+    <p>Bloc de lecture suffisamment long pour tester le défilement vertical de la WebView.</p>
+    <p>Section locale 1 — contenu de démonstration.</p><p>Section locale 2 — contenu de démonstration.</p>
+    <p>Section locale 3 — contenu de démonstration.</p><p>Section locale 4 — contenu de démonstration.</p>
+    <p>Section locale 5 — contenu de démonstration.</p><p>Section locale 6 — contenu de démonstration.</p>
+    <p>Section locale 7 — contenu de démonstration.</p><p>Section locale 8 — contenu de démonstration.</p>
+    <p>Section locale 9 — contenu de démonstration.</p><p>Section locale 10 — contenu de démonstration.</p>
+  </div>
+</body>
+</html>

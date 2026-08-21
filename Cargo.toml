@@ -18,5 +18,10 @@ slint-build = "1.17.1"
 resolver = "2"
 members = ["projects/mail-archive"]
 
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+
 # Les applications futures seront ajoutées comme membres lorsqu'elles auront
 # des besoins et un manifeste Cargo connus.

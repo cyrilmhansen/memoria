@@ -48,6 +48,49 @@ Cette section sera enrichie uniquement par des expériences reproductibles.
 - Packaging : aucun installeur ni paquet généré pour le moment.
 - Problèmes rencontrés et solutions validées : fontconfig traité par
   chargement dynamique, comme décrit ci-dessus.
+- **Memoria — fait vérifié le 2026-08-21 :** pour un binaire release GUI,
+  `strip=true`, LTO complet et `codegen-units=1` réduisent fortement la taille
+  sans régression observée dans les tests ni le smoke test Linux. Le profil
+  est fixé dans le `Cargo.toml` racine ; `panic=abort` reste expérimental car
+  il change le contrat des panics non récupérées. ZIP/7z sont des compressions
+  de transport ; UPX reste candidat non décidé jusqu'à une validation native
+  Windows du démarrage, SmartScreen/antivirus, OAuth et d'une future
+  signature. Mesures détaillées dans
+  [`experiments/2026-08-21-mail-archive-release-profiles.md`](experiments/2026-08-21-mail-archive-release-profiles.md).
+- **Slint/WebView — fait vérifié le 2026-08-21 :** wry 0.56.1 peut attacher
+  une WebView système à une fenêtre Slint/Winit sous Windows et Linux/X11,
+  mais `build_as_child` ne supporte pas Wayland. Wayland demande le chemin
+  `build_gtk` et donc un conteneur GTK ainsi qu'une glue de boucle/fenêtre que
+  Memoria n'adopte pas à ce stade. Le probe et les mesures sont dans
+  [`experiments/2026-08-21-slint-wry-system-webview.md`](experiments/2026-08-21-slint-wry-system-webview.md).
+- **Qt WebEngine — fait vérifié le 2026-08-21 :** Qt 6 WebEngine fonctionne
+  comme fenêtre Qt top-level sous KDE/Wayland, avec `QWebEngineView` (QWidget)
+  ou `WebEngineView` (Qt Quick), mais ces chemins imposent la hiérarchie de
+  fenêtre/scène et la boucle Qt, ainsi que des processus `QtWebEngineProcess`.
+  Aucun embedding public direct dans une fenêtre Slint/winit n'a été établi ;
+  ne pas intégrer Qt WebEngine à Memoria pour l'instant. Voir
+  [`experiments/2026-08-21-slint-qtwebengine-system-webview.md`](experiments/2026-08-21-slint-qtwebengine-system-webview.md).
+- **QTextBrowser — fait vérifié le 2026-08-21 :** sur 31 HTML réels
+  sélectionnés localement, `QTextBrowser` a fourni un rendu lisible (A+B 100 %)
+  sans moteur actif ni processus auxiliaire, avec une empreinte nettement
+  inférieure à Qt WebEngine. Les images CID et le CSS HTML complexe restent
+  ouverts ; détails dans
+  [`experiments/2026-08-21-qt-textbrowser-mail-rendering.md`](experiments/2026-08-21-qt-textbrowser-mail-rendering.md).
+- **Pièces jointes Memoria — fait vérifié le 2026-08-21 :** l'extraction à la
+  demande depuis le RAW fonctionne sans modifier l'archive ; les attachments
+  stricts/nommés sont séparés des ressources inline/CID, et les octets décodés
+  peuvent être ouverts ou enregistrés après assainissement du nom. Voir
+  [`experiments/2026-08-21-mail-archive-attachments-ui.md`](experiments/2026-08-21-mail-archive-attachments-ui.md).
+- **Progression Gmail — fait vérifié le 2026-08-21 :** une full sync peut
+  exposer `examined/total` après son unique parcours paginé des IDs, tandis
+  qu'une sync history reste indéterminée sans second parcours réseau. Les
+  nouveaux messages et les octets réellement reçus restent séparés. Voir
+  [`experiments/2026-08-21-mail-archive-sync-progress.md`](experiments/2026-08-21-mail-archive-sync-progress.md).
+- **Dette d'échelle — à mesurer :** la full sync conserve actuellement les
+  IDs Gmail énumérés afin de connaître exactement `N` avant traitement. Cette
+  stratégie est adaptée aux volumes validés, mais devra être mesurée à
+  l'échelle de millions de messages ; alternatives possibles : représentation
+  compacte des IDs ou spool temporaire, sans second parcours réseau.
 - **Mail archive — fait vérifié le 2026-08-20 :** un prototype isolé sous
   [`projects/mail-archive/`](projects/mail-archive/) sépare archive brute
   append-only segmentée, catalogue structuré et index dérivés SQLite/Tantivy.
@@ -145,6 +188,35 @@ Cette section sera enrichie uniquement par des expériences reproductibles.
   `doc_id`, score, date et identité d’archive, puis permet de relire le RAW.
   BM25 reste le classement de référence ; embeddings et reranking restent
   hors périmètre.
+- **Mail archive — fait vérifié le 2026-08-21 :** les filtres structurés
+  (expéditeur, destinataire, bornes de date, présence/MIME de pièce jointe et
+  labels) sont évalués dans Tantivy avant la limite de résultats. Les champs
+  dérivés exacts ajoutés pour MIME/labels et le fast-field de date augmentent
+  l’index Gmail réel d’environ 0,7 % ; les détails, limites et tests sont dans
+  [`experiments/2026-08-21-mail-archive-advanced-search.md`](experiments/2026-08-21-mail-archive-advanced-search.md).
+- **Décision de projet :** une requête sans texte mais avec filtres est valide
+  et retourne les messages les plus récents ; une requête vide sans filtre
+  reste neutre. Les labels sélectionnés ont une sémantique AND et la borne
+  haute de date est exclusive.
+- **Fait vérifié le 2026-08-21 :** sur un corpus structuré déterministe de
+  1 000 000 messages, l’index Tantivy fait environ 136,6 MB et les requêtes
+  combinées restent sous environ 12 ms au p95, mais le RSS de pointe atteint
+  environ 1,2 GiB. La taille reste presque linéaire entre 100k et 1M ; la
+  mémoire devient la prochaine incertitude prioritaire. Voir
+  [`experiments/2026-08-21-mail-archive-structured-search-1m.md`](experiments/2026-08-21-mail-archive-structured-search-1m.md).
+- **Fait vérifié le 2026-08-21 :** la reconstruction Tantivy ne doit pas
+  matérialiser toutes les lignes du catalogue ni toutes les mises à jour de
+  l'état dérivé. Une itération SQLite et une transaction bornée réduisent le
+  pic 1M d'environ 1,23 GiB à environ 0,80 GiB, sans modifier RAW, catalogue
+  ou résultats. Tantivy reste alors le principal poste mémoire observable ;
+  détails dans
+  [`experiments/2026-08-21-mail-archive-index-memory-1m.md`](experiments/2026-08-21-mail-archive-index-memory-1m.md).
+- **Fait vérifié le 2026-08-21 :** sur le corpus structuré 1M, le réglage
+  produit `Index::writer(50_000_000)` est un compromis meilleur que 64 MiB,
+  le minimum valide ou un seul worker ; un seul merger est pratiquement
+  neutre et `NoMergePolicy` est nettement défavorable. La configuration
+  produit reste inchangée et dynamique selon le matériel. Voir
+  [`experiments/2026-08-21-mail-archive-tantivy-writer-tuning.md`](experiments/2026-08-21-mail-archive-tantivy-writer-tuning.md).
 - **Mail archive — fait vérifié le 2026-08-21 :** une première UI Slint hors
   ligne ouvre l’archive réelle, recherche jusqu’à 50 résultats, sélectionne un
   document au clavier/souris et affiche une vue texte du RAW dérivée dans un
@@ -225,6 +297,13 @@ Cette section sera enrichie uniquement par des expériences reproductibles.
   tests de bibliothèque passent et `VCRUNTIME140.dll`/Universal CRT ne sont
   plus importées. Elle est environ 170 KiB plus grande et reste candidate,
   non encore publiée par la CI. Voir le rapport Windows.
+- **Memoria — audit de dépendances fait vérifié le 2026-08-21 :** Slint est
+  déjà en `default-features = false` avec seulement Winit/software/accessibilité;
+  Reqwest n’utilise que Rustls; rfd conserve Wayland/xdg-portal pour les
+  dialogues Linux. La tentative de retirer stemmer/stopwords de Tantivy
+  économise environ 346 KiB mais ne change pratiquement pas l’index ni les
+  latences, donc les defaults Tantivy restent conservés. Détails :
+  [`experiments/2026-08-21-mail-archive-dependency-audit.md`](experiments/2026-08-21-mail-archive-dependency-audit.md).
 
 Pointeurs officiels à consulter au besoin, sans les considérer comme des
 résultats d'expérience locale :
@@ -232,3 +311,82 @@ résultats d'expérience locale :
 - [Slint documentation](https://docs.slint.dev/)
 - [The Rust Book](https://doc.rust-lang.org/book/)
 - [Cargo workspaces](https://doc.rust-lang.org/cargo/reference/workspaces.html)
+
+## 2026-08-21 — Miniatures système
+
+- **Fait vérifié :** sous KDE Wayland, le cache freedesktop et les providers
+  `.thumbnailer` installés fournissent des miniatures réelles sans lier de
+  renderer PDF/Office/vidéo à l'application. La couverture dépend toutefois
+  des providers présents et peut produire `unavailable` ou `error`.
+- **Contrat retenu pour l'expérience :** accepter uniquement une image valide,
+  avec timeout et possibilité de désactiver les previews ; ne jamais confondre
+  une icône de fichier avec une miniature.
+- **Limite :** le backend Windows `IShellItemImageFactory` compile, mais la
+  validation native Windows de l'isolation et des providers reste ouverte.
+- **Détails :** `experiments/2026-08-21-system-thumbnail-service.md`.
+- **Correction vérifiée :** l'absence de `.thumbnailer` PDF ne signifie pas
+  l'absence de support KDE. `KIO::PreviewJob` découvre
+  `gsthumbnail.so` (`application/pdf` notamment), lance le worker KIO hors
+  processus et produit une miniature PDF sur cette machine. Sous KDE, KIO est
+  le backend à essayer avant le fallback freedesktop. Voir le rapport système
+  et `experiments/kio-thumbnail-probe/`.
+- **IPC KIO — fait vérifié :** `KIO::PreviewJob` lance
+  `/usr/lib/kf6/kioworker` et communique avec lui via des sockets Unix privés ;
+  aucun endpoint D-Bus public de preview n'a été observé. Un client Rust ne
+  doit pas réimplémenter ce protocole interne. Le petit helper KF6 est la
+  frontière d'adaptation provisoire. Détails dans le rapport système.
+
+## 2026-08-21 — Première preview Memoria
+
+- **Fait vérifié :** Memoria peut demander une PNG au helper KIO ou au probe
+  freedesktop sans lier Qt/KF6 au binaire principal. L'appel est hors thread
+  UI, borné par timeout et désactivable par configuration d'exécution.
+- **Décision de projet :** l'overlay de lecture reste temporaire et les
+  erreurs de provider n'empêchent ni la lecture du message ni Ouvrir/
+  Enregistrer sous. RAW/catalogue/index ne changent pas.
+- **Détails et mesures :**
+  [`experiments/2026-08-21-mail-archive-attachment-preview.md`](experiments/2026-08-21-mail-archive-attachment-preview.md).
+- **Validation Wayland :** un PDF réel a été prévisualisé via KIO dans
+  l'overlay Memoria ; le helper doit être fourni explicitement en développement
+  ou installé à côté de l'application/dans `PATH`. Un helper absent déclenche
+  le fallback freedesktop puis `unavailable` sans empêcher la lecture.
+
+## 2026-08-21 — HTML dans le navigateur système
+
+- **Fait vérifié :** un serveur éphémère `127.0.0.1` avec token aléatoire peut
+  servir un HTML MIME dérivé et ses ressources CID sans ajouter de WebView au
+  binaire Memoria. Sessions et CID sont gardés en mémoire puis invalidés à la
+  fin du processus.
+- **Décision de projet :** utiliser `ammonia` et une CSP stricte ; scripts,
+  formulaires, objets/iframes et ressources distantes sont bloqués, tandis que
+  les liens externes nécessitent une action explicite.
+- **Détails, dépendances et limites :**
+  [`experiments/2026-08-21-mail-archive-html-browser.md`](experiments/2026-08-21-mail-archive-html-browser.md).
+
+## 2026-08-21 — Internationalisation et identifiants
+
+- **Fait vérifié :** Slint 1.17.1 n’offre pas de catalogue i18n applicatif
+  intégré dans l’API utilisée par Memoria ; le petit catalogue Rust local
+  couvre FR/EN sans nouvelle dépendance runtime.
+- **Décision de projet :** la locale système sélectionne FR pour les locales
+  `fr*`, sinon EN ; les pluriels sont centralisés et les identifiants
+  protocole/schéma restent hors traduction.
+- **Détails :** `experiments/2026-08-21-mail-archive-i18n-identifiers.md`.
+
+- **Fait vérifié :** les sessions HTML sont bornées à 8 et expirent après
+  10 minutes ; la CSP interdit les chargements réseau automatiques.
+
+## 2026-08-21 — Audit dépendances et sécurité Memoria
+
+- **Fait vérifié :** le serveur HTML local utilise uniquement `std::net` ;
+  `tokio`/`hyper` proviennent de Reqwest et ne servent pas au listener local.
+- **Fait vérifié :** `ammonia 4.1.4` ajoute html5ever/markup5ever/cssparser,
+  sans moteur navigateur ni dépendance Qt/KF6/GTK au binaire Memoria.
+- **Sécurité :** `cargo-audit 0.22.2` signale zéro vulnérabilité connue, mais
+  une alerte unsoundness `lru 0.16.4` transitive de Tantivy ; sa correction
+  nécessite une version de Tantivy acceptant `lru >=0.18.2`. Voir le rapport
+  d’audit pour l’évaluation d’exploitabilité et les warnings de maintenance.
+- **Taille :** le binaire release Linux courant fait 31 070 752 octets ; les
+  +692 KiB historiques après i18n ne sont pas attribuables au catalogue sans
+  rebuild contrôlé bit-à-bit.
+- **Rapport :** `experiments/2026-08-21-mail-archive-dependency-security-audit.md`.

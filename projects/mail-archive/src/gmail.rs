@@ -42,6 +42,7 @@ impl std::error::Error for GmailError {}
 #[derive(Clone, Debug, Default)]
 pub struct SyncStats {
     pub examined: u64,
+    pub total: Option<u64>,
     pub new_messages: u64,
     pub label_changes: u64,
     pub deletions: u64,
@@ -76,6 +77,7 @@ pub struct SyncStats {
 #[derive(Clone, Debug, Default)]
 pub struct SyncProgress {
     pub examined: u64,
+    pub total: Option<u64>,
     pub new_messages: u64,
     pub label_changes: u64,
     pub deletions: u64,
@@ -84,9 +86,10 @@ pub struct SyncProgress {
     pub full_sync: bool,
 }
 
-fn progress_snapshot(stats: &SyncStats) -> SyncProgress {
+fn progress_snapshot(stats: &SyncStats, total: Option<u64>) -> SyncProgress {
     SyncProgress {
         examined: stats.examined,
+        total,
         new_messages: stats.new_messages,
         label_changes: stats.label_changes,
         deletions: stats.deletions,
@@ -969,51 +972,63 @@ fn full_sync<T: GmailTransport>(
     let mut writer = crate::ArchiveWriter::open(&root.join("archive"), 64 * 1024 * 1024)
         .map_err(|error| GmailError::Io(error.to_string()))?;
     let mut page = None;
-    let mut seen = HashSet::new();
+    let mut listed_messages = Vec::new();
     let reconcile = max.is_none() && query.is_none();
     loop {
         let response = transport.list(page.as_deref(), query)?;
         let next_page = response.next_page_token.clone();
         for listed in response.messages {
-            if max.map(|limit| stats.examined >= limit).unwrap_or(false) {
+            if max
+                .map(|limit| listed_messages.len() as u64 >= limit)
+                .unwrap_or(false)
+            {
                 break;
             }
-            stats.examined += 1;
-            seen.insert(listed.id.clone());
-            if crate::gmail_message_exists(connection, source, &listed.id)
-                .map_err(|error| GmailError::Other(error.to_string()))?
-            {
-                if reconcile || stats.full_sync {
-                    let metadata = transport.get_metadata(&listed.id)?;
-                    crate::repair_gmail_metadata(
-                        connection,
-                        source,
-                        &metadata.id,
-                        &metadata.thread_id,
-                        &serde_json::to_string(&metadata.label_ids)
-                            .map_err(|error| GmailError::Json(error.to_string()))?,
-                        metadata
-                            .internal_date
-                            .as_deref()
-                            .and_then(|value| value.parse().ok()),
-                        metadata.history_id.as_deref(),
-                    )
-                    .map_err(|error| GmailError::Other(error.to_string()))?;
-                    progress(&progress_snapshot(stats));
-                }
-                continue;
-            }
-            let raw = transport.get_raw(&listed.id)?;
-            import_raw(connection, &mut writer, source, &raw, stats, progress)?;
-            progress(&progress_snapshot(stats));
+            listed_messages.push(listed);
         }
-        if max.map(|limit| stats.examined >= limit).unwrap_or(false) {
+        if max
+            .map(|limit| listed_messages.len() as u64 >= limit)
+            .unwrap_or(false)
+        {
             break;
         }
         page = next_page;
         if page.is_none() {
             break;
         }
+    }
+    let total = Some(listed_messages.len() as u64);
+    stats.total = total;
+    let mut seen = HashSet::new();
+    for listed in listed_messages {
+        stats.examined += 1;
+        seen.insert(listed.id.clone());
+        if crate::gmail_message_exists(connection, source, &listed.id)
+            .map_err(|error| GmailError::Other(error.to_string()))?
+        {
+            if reconcile || stats.full_sync {
+                let metadata = transport.get_metadata(&listed.id)?;
+                crate::repair_gmail_metadata(
+                    connection,
+                    source,
+                    &metadata.id,
+                    &metadata.thread_id,
+                    &serde_json::to_string(&metadata.label_ids)
+                        .map_err(|error| GmailError::Json(error.to_string()))?,
+                    metadata
+                        .internal_date
+                        .as_deref()
+                        .and_then(|value| value.parse().ok()),
+                    metadata.history_id.as_deref(),
+                )
+                .map_err(|error| GmailError::Other(error.to_string()))?;
+                progress(&progress_snapshot(stats, total));
+            }
+            continue;
+        }
+        let raw = transport.get_raw(&listed.id)?;
+        import_raw(connection, &mut writer, source, &raw, stats, progress)?;
+        progress(&progress_snapshot(stats, total));
     }
     writer
         .sync()
@@ -1055,7 +1070,7 @@ fn incremental_sync<T: GmailTransport>(
                     .map_err(|error| GmailError::Other(error.to_string()))?
                 {
                     import_raw(connection, &mut writer, source, &raw, stats, progress)?;
-                    progress(&progress_snapshot(stats));
+                    progress(&progress_snapshot(stats, None));
                 }
             }
             for deleted in record.messages_deleted {
@@ -1075,7 +1090,7 @@ fn incremental_sync<T: GmailTransport>(
                 )
                 .map_err(|error| GmailError::Other(error.to_string()))?;
                 stats.label_changes += 1;
-                progress(&progress_snapshot(stats));
+                progress(&progress_snapshot(stats, None));
             }
         }
         page = next_page;
@@ -1438,6 +1453,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stats.new_messages, 1);
+        assert_eq!(stats.total, Some(1));
+        assert_eq!(progress.last().map(|value| value.examined), Some(1));
+        assert_eq!(progress.last().and_then(|value| value.total), Some(1));
         assert_eq!(progress.last().map(|value| value.new_messages), Some(1));
         assert!(progress.iter().all(|value| value.archive_bytes_added > 0));
         let _ = std::fs::remove_dir_all(&root);
