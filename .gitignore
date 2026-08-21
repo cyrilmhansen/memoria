@@ -1,0 +1,6 @@
+/target/
+credentials*.json
+client_secret*.json
+tokens/
+.mail-archive-tokens/
+.local/

@@ -1,0 +1,4 @@
+[env]
+# Slint 1.17.1 peut charger fontconfig dynamiquement sur Linux. Cela évite
+# de dépendre d'un chemin Homebrew/pkg-config figé au moment de la compilation.
+RUST_FONTCONFIG_DLOPEN = { value = "1", force = true }

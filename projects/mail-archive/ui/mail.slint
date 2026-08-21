@@ -1,0 +1,471 @@
+import { Button, HorizontalBox, LineEdit, ListView, TextEdit, VerticalBox } from "std-widgets.slint";
+
+struct SearchRow {
+    doc-id: int,
+    date: string,
+    correspondent: string,
+    subject: string,
+    snippet: string,
+    attachment: string,
+}
+
+export component MailWindow inherits Window {
+    title: "Memoria — Archive";
+    preferred-width: 1200px;
+    preferred-height: 760px;
+    min-width: 760px;
+    min-height: 520px;
+    background: #f5f6f8;
+
+    in property <[SearchRow]> results;
+    in property <int> selected-index: -1;
+    in property <string> result-count: "0 résultats";
+    in property <string> message-date;
+    in property <string> message-from;
+    in property <string> message-to;
+    in property <string> message-subject;
+    in property <string> message-body;
+    in property <string> message-attachments;
+    in property <string> message-zoom-label: "100 %";
+    in property <length> message-font-size: 14px;
+    in property <string> status: "Prêt";
+    in property <bool> loading: false;
+    in property <bool> archive-view: false;
+    in property <bool> setup-view: false;
+    in property <bool> source-configured: false;
+    in property <bool> syncing: false;
+    in property <string> archive-message-count: "0 messages";
+    in property <string> archive-size: "Archive vide";
+    in property <string> archive-segments: "0 segments";
+    in property <string> archive-catalog: "Catalogue indisponible";
+    in property <string> archive-index: "Index non construit";
+    in property <string> source-status: "Source Gmail non configurée";
+    in property <string> sync-progress: "";
+    in property <string> setup-status: "Choisissez une archive pour commencer.";
+    in-out property <string> query;
+
+    callback search-changed(string);
+    callback search-submitted(string);
+    callback result-selected(int);
+    callback clear-search();
+    callback selection-move(int);
+    callback zoom-change(int);
+    callback show-archive();
+    callback show-search();
+    callback sync-requested();
+    callback refresh-search-index() -> bool;
+    callback open-archive-requested();
+    callback create-archive-requested();
+    callback add-source-requested();
+    callback quit-requested();
+
+    accessible-role: AccessibleRole.main;
+    accessible-label: "Recherche dans l’archive de messages";
+
+    init => { search_field.focus(); }
+
+    function ensure-selected-visible() {
+        if root.selected-index < 0 || root.selected-index >= root.results.length {
+            return;
+        }
+        let item-height = 82px;
+        let item-y = root.selected-index * item-height + results_view.viewport-y;
+        if item-y < 0px {
+            results_view.viewport-y -= item-y;
+        } else if item-y + item-height > results_view.visible-height {
+            results_view.viewport-y -= item-y + item-height - results_view.visible-height;
+        }
+    }
+
+    MenuBar {
+        Menu {
+            title: "Fichier";
+            MenuItem { title: "Nouvelle archive…"; activated => { root.create-archive-requested(); } }
+            MenuItem { title: "Ouvrir une archive…"; activated => { root.open-archive-requested(); } }
+            MenuItem { title: "Archives récentes"; activated => { root.open-archive-requested(); } }
+            MenuSeparator { }
+            MenuItem { title: "Quitter"; activated => { root.quit-requested(); } }
+        }
+        Menu {
+            title: "Archive";
+            MenuItem {
+                title: "État de l’archive…";
+                activated => { root.show-archive(); }
+            }
+            MenuItem {
+                title: "Synchroniser maintenant";
+                enabled: root.source-configured && !root.syncing;
+                activated => { root.sync-requested(); }
+            }
+            MenuItem {
+                title: "Ajouter/configurer une source Gmail…";
+                enabled: !root.syncing;
+                activated => { root.add-source-requested(); }
+            }
+            MenuItem {
+                title: "Retour à la recherche";
+                enabled: root.archive-view;
+                activated => { root.show-search(); }
+            }
+        }
+        Menu {
+            title: "Recherche";
+            MenuItem {
+                title: "Focus recherche";
+                shortcut: @keys(Control + F);
+                activated => { search_field.focus(); }
+            }
+            MenuItem {
+                title: "Effacer la recherche";
+                shortcut: @keys(Control + Backspace);
+                activated => { root.clear-search(); search_field.text = ""; search_field.focus(); }
+            }
+        }
+        Menu {
+            title: "Affichage";
+            MenuItem { title: "Réduire le zoom du message"; enabled: false; }
+            MenuItem { title: "Réinitialiser le zoom du message"; enabled: false; }
+            MenuItem { title: "Augmenter le zoom du message"; enabled: false; }
+        }
+        Menu {
+            title: "Aide";
+            MenuItem { title: "À propos de Memoria"; enabled: false; }
+        }
+    }
+
+    if root.setup-view: Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        background: #f5f6f8;
+        accessible-role: AccessibleRole.region;
+        accessible-label: "Choix de l’archive";
+        VerticalBox {
+            width: min(parent.width - 80px, 560px);
+            x: (parent.width - self.width) / 2;
+            y: 120px;
+            spacing: 14px;
+            Text { text: "Memoria"; color: #202633; font-size: 28px; }
+            Text {
+                text: "Ouvrez une archive existante ou créez-en une nouvelle.";
+                color: #667085;
+                wrap: word-wrap;
+            }
+            Text { text: root.setup-status; color: #9a3412; wrap: word-wrap; }
+            HorizontalBox {
+                spacing: 12px;
+                Button {
+                    text: "Ouvrir une archive…";
+                    accessible-label: "Ouvrir une archive";
+                    clicked => { root.open-archive-requested(); }
+                }
+                Button {
+                    text: "Créer une archive…";
+                    accessible-label: "Créer une archive";
+                    clicked => { root.create-archive-requested(); }
+                }
+            }
+        }
+    }
+
+    if root.archive-view: Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        background: #f5f6f8;
+        accessible-role: AccessibleRole.region;
+        accessible-label: "Archive et synchronisation";
+        VerticalBox {
+            padding: 28px;
+            spacing: 18px;
+            Text {
+                text: "Archive / Synchronisation";
+                color: #202633;
+                font-size: 24px;
+                vertical-alignment: center;
+            }
+            HorizontalBox {
+                spacing: 18px;
+                Rectangle {
+                    horizontal-stretch: 1;
+                    background: white;
+                    border-width: 1px;
+                    border-color: #d9dde5;
+                    border-radius: 6px;
+                    VerticalBox {
+                        padding: 18px;
+                        spacing: 10px;
+                        Text { text: "Archive locale"; color: #202633; font-size: 17px; }
+                        Text { text: root.archive-message-count; color: #344054; }
+                        Text { text: root.archive-size; color: #344054; }
+                        Text { text: root.archive-segments; color: #344054; }
+                        Text { text: root.archive-catalog; color: #667085; }
+                        Text { text: root.archive-index; color: #667085; }
+                    }
+                }
+                Rectangle {
+                    horizontal-stretch: 1;
+                    background: white;
+                    border-width: 1px;
+                    border-color: #d9dde5;
+                    border-radius: 6px;
+                    VerticalBox {
+                        padding: 18px;
+                        spacing: 10px;
+                        Text { text: "Source Gmail"; color: #202633; font-size: 17px; }
+                        Text {
+                            text: root.source-status;
+                            color: root.source-configured ? #344054 : #9a3412;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: root.sync-progress;
+                            color: #667085;
+                            wrap: word-wrap;
+                        }
+                        if !root.source-configured: Button {
+                            text: "Ajouter un compte Gmail…";
+                            accessible-label: "Ajouter ou configurer une source Gmail";
+                            clicked => { root.add-source-requested(); }
+                        }
+                        Button {
+                            text: root.syncing ? "Synchronisation…" : "Synchroniser maintenant";
+                            enabled: root.source-configured && !root.syncing;
+                            accessible-label: "Synchroniser maintenant avec Gmail";
+                            clicked => { root.sync-requested(); }
+                        }
+                    }
+                }
+            }
+            Rectangle { vertical-stretch: 1; }
+        }
+    }
+
+    scope := FocusScope {
+        width: parent.width;
+        height: parent.height;
+        visible: !root.archive-view && !root.setup-view;
+        capture-key-pressed(event) => {
+            if event.text == Key.Escape {
+                if root.message-subject != "" {
+                    result_scope.focus();
+                } else {
+                    root.clear-search();
+                    search_field.text = "";
+                    search_field.focus();
+                }
+                accept;
+            } else if event.modifiers.control && event.text == "f" {
+                search_field.focus();
+                accept;
+            } else if event.modifiers.control && event.text == Key.Backspace {
+                root.clear-search();
+                search_field.text = "";
+                search_field.focus();
+                accept;
+            } else if event.modifiers.control && (event.text == "+" || event.text == "=") {
+                root.zoom-change(1);
+                accept;
+            } else if event.modifiers.control && event.text == "-" {
+                root.zoom-change(-1);
+                accept;
+            } else if event.modifiers.control && event.text == "0" {
+                root.zoom-change(0);
+                accept;
+            } else if event.text == Key.UpArrow {
+                root.selection-move(-1);
+                result_scope.focus();
+                root.ensure-selected-visible();
+                accept;
+            } else if event.text == Key.DownArrow {
+                root.selection-move(1);
+                result_scope.focus();
+                root.ensure-selected-visible();
+                accept;
+            } else if event.text == Key.PageUp {
+                root.selection-move(-10);
+                result_scope.focus();
+                root.ensure-selected-visible();
+                accept;
+            } else if event.text == Key.PageDown {
+                root.selection-move(10);
+                result_scope.focus();
+                root.ensure-selected-visible();
+                accept;
+            } else if event.text == Key.Home {
+                root.selection-move(-1000000);
+                result_scope.focus();
+                root.ensure-selected-visible();
+                accept;
+            } else if event.text == Key.End {
+                root.selection-move(1000000);
+                result_scope.focus();
+                root.ensure-selected-visible();
+                accept;
+            } else if event.text == Key.Return {
+                if root.selected-index >= 0 {
+                    root.result-selected(root.selected-index);
+                }
+                accept;
+            }
+            reject
+        }
+
+        Rectangle {
+            background: #f5f6f8;
+            VerticalBox {
+            padding: 18px;
+            spacing: 12px;
+
+            HorizontalBox {
+                height: 44px;
+                Text {
+                    text: "Memoria";
+                    color: #202633;
+                    font-size: 22px;
+                    vertical-alignment: center;
+                }
+                Rectangle { width: 18px; }
+                search_field := LineEdit {
+                    horizontal-stretch: 1;
+                    height: 36px;
+                    text: root.query;
+                    placeholder-text: "Rechercher dans les messages…";
+                    accessible-label: "Recherche dans les messages";
+                    edited(text) => { root.query = text; root.search-changed(text); }
+                    accepted => { root.search-submitted(self.text); }
+                }
+                Button {
+                    text: "Effacer";
+                    accessible-label: "Effacer la recherche";
+                    clicked => { root.clear-search(); search_field.text = ""; search_field.focus(); }
+                }
+            }
+
+            HorizontalBox {
+                spacing: 12px;
+                VerticalBox {
+                    horizontal-stretch: 2;
+                    spacing: 8px;
+                    HorizontalBox {
+                        height: 24px;
+                        Text { text: root.result-count; color: #667085; vertical-alignment: center; }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text { text: root.loading ? "Recherche…" : root.status; color: #667085; vertical-alignment: center; }
+                    }
+                    Rectangle {
+                        vertical-stretch: 1;
+                        background: white;
+                        border-width: 1px;
+                        border-color: #d9dde5;
+                        border-radius: 6px;
+                        Text {
+                            text: root.results.length == 0 ? "Saisissez une recherche pour afficher les messages." : "";
+                            color: #667085;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            width: parent.width;
+                            accessible-label: "Aucun résultat. Saisissez une recherche pour afficher les messages.";
+                        }
+                        result_scope := FocusScope {
+                            width: parent.width;
+                            height: parent.height;
+                            results_view := ListView {
+                            accessible-label: "Liste des résultats de recherche";
+                            for row[index] in root.results : Rectangle {
+                                width: parent.width;
+                                height: 82px;
+                                background: index == root.selected-index ? #e2f1ef : #ffffff;
+                                accessible-role: AccessibleRole.list-item;
+                                accessible-label: row.correspondent + " — " + row.subject + " — " + row.date;
+                                HorizontalBox {
+                                    padding: 10px;
+                                    spacing: 10px;
+                                    VerticalBox {
+                                        horizontal-stretch: 1;
+                                        spacing: 3px;
+                                        HorizontalBox {
+                                            Text { text: row.correspondent; color: #202633; font-size: 13px; }
+                                            Rectangle { horizontal-stretch: 1; }
+                                            Text { text: row.date; color: #667085; font-size: 11px; }
+                                        }
+                                        Text { text: row.subject; color: #202633; font-size: 14px; overflow: elide; }
+                                        Text { text: row.snippet; color: #667085; font-size: 11px; overflow: elide; }
+                                    }
+                                    Text { text: row.attachment; color: #667085; vertical-alignment: center; }
+                                }
+                                TouchArea {
+                                    width: parent.width;
+                                    height: parent.height;
+                                    clicked => { root.result-selected(index); }
+                                }
+                                Rectangle {
+                                    y: parent.height - 1px;
+                                    width: parent.width;
+                                    height: 1px;
+                                    background: #edf0f3;
+                                }
+                            }
+                        }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    horizontal-stretch: 3;
+                    background: white;
+                    border-width: 1px;
+                    border-color: #d9dde5;
+                    border-radius: 6px;
+                    accessible-role: AccessibleRole.region;
+                    accessible-label: "Panneau de lecture du message";
+                    VerticalBox {
+                        padding: 18px;
+                        spacing: 8px;
+                        HorizontalBox {
+                            Text {
+                                text: root.message-subject == "" ? "Sélectionnez un message" : root.message-subject;
+                                color: #202633;
+                                font-size: 18px;
+                                wrap: word-wrap;
+                                horizontal-stretch: 1;
+                            }
+                            Button {
+                                text: "−";
+                                accessible-label: "Réduire le zoom du message";
+                                clicked => { root.zoom-change(-1); }
+                            }
+                            Button {
+                                text: root.message-zoom-label;
+                                accessible-label: "Réinitialiser le zoom du message";
+                                clicked => { root.zoom-change(0); }
+                            }
+                            Button {
+                                text: "+";
+                                accessible-label: "Augmenter le zoom du message";
+                                clicked => { root.zoom-change(1); }
+                            }
+                        }
+                        Text { text: root.message-date; color: #667085; font-size: 11px; }
+                        Text { text: root.message-from; color: #344054; font-size: 12px; overflow: elide; }
+                        Text { text: root.message-to; color: #344054; font-size: 12px; overflow: elide; }
+                        Text { text: root.message-attachments; color: #667085; font-size: 11px; }
+                        Rectangle { height: 1px; background: #e5e7eb; }
+                        TextEdit {
+                            vertical-stretch: 1;
+                            read-only: true;
+                            text: root.message-body == "" ? "Le contenu dérivé du message apparaîtra ici." : root.message-body;
+                            font-size: root.message-font-size;
+                            wrap: word-wrap;
+                            accessible-label: "Corps du message (sélectionnable et copiable)";
+                        }
+                    }
+                }
+            }
+            }
+        }
+    }
+
+}

@@ -1,0 +1,22 @@
+[package]
+name = "slint-apps-workspace"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+slint = { version = "1.17.1", default-features = false, features = ["std", "backend-winit", "renderer-software", "accessibility", "compat-1-2"] }
+# Slint 1.17.1 partage cette version de fontique avec son moteur de texte.
+# Cette activation explicite rend le chargement fontconfig dynamique sur Linux
+# et évite de lier le build à un chemin Homebrew/pkg-config.
+fontique = { version = "0.10.0", default-features = false, features = ["fontconfig-dlopen"] }
+
+[build-dependencies]
+slint-build = "1.17.1"
+
+[workspace]
+resolver = "2"
+members = ["projects/mail-archive"]
+
+# Les applications futures seront ajoutées comme membres lorsqu'elles auront
+# des besoins et un manifeste Cargo connus.

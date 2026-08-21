@@ -1,0 +1,185 @@
+# mail-archive — expérimentation de stockage et recherche
+
+Ce crate est un prototype jetable pour mesurer une architecture d’archive
+locale. Il ne contient ni client Gmail métier complet, ni IMAP, ni restauration
+vers un fournisseur. Il contient une UI de recherche/consultation et un
+connecteur Gmail expérimental strictement en lecture seule.
+
+## Exécution
+
+Depuis la racine du workspace :
+
+```text
+cargo run -p mail-archive-experiment --bin mail-archive-experiment -- generate --messages 10000 --seed 42 --out /tmp/mail-archive
+cargo run -p mail-archive-experiment --bin mail-archive-experiment -- generate --profile personal --messages 10000 --seed 42 --out /tmp/mail-archive-personal
+cargo run -p mail-archive-experiment --bin mail-archive-experiment -- generate --profile heavy --messages 5000 --seed 42 --out /tmp/mail-archive-heavy
+cargo run -p mail-archive-experiment --bin mail-archive-experiment -- benchmark --messages 100000 --seed 42 --attachment-rate 0 --queries 2 --segment-bytes 67108864 --out /tmp/mail-archive-bench
+cargo run -p mail-archive-experiment --bin mail-archive-experiment -- recover-demo --messages 10 --out /tmp/mail-archive-recovery
+cargo run -p mail-archive-experiment --bin mail-archive-experiment -- cas-benchmark --profile personal --messages 10000 --seed 42 --out /tmp/mail-archive-cas
+cargo test -p mail-archive-experiment
+cargo run -p mail-archive-experiment --bin mail-archive-experiment -- gmail-report --archive /chemin/archive
+cargo run -p mail-archive-experiment --bin mail-archive-app
+cargo run -p mail-archive-experiment --bin mail-archive-app -- --archive /chemin/archive
+cargo run -p mail-archive-experiment --bin mail-archive-app -- --archive /chemin/archive --benchmark
+```
+
+## Synchronisation Gmail en lecture seule
+
+Le connecteur utilise exclusivement le scope
+`https://www.googleapis.com/auth/gmail.readonly`. Il appelle `list`, `get` en
+`format=RAW` et `history`; aucune opération Gmail d’écriture n’est présente
+dans le prototype. Les bytes RAW décodés de base64url sont la représentation
+faisant autorité, tandis que les IDs Gmail, thread, labels, dates et history IDs
+restent dans le catalogue SQLite.
+
+```text
+cargo run -p mail-archive-experiment --bin mail-archive-experiment -- gmail-sync \
+  --archive /chemin/archive \
+  --credentials /chemin/client_secret.json \
+  --account compte-principal \
+  --max-messages 100
+```
+
+`--query` accepte une requête Gmail pour borner une expérience. Une clé opaque
+est recommandée pour `--account`. La synchronisation incrémentale utilise le
+`historyId`; si Gmail ne conserve plus cet historique, le prototype repart en
+full sync sans effacer l’archive. Une full sync complète marque les messages
+absents comme supprimés côté source, mais ne supprime jamais leurs frames.
+
+Configuration minimale : créer un projet Google Cloud, activer Gmail API,
+configurer l’écran de consentement, créer un client OAuth **Desktop app**, puis
+télécharger le JSON installé. Le premier lancement ouvre un navigateur et
+utilise une redirection loopback locale. Credentials et tokens doivent rester
+hors du répertoire d’archive et sont ignorés par Git. Aucun token, contenu ou
+attribut MIME n’est écrit dans les logs.
+
+Le benchmark produit des lignes `key=value` et crée quatre familles
+d’artefacts séparées :
+
+- `archive/segment-*.arc` : données brutes faisant autorité, append-only,
+  avec frames length/checksum et segmentation configurable ;
+- `metadata.sqlite` : catalogue structuré et positions d’archive, distinct de
+  la recherche ;
+- `sqlite-fts.db` : index FTS5 dérivé et reconstructible ;
+- `tantivy/` : index Tantivy dérivé et reconstructible.
+
+## Première interface de recherche
+
+`mail-archive-app` peut démarrer sans argument. Il rouvre l’archive par défaut
+ou récemment utilisée si elle est accessible ; sinon l’écran initial permet
+`Ouvrir une archive…` ou `Créer une archive…`. Un dossier non vide est refusé
+pour une nouvelle archive et un dossier invalide n’est pas créé implicitement.
+La configuration légère est stockée dans `$XDG_CONFIG_HOME/memoria/config.json`
+(ou le répertoire standard équivalent) ; elle ne contient ni messages ni
+tokens. Les tokens OAuth restent dans un répertoire séparé.
+
+`mail-archive-app` ouvre une archive existante hors ligne, réutilise l’index
+Tantivy dérivé et affiche jusqu’à 50 résultats. Une recherche vide conserve un
+état neutre ; la saisie est réactive. Cliquer une ligne, ou utiliser les
+flèches puis Entrée, lit la frame RAW dans un thread de fond et affiche une
+représentation texte dérivée du MIME. Le RAW n’est jamais remplacé par cette
+représentation.
+
+## Synchronisation depuis Memoria
+
+La vue `Archive / Synchronisation` est accessible depuis le menu `Archive`.
+Depuis cette vue, `Ajouter un compte Gmail…` demande explicitement un fichier
+OAuth Desktop existant, puis réutilise le flux loopback du connecteur. Le scope
+reste exclusivement `gmail.readonly`. La première synchronisation se lance
+ensuite avec `Synchroniser maintenant` ; aucune autorisation ni synchronisation
+n’est lancée au démarrage.
+
+Le mode CLI reste disponible pour des exécutions reproductibles :
+
+```text
+cargo run -p mail-archive-experiment --bin mail-archive-app -- \
+  --archive /chemin/archive \
+  --credentials ~/.config/mail-archive/gmail-client.json \
+  --token-dir ~/.config/mail-archive/tokens \
+  --account compte-local
+```
+
+Sans credentials, la consultation locale reste disponible et la vue Archive
+indique que la source Gmail n’est pas configurée. L’action explicite
+`Synchroniser maintenant` effectue la full sync, la réconciliation history ou
+la reprise prévue par le connecteur existant, puis met à jour l’index Tantivy
+dans un worker. Les RAW et le catalogue sont validés avant que l’interface
+n’affiche l’index comme à jour. Une erreur d’indexation ne supprime pas les
+RAW ; elle est affichée séparément.
+
+Le prototype ne fournit pas encore de client OAuth Google distribué par le
+projet : le développeur doit créer un client **Desktop app** dans Google Cloud
+et sélectionner son fichier JSON dans Memoria. Credentials et tokens restent
+hors de l’archive et hors Git.
+
+Le chemin de l’archive vient de `--archive` ou de `MAIL_ARCHIVE_PATH`. La
+commande `--benchmark` mesure seulement le contrôleur local (ouverture,
+recherche, lecture/parsing) et n’ouvre pas de fenêtre.
+
+Après la génération initiale, les deux indexeurs suivent le chemin
+`archive → catalogue → lecture ciblée → parsing → index`. Le générateur n'est
+pas utilisé pour reconstruire les messages pendant l'indexation.
+
+Le seed, le nombre de messages et la politique de pièces jointes rendent le
+corpus reproductible. Le générateur couvre plusieurs langues, comptes,
+dossiers, conversations, distributions de correspondants, termes fréquents
+et rares, formats texte/HTML et pièces jointes à tailles variables.
+
+Trois profils sont disponibles : `light` (majoritairement textuel),
+`personal` (hétérogène, newsletters, reçus et pièces jointes) et `heavy`
+(beaucoup de pièces jointes et messages volumineux). `--duplicate-rate`
+contrôle explicitement la probabilité de contenu partagé ; `--compression`
+active les mesures gzip/zstd, coûteuses sur les gros profils.
+
+## Dépendances expérimentales
+
+- `rusqlite 0.40.2` avec `bundled` : SQLite est compilé localement et FTS5 est
+  disponible sans serveur ni bibliothèque SQLite système ; la table utilise
+  le tokenizer Unicode61 et des champs FTS séparés.
+- `tantivy 0.26.1` : index inversé Rust segmenté, BM25 via le query parser,
+  champ numérique de date et index reader séparé.
+- `flate2 1.1` : baseline gzip des bytes bruts ; ce n’est pas une décision de
+  compression de l’archive.
+- `zstd 0.13` : mesure expérimentale au niveau message, également sans
+  décision de format.
+- `reqwest 0.12` avec `rustls-tls` : transport HTTPS minimal vers l’API Gmail.
+- `mailparse 0.16.1` : parsing MIME dérivé; il ne remplace jamais la copie RAW.
+- `base64 0.22`, `blake3 1.8` : décodage base64url et statistiques de hash en
+  lecture seule, sans CAS de production.
+- `dirs 6`, `url 2.5`, `webbrowser 1` : token dir configurable, callback OAuth
+  et ouverture du navigateur desktop.
+
+## Limites actuelles
+
+- Le benchmark compare les mêmes champs recherchables et stocke aussi les
+  champs textuels côté Tantivy ; SQLite conserve en plus sa table de contenu
+  FTS5 et ses attributs structurés. Les tailles ne sont donc comparables
+  qu'avec cette ventilation explicite.
+- Les résultats de taille ne sont pas une preuve à 300 Go : le corpus reste
+  synthétique et le benchmark ne simule pas la fragmentation, les disques
+  lents ou plusieurs millions de lignes.
+- La déduplication n’est pas encore appliquée aux bytes de l’archive. Le
+  corpus mesure seulement les hashes d’attachements répétés pour préparer une
+  expérience coût/bénéfice séparée.
+- Le mode « index chaud » indexe les 270 derniers messages, soit environ 90
+  jours selon l’horloge synthétique. Il est reconstruit indépendamment et ne
+  déplace aucun objet archivé.
+- La campagne Gmail réelle dépend de credentials locaux et n’est pas exécutée
+  automatiquement. Les fixtures vérifient pagination, RAW binaire, idempotence
+  et repli après expiration de l’historique; les statistiques d’un compte réel
+  doivent rester agrégées et anonymisées.
+- `mailparse` fournit des vues MIME dérivées; les offsets MIME ne sont pas
+  encore persistés. La fidélité byte-exacte repose sur les bytes RAW.
+
+Le rapport détaillé de changement d'échelle est dans
+[`experiments/2026-08-20-mail-archive-scale.md`](../../experiments/2026-08-20-mail-archive-scale.md).
+Le rapport CAS et contrat de fidélité est dans
+[`experiments/2026-08-20-mail-archive-cas.md`](../../experiments/2026-08-20-mail-archive-cas.md).
+Le rapport du connecteur Gmail est dans
+[`experiments/2026-08-20-mail-archive-gmail-readonly.md`](../../experiments/2026-08-20-mail-archive-gmail-readonly.md).
+Le rapport de la campagne réelle 100 → 1 000 est dans
+[`experiments/2026-08-20-mail-archive-gmail-real-1000.md`](../../experiments/2026-08-20-mail-archive-gmail-real-1000.md).
+L’expérience MIME ciblée `has:attachment` est dans
+[`experiments/2026-08-20-mail-archive-gmail-attachments.md`](../../experiments/2026-08-20-mail-archive-gmail-attachments.md).
+La full sync réelle complète est documentée dans
+[`experiments/2026-08-20-mail-archive-gmail-full-sync.md`](../../experiments/2026-08-20-mail-archive-gmail-full-sync.md).

@@ -1,0 +1,252 @@
+import { Button, CheckBox, HorizontalBox, LineEdit, ListView, ProgressIndicator, VerticalBox } from "std-widgets.slint";
+
+export component DemoWindow inherits Window {
+    title: "Slint native workspace demo";
+    width: 1180px;
+    height: 760px;
+    background: #f5f6f8;
+
+    in property <[string]> items;
+    in property <int> filtered-count;
+    in property <int> selected-index: -1;
+    in property <string> selected-item: "Aucun élément sélectionné";
+    in property <string> selected-page: "Explorer";
+    in property <string> status: "Prêt";
+    in property <int> task-progress: 0;
+    in property <bool> task-running: false;
+    in property <bool> dialog-open: false;
+    in-out property <bool> show-details: true;
+
+    callback navigate(string);
+    callback search-changed(string);
+    callback item-selected(int);
+    callback start-task();
+    callback cancel-task();
+    callback open-dialog();
+    callback close-dialog();
+    callback preferences-changed(bool);
+
+    accessible-role: AccessibleRole.main;
+    accessible-label: "Démonstration Slint native";
+
+    Rectangle {
+        background: #f5f6f8;
+
+        HorizontalBox {
+            padding: 0px;
+            spacing: 0px;
+
+            Rectangle {
+                width: 190px;
+                background: #202633;
+
+                VerticalBox {
+                    padding: 20px;
+                    spacing: 8px;
+
+                    Text {
+                        text: "SLINT LAB";
+                        color: #8bd5ca;
+                        font-size: 18px;
+                    }
+                    Text {
+                        text: "Native desktop demo";
+                        color: #aeb7c8;
+                        font-size: 12px;
+                    }
+                    Rectangle { height: 16px; }
+                    Button {
+                        text: "Explorer";
+                        primary: root.selected-page == "Explorer";
+                        clicked => { root.navigate("Explorer"); }
+                    }
+                    Button {
+                        text: "Activité";
+                        primary: root.selected-page == "Activité";
+                        clicked => { root.navigate("Activité"); }
+                    }
+                    Button {
+                        text: "Préférences";
+                        primary: root.selected-page == "Préférences";
+                        clicked => { root.navigate("Préférences"); }
+                    }
+                    Rectangle { vertical-stretch: 1; }
+                    Text {
+                        text: "Sans WebView\nWindows · Linux · Wayland";
+                        color: #aeb7c8;
+                        font-size: 11px;
+                    }
+                }
+            }
+
+            VerticalBox {
+                padding: 24px;
+                spacing: 16px;
+
+                HorizontalBox {
+                    height: 42px;
+                    Text {
+                        text: root.selected-page;
+                        font-size: 26px;
+                        color: #202633;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Button {
+                        text: "Ouvrir le dialogue";
+                        clicked => { root.open-dialog(); }
+                    }
+                }
+
+                Rectangle {
+                    height: 1px;
+                    background: #d9dde5;
+                }
+
+                HorizontalBox {
+                    spacing: 16px;
+
+                    VerticalBox {
+                        horizontal-stretch: 2;
+                        spacing: 10px;
+
+                        HorizontalBox {
+                            height: 40px;
+                            LineEdit {
+                                placeholder-text: "Rechercher parmi 100 000 éléments…";
+                                edited(text) => { root.search-changed(text); }
+                                accessible-label: "Recherche dans les éléments";
+                            }
+                            Text {
+                                text: root.filtered-count + " résultats";
+                                color: #667085;
+                                vertical-alignment: center;
+                                horizontal-alignment: right;
+                            }
+                        }
+
+                        Rectangle {
+                            vertical-stretch: 1;
+                            background: white;
+                            border-width: 1px;
+                            border-color: #d9dde5;
+                            border-radius: 6px;
+
+                            ListView {
+                                viewport-height: self.height;
+                                for item[index] in root.items : Rectangle {
+                                    height: 34px;
+                                    background: index == root.selected-index ? #e5f3f1 : (Math.mod(index, 2) == 0 ? #ffffff : #fafbfc);
+                                    accessible-role: AccessibleRole.list-item;
+                                    accessible-label: item;
+
+                                    HorizontalBox {
+                                        padding-left: 12px;
+                                        padding-right: 12px;
+                                        Text {
+                                            text: item;
+                                            color: #273142;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    TouchArea {
+                                        clicked => { root.item-selected(index); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: 250px;
+                        background: white;
+                        border-width: 1px;
+                        border-color: #d9dde5;
+                        border-radius: 6px;
+
+                        VerticalBox {
+                            padding: 16px;
+                            spacing: 12px;
+                            Text {
+                                text: "Propriétés";
+                                font-size: 17px;
+                                color: #202633;
+                            }
+                            Text { text: "Élément sélectionné"; color: #667085; font-size: 11px; }
+                            Text { text: root.selected-item; color: #202633; wrap: word-wrap; }
+                            Rectangle { height: 1px; background: #e5e7eb; }
+                            Text { text: "État"; color: #667085; font-size: 11px; }
+                            Text { text: root.status; color: #202633; }
+                            Rectangle { vertical-stretch: 1; }
+                            CheckBox {
+                                text: "Afficher ce panneau";
+                                checked: root.show-details;
+                                toggled => { root.show-details = self.checked; root.preferences-changed(self.checked); }
+                                accessible-label: "Afficher le panneau de propriétés";
+                            }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 116px;
+                    background: white;
+                    border-width: 1px;
+                    border-color: #d9dde5;
+                    border-radius: 6px;
+
+                    VerticalBox {
+                        padding: 14px;
+                        spacing: 8px;
+                        HorizontalBox {
+                            Text { text: "Tâche Rust hors UI"; font-size: 16px; color: #202633; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Text { text: root.task-progress + "%"; color: #667085; }
+                        }
+                        ProgressIndicator { progress: root.task-progress / 100.0; }
+                        HorizontalBox {
+                            Text { text: root.status; color: #667085; vertical-alignment: center; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Button {
+                                text: root.task-running ? "Annuler" : "Démarrer";
+                                clicked => { root.task-running ? root.cancel-task() : root.start-task(); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if root.dialog-open : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        background: #00000055;
+        TouchArea { clicked => { } }
+
+        Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 390px;
+            height: 190px;
+            background: white;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: #cfd5df;
+
+            VerticalBox {
+                padding: 22px;
+                spacing: 14px;
+                Text { text: "Dialogue modal"; font-size: 19px; color: #202633; }
+                Text { text: "Cette fenêtre est rendue par Slint, sans WebView."; color: #667085; wrap: word-wrap; }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalBox {
+                    Rectangle { horizontal-stretch: 1; }
+                    Button { text: "Fermer"; clicked => { root.close-dialog(); } }
+                }
+            }
+        }
+    }
+}
