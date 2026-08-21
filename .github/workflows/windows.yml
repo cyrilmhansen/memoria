@@ -3,6 +3,7 @@ name: Windows
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   check-and-test:
@@ -12,22 +13,46 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo check --workspace
       - run: cargo test --workspace
-      - run: cargo build --release -p mail-archive-experiment --bin mail-archive-app
+      - name: Build CI profile
+        run: cargo build --profile ci -p mail-archive-experiment --bin mail-archive-app
       - uses: actions/upload-artifact@v4
         with:
           name: memoria-windows-x86_64
-          path: target/release/mail-archive-app.exe
+          path: target/ci/mail-archive-app.exe
           if-no-files-found: error
       - name: Test workspace with static CRT
         run: cargo test --workspace
         env:
           RUSTFLAGS: -C target-feature=+crt-static
-      - name: Build release with static CRT
-        run: cargo build --release -p mail-archive-experiment --bin mail-archive-app
+      - name: Build CI profile with static CRT
+        run: cargo build --profile ci -p mail-archive-experiment --bin mail-archive-app
         env:
           RUSTFLAGS: -C target-feature=+crt-static
       - uses: actions/upload-artifact@v4
         with:
           name: memoria-windows-x86_64-static
+          path: target/ci/mail-archive-app.exe
+          if-no-files-found: error
+
+  distribution-release:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build distribution release
+        run: cargo build --release -p mail-archive-experiment --bin mail-archive-app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: memoria-windows-x86_64-release
+          path: target/release/mail-archive-app.exe
+          if-no-files-found: error
+      - name: Build distribution release with static CRT
+        run: cargo build --release -p mail-archive-experiment --bin mail-archive-app
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+      - uses: actions/upload-artifact@v4
+        with:
+          name: memoria-windows-x86_64-release-static
           path: target/release/mail-archive-app.exe
           if-no-files-found: error

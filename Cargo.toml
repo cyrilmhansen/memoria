@@ -23,5 +23,12 @@ strip = true
 lto = true
 codegen-units = 1
 
+# Used for ordinary CI artifacts: optimized and stripped, but less expensive
+# to link than the distribution profile above.
+[profile.ci]
+inherits = "release"
+lto = "thin"
+codegen-units = 8
+
 # Les applications futures seront ajoutées comme membres lorsqu'elles auront
 # des besoins et un manifeste Cargo connus.

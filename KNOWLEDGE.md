@@ -57,6 +57,12 @@ Cette section sera enrichie uniquement par des expériences reproductibles.
   Windows du démarrage, SmartScreen/antivirus, OAuth et d'une future
   signature. Mesures détaillées dans
   [`experiments/2026-08-21-mail-archive-release-profiles.md`](experiments/2026-08-21-mail-archive-release-profiles.md).
+- **Décision de projet :** les builds CI ordinaires utilisent le profil Cargo
+  `ci` (`inherits = "release"`, ThinLTO, 8 unités de codegen) ; le profil
+  `release` conserve le fat LTO et `codegen-units=1` pour les binaires de
+  distribution. Le build CI Linux local mesuré fait 36 609 152 octets contre
+  31 070 752 octets pour le release historique ; aucun run GitHub n'est encore
+  associé à cette modification non poussée.
 - **Slint/WebView — fait vérifié le 2026-08-21 :** wry 0.56.1 peut attacher
   une WebView système à une fenêtre Slint/Winit sous Windows et Linux/X11,
   mais `build_as_child` ne supporte pas Wayland. Wayland demande le chemin

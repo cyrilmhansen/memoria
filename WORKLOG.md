@@ -483,3 +483,15 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
   `tantivy 0.26.1` (`lru ^0.16.3`) ; aucun changement de dépendance conservé.
 - Binaire release restauré après l’analyse bloat : 31 070 752 octets.
 - Rapport : `experiments/2026-08-21-mail-archive-dependency-security-audit.md`.
+
+## 2026-08-21 — Profil CI ThinLTO
+
+- Ajouté `[profile.ci]`, hérité de `release` avec ThinLTO et 8 unités de
+  codegen ; le profil de distribution fat LTO reste inchangé.
+- Le workflow Windows utilise `ci` pour les builds ordinaires push/PR et garde
+  `release` dans un job `workflow_dispatch` explicite, pour les variantes CRT
+  dynamique et statique.
+- Validation locale : formatage, `cargo check --workspace`,
+  `cargo test --workspace` et build `cargo build --profile ci` passés.
+- Mesure locale : binaire CI Linux de 36 609 152 octets contre 31 070 752
+  octets pour le release historique ; aucun run GitHub n'a encore été exécuté.
