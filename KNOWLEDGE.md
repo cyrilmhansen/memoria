@@ -375,6 +375,10 @@ résultats d'expérience locale :
 
 - **Fait vérifié :** les sessions HTML sont bornées à 8 et expirent après
   10 minutes ; la CSP interdit les chargements réseau automatiques.
+- **Correction vérifiée :** les références `cid:` doivent être normalisées
+  (angles et percent-encoding) avant sanitisation, puis comparées exactement
+  au `Content-ID` MIME. Les réponses CID conservent leur MIME image pour
+  `nosniff`; les ressources HTTP/HTTPS restent bloquées. Voir le rapport HTML.
 
 ## 2026-08-21 — Audit dépendances et sécurité Memoria
 

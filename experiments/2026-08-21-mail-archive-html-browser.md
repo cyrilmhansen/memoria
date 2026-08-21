@@ -94,3 +94,43 @@ actifs ou aux intégrations externes ; scripts, formulaires, iframes, objets et
 ressources distantes sont volontairement neutralisés. Le rendu et la sécurité
 finale dépendent aussi du navigateur utilisé ; la CSP reste donc une barrière
 de défense obligatoire.
+
+## Correction CID — validation réelle
+
+**Cause vérifiée.** La première réécriture recherchait des chaînes littérales
+`cid:<id>` et une variante HTML échappée. Elle ne normalisait pas les références
+CID URL-encodées (`%40`, `%3C`, `%3E`) et ne traitait pas uniformément les formes
+entourées d'angles. Ammonia supprimait ensuite les `src` CID restés inconnus.
+La route, la CSP et `nosniff` n'étaient pas la cause du défaut.
+
+La correction réécrit avant sanitisation chaque référence dont le schéma est
+`cid:` après une normalisation stricte : décodage percent-encoding valide,
+retrait éventuel des angles, puis égalité exacte avec le `Content-ID` MIME
+normalisé. Une référence inconnue reste bloquée par la sanitisation ; aucune
+correspondance approximative n'est tentée.
+
+La réponse CID conserve le type MIME de la partie MIME, par exemple
+`image/png`, et non un type générique. La CSP `img-src 'self'`, le header
+`X-Content-Type-Options: nosniff`, les tokens opaques et le bind localhost
+n'ont pas changé.
+
+Le diagnostic hors ligne anonymisé sur l'archive réelle a observé :
+
+```text
+html_messages=3002
+img_total=36162
+cid_src=78
+cid_mime_resources=96
+cid_matched=78
+cid_rewritten=78
+cid_get_requests=78
+cid_http_200=78
+cid_content_type_image=78
+```
+
+Un smoke test a ouvert le premier message correspondant dans le navigateur
+système via l'URL locale opaque ; le serveur a servi toutes les ressources CID
+correspondantes en `image/*`. Aucun contenu, identifiant réel ou octet de
+l'archive n'a été journalisé. Les tests couvrent désormais les CID simples,
+avec `@`, percent-encodés, plusieurs ressources, CID absent, ressource
+non-image et image HTTPS bloquée.

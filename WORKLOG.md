@@ -461,6 +461,18 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
 - Validations : `cargo test -p mail-archive-experiment`, `cargo check --workspace`.
 - Rapport : `experiments/2026-08-21-mail-archive-i18n-identifiers.md`.
 
+## 2026-08-21 — Correction des images CID HTML
+
+- Diagnostic hors ligne anonymisé sur l'archive réelle : 78 références
+  `cid:` correspondantes ; après correction, 78 réécritures, 78 réponses
+  HTTP 200 et 78 réponses `image/*`.
+- Corrigé la normalisation exacte des CID (angles et percent-encoding) avant
+  ammonia ; les images HTTP/HTTPS restent bloquées par la CSP.
+- Ajouté les fixtures CID simples, avec `@`, percent-encodées, absentes,
+  multiples, non-image et image externe ; le smoke test navigateur système
+  a été relancé sans journaliser de contenu personnel.
+- Rapport : `experiments/2026-08-21-mail-archive-html-browser.md`.
+
 ## 2026-08-21 — Audit dépendances, binaire et sécurité
 
 - Capturés `cargo tree`, `cargo tree -d`, `cargo tree -e features`,

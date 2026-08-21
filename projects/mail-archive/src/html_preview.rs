@@ -130,30 +130,92 @@ fn random_token() -> io::Result<String> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn replace_ascii_case_insensitive(mut html: String, needle: &str, replacement: &str) -> String {
-    let lower_needle = needle.to_ascii_lowercase();
-    loop {
-        let lower = html.to_ascii_lowercase();
-        let Some(position) = lower.find(&lower_needle) else {
-            return html;
-        };
-        html.replace_range(position..position + needle.len(), replacement);
-    }
-}
-
 fn sanitize_html(html: &str, session: &str, replacements: &[(String, String)]) -> String {
-    let mut rewritten = html.to_string();
+    let mut replacement_routes = HashMap::new();
     for (content_id, token) in replacements {
-        let route = format!("/{session}/cid/{token}");
-        rewritten = replace_ascii_case_insensitive(rewritten, &format!("cid:{content_id}"), &route);
-        rewritten =
-            replace_ascii_case_insensitive(rewritten, &format!("cid:&lt;{content_id}&gt;"), &route);
+        replacement_routes.insert(
+            normalize_cid_reference(content_id).unwrap_or_else(|| content_id.clone()),
+            format!("/{session}/cid/{token}"),
+        );
     }
+    let rewritten = rewrite_cid_urls(html, &replacement_routes);
     let builder = Builder::default();
     let clean = builder.clean(&rewritten).to_string();
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\"><meta http-equiv=\"Content-Security-Policy\" content=\"{CSP}\"></head><body>{clean}</body></html>"
     )
+}
+
+fn normalize_cid_reference(value: &str) -> Option<String> {
+    let mut value = value.trim();
+    if value.starts_with("&lt;") && value.ends_with("&gt;") {
+        value = &value[4..value.len() - 4];
+    } else if value.starts_with('<') && value.ends_with('>') {
+        value = &value[1..value.len() - 1];
+    }
+    let mut decoded = Vec::with_capacity(value.len());
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return None;
+            }
+            let high = hex_digit(bytes[index + 1])?;
+            let low = hex_digit(bytes[index + 2])?;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    let decoded = String::from_utf8(decoded).ok()?;
+    let decoded = decoded.trim();
+    let decoded = decoded
+        .strip_prefix('<')
+        .and_then(|value| value.strip_suffix('>'))
+        .unwrap_or(decoded);
+    (!decoded.is_empty()).then(|| decoded.to_string())
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn rewrite_cid_urls(html: &str, routes: &HashMap<String, String>) -> String {
+    let lower = html.to_ascii_lowercase();
+    let mut output = String::with_capacity(html.len());
+    let mut cursor = 0;
+    while let Some(relative) = lower[cursor..].find("cid:") {
+        let start = cursor + relative;
+        output.push_str(&html[cursor..start]);
+        let value_start = start + 4;
+        let mut value_end = value_start;
+        while value_end < html.len()
+            && !html.as_bytes()[value_end].is_ascii_whitespace()
+            && !matches!(html.as_bytes()[value_end], b'"' | b'\'')
+        {
+            value_end += 1;
+        }
+        let value = &html[value_start..value_end];
+        if let Some(normalized) = normalize_cid_reference(value) {
+            if let Some(route) = routes.get(&normalized) {
+                output.push_str(route);
+                cursor = value_end;
+                continue;
+            }
+        }
+        output.push_str(&html[start..value_end]);
+        cursor = value_end;
+    }
+    output.push_str(&html[cursor..]);
+    output
 }
 
 fn handle_connection(mut stream: TcpStream, sessions: &Arc<Mutex<HashMap<String, HtmlSession>>>) {
@@ -263,7 +325,8 @@ fn respond(stream: &mut TcpStream, status: &str, content_type: &str, body: &[u8]
 #[cfg(test)]
 mod tests {
     use super::{
-        prune_sessions, sanitize_html, HtmlPreviewServer, HtmlSession, MAX_SESSIONS, SESSION_TTL,
+        normalize_cid_reference, prune_sessions, sanitize_html, HtmlPreviewServer, HtmlSession,
+        MAX_SESSIONS, SESSION_TTL,
     };
     use crate::{create_metadata, insert_metadata, ArchiveWriter, Message};
     use std::collections::HashMap;
@@ -318,6 +381,31 @@ mod tests {
         assert!(html.contains("https://example.test"));
         assert!(html.contains("connect-src 'none'"));
         assert!(html.contains("img-src 'self'"));
+    }
+
+    #[test]
+    fn rewrites_exact_cid_forms_before_sanitization() {
+        let html = sanitize_html(
+            r#"<img src="cid:test-image"><img src="cid:foo%40example"><img src="cid:%3Cangle%40example%3E"><img src="cid:missing">"#,
+            "session",
+            &[
+                ("test-image".into(), "one".into()),
+                ("foo@example".into(), "two".into()),
+                ("angle@example".into(), "three".into()),
+            ],
+        );
+        assert!(html.contains("/session/cid/one"));
+        assert!(html.contains("/session/cid/two"));
+        assert!(html.contains("/session/cid/three"));
+        assert!(!html.contains("cid:missing"));
+        assert_eq!(
+            normalize_cid_reference("<abc@example>"),
+            Some("abc@example".into())
+        );
+        assert_eq!(
+            normalize_cid_reference("abc%40example"),
+            Some("abc@example".into())
+        );
     }
 
     #[test]
@@ -386,6 +474,7 @@ mod tests {
         .unwrap();
         let mut resource_response = Vec::new();
         resource.read_to_end(&mut resource_response).unwrap();
+        assert!(String::from_utf8_lossy(&resource_response).contains("Content-Type: image/png"));
         assert!(resource_response.ends_with(b"hello"));
         fs::remove_dir_all(root).unwrap();
     }
