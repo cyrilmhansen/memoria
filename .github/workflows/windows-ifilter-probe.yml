@@ -32,8 +32,8 @@ jobs:
             & $probe $path 1> $output 2> $errorOutput
             $exitCode = $LASTEXITCODE
             $watch.Stop()
-            $text = Get-Content -Raw -LiteralPath $output
-            $diagnostic = Get-Content -Raw -LiteralPath $errorOutput
+            $text = [IO.File]::ReadAllText($output)
+            $diagnostic = [IO.File]::ReadAllText($errorOutput)
             $match = $text.Contains($phrase)
             $status = if ($exitCode -eq 0) { "success" } elseif ($exitCode -eq 3) { "unsupported" } else { "failed" }
             "fixture=$name status=$status phrase_found=$match elapsed_ms=$($watch.ElapsedMilliseconds) stdout_bytes=$([Text.Encoding]::UTF8.GetByteCount($text))"
