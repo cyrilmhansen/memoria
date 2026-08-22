@@ -591,3 +591,12 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
 - Ajouté un mini-chemin IMAPS rustls pour GreenMail local ; le certificat de
   test est accepté uniquement dans le probe. Rapport :
   `experiments/2026-08-22-mail-archive-imap-probe.md`.
+
+## 2026-08-22 — IMAPS avec CA de test
+
+- Remplacé le chemin TLS de diagnostic par une validation normale rustls avec
+  CA PEM explicite, certificat GreenMail PKCS#12 signé et SAN `localhost`.
+- Validé IMAPS GreenMail depuis Linux et depuis Windows vers le serveur Linux,
+  avec greeting, login, EXAMINE et FETCH des 12 fixtures.
+- L’échec Windows initial est classé `GREENMAIL_TEST_CERTIFICATE`; STARTTLS
+  reste hors de cette campagne.

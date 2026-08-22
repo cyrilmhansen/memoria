@@ -7,9 +7,9 @@ Date : 2026-08-22
 **GO WITH CAVEATS.** `BODY.PEEK[]` fournit, avec GreenMail 2.1.12, un
 message MIME directement réutilisable comme RAW : les 12 fixtures sont
 identiques octet par octet après APPEND puis FETCH, en client Linux comme en
-client Windows sur le LAN. Cela valide le chemin protocolaire et le flux
-croisé, mais ne constitue pas encore une campagne de compatibilité avec des
-serveurs IMAP réels variés ni une validation IMAPS Windows.
+client Windows sur le LAN. Une CA de test dédiée valide maintenant aussi
+IMAPS depuis Linux et Windows. Cela ne constitue pas encore une campagne de
+compatibilité avec des serveurs IMAP réels variés.
 
 ## Versions et architecture
 
@@ -21,7 +21,12 @@ serveurs IMAP réels variés ni une validation IMAPS Windows.
 - Client : CLI Rust indépendant, sans lien avec Memoria.
 
 Le serveur a été lancé avec IMAP plain sur 3143 et IMAPS sur 3993, avec
-authentification et un compte synthétique. Le probe utilise `EXAMINE INBOX`,
+authentification et un compte synthétique. Pour la campagne TLS, une CA locale
+éphémère a signé un certificat serveur PKCS#12 GreenMail avec SAN `localhost`
+(également `imap.test` et `127.0.0.1`). Le probe charge explicitement le PEM
+de la CA dans le `RootCertStore` rustls et utilise le server name `localhost`;
+aucun verifier dangereux n’est utilisé sur le chemin principal. Le probe
+utilise `EXAMINE INBOX`,
 `UID FETCH 1:* (UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[])`, des
 timeouts par opération et ne demande jamais `BODY[]` ni `STORE +FLAGS`.
 
@@ -94,19 +99,30 @@ connexion permettait de les relever.
 
 ## IMAPS
 
-Le chemin IMAPS rustls du probe fonctionne localement contre GreenMail sur
-3993 et récupère le même INBOX. Pour ce test uniquement, le probe utilise un
-verifier dangereux qui accepte le certificat de test GreenMail ; ce n’est pas
-une politique acceptable pour Memoria. Le produit devra charger une autorité
-de confiance ou vérifier explicitement le certificat selon une configuration
-utilisateur sûre.
+Le chemin implicite IMAPS rustls est maintenant validé avec la CA réelle de
+test :
 
-Le même essai IMAPS depuis le client Windows plain validé n’a pas abouti : le
-handshake/flux côté GreenMail s’est fermé avant le greeting et le probe a
-retourné `greeting timeout`. Le serveur a enregistré une fermeture de socket.
-Ce point reste à reproduire avec une stratégie de confiance TLS réelle avant
-de conclure sur IMAPS Windows ; il ne remet pas en cause le test IMAP plain
-croisé qui, lui, est passé.
+| client | serveur | résultat |
+|---|---|---|
+| Linux | GreenMail 2.1.12, 3993 | TCP, handshake, greeting, login, EXAMINE et FETCH réussis |
+| Windows x86-64 | GreenMail 2.1.12 Linux, 3993 via LAN | TCP, handshake, greeting, login, EXAMINE et FETCH réussis |
+
+Les 12 fixtures ont été récupérées sous les deux clients avec les mêmes
+SHA-256, sizes et flags `seen=false`. La session observée par OpenSSL utilise
+TLS 1.3 et `TLS_AES_256_GCM_SHA384`; le certificat `CN=localhost` est vérifié
+par la CA dédiée.
+
+La première campagne utilisait le certificat GreenMail par défaut et un
+verifier dangereux ; Windows terminait alors la connexion avant le greeting.
+Après remplacement par un certificat signé par la CA explicitement chargée,
+le même flux Windows réussit. Le diagnostic retenu est donc
+**GREENMAIL_TEST_CERTIFICATE**, et non `RUSTLS_WINDOWS` ou `NETWORK/OS`.
+Cette stratégie de CA de test ne doit pas être transposée telle quelle au
+produit : Memoria devra utiliser une chaîne de confiance appropriée ou une
+configuration de certificat explicitement sûre.
+
+STARTTLS n’a pas été ajouté : le probe actuel ne le supporte pas et son ajout
+n’était pas nécessaire pour trancher l’interopérabilité IMAPS implicite.
 
 ## Erreurs et bornes
 
@@ -156,7 +172,8 @@ pas Memoria.
 - prise en compte éventuelle de RFC 8474 `OBJECTID` : `MAILBOXID`, `EMAILID`
   et éventuellement `THREADID`. Cette extension resterait optionnelle et ne
   serait jamais exigée pour le fonctionnement IMAP de base ;
-- stratégie de confiance/certificats IMAPS, notamment Windows ;
+- stratégie de confiance/certificats IMAPS avec des autorités réelles, au-delà
+  de la CA locale de test ;
 - comportement de serveurs avec extensions ou réponses FETCH partielles ;
 - coût et intégration d’un worker async avant toute abstraction multi-source.
 

@@ -1,8 +1,6 @@
 use async_imap::types::Fetch;
 use futures::TryStreamExt;
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
+use rustls::pki_types::{pem::PemObject, CertificateDer, ServerName};
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fmt::Debug;
@@ -28,6 +26,8 @@ struct Config {
     fixtures: Option<PathBuf>,
     timeout: Duration,
     tls: bool,
+    ca_cert: Option<PathBuf>,
+    server_name: String,
 }
 
 fn option(args: &[String], name: &str) -> Option<String> {
@@ -61,6 +61,8 @@ fn config() -> Result<Config, String> {
                 .map_err(|_| "invalid --timeout-ms")?,
         ),
         tls: has_option(&args, "--tls"),
+        ca_cert: option(&args, "--ca-cert").map(PathBuf::from),
+        server_name: option(&args, "--server-name").unwrap_or_else(|| "localhost".into()),
     })
 }
 
@@ -95,15 +97,24 @@ async fn run(config: Config) -> Result<(), String> {
         .map_err(|error| format!("set TCP options: {error}"))?;
 
     if config.tls {
+        let ca_path = config
+            .ca_cert
+            .as_ref()
+            .ok_or("--ca-cert is required with --tls")?;
+        let ca = CertificateDer::from_pem_file(ca_path)
+            .map_err(|error| format!("read CA certificate: {error}"))?;
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(ca)
+            .map_err(|error| format!("add CA certificate: {error}"))?;
         let provider = rustls::crypto::aws_lc_rs::default_provider();
         let tls_config = rustls::ClientConfig::builder_with_provider(provider.into())
             .with_safe_default_protocol_versions()
             .map_err(|error| format!("TLS configuration failed: {error}"))?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(AcceptAnyCertificate))
+            .with_root_certificates(roots)
             .with_no_client_auth();
         let connector = TlsConnector::from(Arc::new(tls_config));
-        let server_name = ServerName::try_from("localhost")
+        let server_name = ServerName::try_from(config.server_name.clone())
             .map_err(|error| format!("TLS server name failed: {error}"))?;
         let tls_stream = timeout(config.timeout, connector.connect(server_name, stream))
             .await
@@ -112,55 +123,6 @@ async fn run(config: Config) -> Result<(), String> {
         return run_session(config, tls_stream).await;
     }
     run_session(config, stream).await
-}
-
-#[derive(Debug)]
-struct AcceptAnyCertificate;
-
-impl ServerCertVerifier for AcceptAnyCertificate {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, RustlsError> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, RustlsError> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, RustlsError> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ED25519,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::ECDSA_NISTP521_SHA512,
-            SignatureScheme::RSA_PKCS1_SHA512,
-        ]
-    }
 }
 
 async fn run_session<S>(config: Config, stream: S) -> Result<(), String>
