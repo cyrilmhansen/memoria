@@ -33,6 +33,7 @@ pub struct UiStrings {
     pub open_archive: &'static str,
     pub recent_archives: &'static str,
     pub export_eml: &'static str,
+    pub export_displayed_eml: &'static str,
     pub quit: &'static str,
     pub archive: &'static str,
     pub archive_state: &'static str,
@@ -105,6 +106,7 @@ impl UiStrings {
                 open_archive: "Ouvrir une archive…",
                 recent_archives: "Archives récentes",
                 export_eml: "Exporter en EML…",
+                export_displayed_eml: "Exporter les résultats affichés en EML…",
                 quit: "Quitter",
                 archive: "Archive",
                 archive_state: "État de l’archive…",
@@ -173,6 +175,7 @@ impl UiStrings {
                 open_archive: "Open archive…",
                 recent_archives: "Recent archives",
                 export_eml: "Export as EML…",
+                export_displayed_eml: "Export displayed results as EML…",
                 quit: "Quit",
                 archive: "Archive",
                 archive_state: "Archive status…",
@@ -317,6 +320,11 @@ pub fn status(language: Language, key: &str) -> String {
         ),
         "reading" => ("Lecture du message…", "Reading message…"),
         "no-selected" => ("Aucun message sélectionné", "No message selected"),
+        "no-results" => ("Aucun résultat à exporter", "No results to export"),
+        "eml-batch-started" => (
+            "Export des résultats en cours…",
+            "Exporting search results…",
+        ),
         "eml-exported" => ("Message exporté en EML", "Message exported as EML"),
         "eml-export-failed" => ("Export EML impossible", "EML export failed"),
         "open-html" => ("Ouverture du message HTML…", "Opening HTML message…"),
@@ -361,6 +369,28 @@ pub fn sync_finished(language: Language, new_messages: u64, bytes: u64) -> Strin
         Language::En => format!(
             "Synchronization complete · {new_messages} new message{} · {size} added",
             if new_messages == 1 { "" } else { "s" }
+        ),
+    }
+}
+
+pub fn eml_batch_finished(
+    language: Language,
+    displayed: usize,
+    exported: usize,
+    errors: usize,
+) -> String {
+    match language {
+        Language::Fr => format!(
+            "Export de {displayed} résultat{} affiché{} terminé · {exported} exporté{} · {errors} erreur{}",
+            if displayed == 1 { "" } else { "s" },
+            if displayed == 1 { "" } else { "s" },
+            if exported == 1 { "" } else { "s" },
+            if errors == 1 { "" } else { "s" }
+        ),
+        Language::En => format!(
+            "Export of {displayed} displayed result{} complete · {exported} exported · {errors} error{}",
+            if displayed == 1 { "" } else { "s" },
+            if errors == 1 { "" } else { "s" }
         ),
     }
 }

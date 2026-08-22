@@ -3731,6 +3731,45 @@ mod tests {
     }
 
     #[test]
+    fn export_message_eml_can_replace_an_existing_destination() {
+        let root = std::env::temp_dir().join(format!(
+            "mail-export-existing-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("archive")).unwrap();
+        let catalog = create_metadata(&root.join("metadata.sqlite")).unwrap();
+        let raw = b"From: sender@example.test\r\n\r\nbody";
+        let message = Message {
+            id: 8,
+            message_id: "eml-existing-fixture".into(),
+            timestamp: 0,
+            sender: "sender@example.test".into(),
+            recipients: Vec::new(),
+            subject: String::new(),
+            text_body: "body".into(),
+            html_body: None,
+            account: "fixture".into(),
+            folder: "Inbox".into(),
+            thread: "thread".into(),
+            attachments: Vec::new(),
+            raw: raw.to_vec(),
+        };
+        let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        let location = writer.append(&message).unwrap();
+        writer.sync().unwrap();
+        insert_metadata(&catalog, &message, &location).unwrap();
+        drop(writer);
+        drop(catalog);
+        let destination = root.join("existing.eml");
+        fs::write(&destination, b"keep").unwrap();
+        export_message_eml(&root, 8, &destination).unwrap();
+        assert_eq!(fs::read(destination).unwrap(), raw);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn real_archive_structured_search_smoke_is_offline_only() {
         let root = Path::new(".local/gmail-real-20260820");
         if !root.join("metadata.sqlite").exists() {

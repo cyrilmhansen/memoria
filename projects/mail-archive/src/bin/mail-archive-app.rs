@@ -14,9 +14,10 @@ use mail_archive_experiment::{
 mod thumbnail;
 use slint::{Model, ModelRc, SharedString, VecModel, Weak};
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -76,6 +77,7 @@ fn localized_ui(language: Language) -> UiText {
         open_archive: t.open_archive.into(),
         recent_archives: t.recent_archives.into(),
         export_eml: t.export_eml.into(),
+        export_displayed_eml: t.export_displayed_eml.into(),
         quit: t.quit.into(),
         archive: t.archive.into(),
         archive_state: t.archive_state.into(),
@@ -272,6 +274,59 @@ fn eml_filename(date: &str, subject: &str, doc_id: u64) -> String {
         value.insert(0, '_');
     }
     format!("{value}.eml")
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct EmlBatchSummary {
+    exported: usize,
+    errors: usize,
+}
+
+fn next_eml_destination(
+    directory: &Path,
+    filename: &str,
+    reserved: &mut HashSet<PathBuf>,
+) -> PathBuf {
+    let path = Path::new(filename);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("message");
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("eml");
+    let mut index = 1;
+    loop {
+        let candidate_name = if index == 1 {
+            format!("{stem}.{extension}")
+        } else {
+            format!("{stem}-{index}.{extension}")
+        };
+        let candidate = directory.join(candidate_name);
+        if !candidate.exists() && reserved.insert(candidate.clone()) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn export_eml_batch(
+    archive: &Path,
+    messages: &[(u64, String, String)],
+    destination: &Path,
+) -> EmlBatchSummary {
+    let mut summary = EmlBatchSummary::default();
+    let mut reserved = HashSet::new();
+    for &(doc_id, ref date, ref subject) in messages {
+        let filename = eml_filename(date, subject, doc_id);
+        let path = next_eml_destination(destination, &filename, &mut reserved);
+        match export_message_eml(archive, doc_id, &path) {
+            Ok(()) => summary.exported += 1,
+            Err(_) => summary.errors += 1,
+        }
+    }
+    summary
 }
 
 fn attachment_rows(infos: &[AttachmentInfo]) -> Vec<AttachmentRow> {
@@ -1256,6 +1311,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let weak = ui.as_weak();
+    let archive_for_export_displayed_eml = current_archive.clone();
+    let export_results_language = language;
+    ui.on_export_results_eml_requested(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let Some(archive) = archive_for_export_displayed_eml.borrow().clone() else {
+            ui.set_status(i18n::status(export_results_language, "archive-inaccessible").into());
+            return;
+        };
+        let messages = (0..ui.get_results().row_count())
+            .filter_map(|index| ui.get_results().row_data(index as usize))
+            .map(|row| {
+                (
+                    row.doc_id as u64,
+                    row.date.to_string(),
+                    row.subject.to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if messages.is_empty() {
+            ui.set_status(i18n::status(export_results_language, "no-results").into());
+            return;
+        }
+        let strings = i18n::UiStrings::for_language(export_results_language);
+        let Some(destination) = rfd::FileDialog::new()
+            .set_title(strings.export_displayed_eml)
+            .pick_folder()
+        else {
+            ui.set_status(i18n::status(export_results_language, "cancelled").into());
+            return;
+        };
+        ui.set_status(i18n::status(export_results_language, "eml-batch-started").into());
+        let weak = ui.as_weak();
+        thread::spawn(move || {
+            let summary = export_eml_batch(&archive, &messages, &destination);
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_status(
+                        i18n::eml_batch_finished(
+                            export_results_language,
+                            messages.len(),
+                            summary.exported,
+                            summary.errors,
+                        )
+                        .into(),
+                    );
+                }
+            });
+        });
+    });
+
+    let weak = ui.as_weak();
     let archive_for_open_attachment = current_archive.clone();
     let selected_for_open_attachment = selected_doc_id.clone();
     let temp_for_open_attachment = temp_attachments.clone();
@@ -1667,6 +1773,86 @@ mod tests {
         assert_eq!(name, "2026-08-22 1020-Sujet résumé_essai.eml");
         assert_eq!(eml_filename("", "", 42), "message-42.eml");
         assert!(!eml_filename("", "CON", 42).starts_with("CON."));
+    }
+
+    #[test]
+    fn batch_eml_export_is_byte_exact_and_continues_after_errors() {
+        let root = std::env::temp_dir().join(format!(
+            "memoria-batch-eml-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let destination = root.join("exports");
+        fs::create_dir_all(&destination).unwrap();
+        let catalog =
+            mail_archive_experiment::create_metadata(&root.join("metadata.sqlite")).unwrap();
+        let mut writer =
+            mail_archive_experiment::ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        let mut raws = Vec::new();
+        for (id, subject) in [
+            (0_u64, "same subject"),
+            (1_u64, "same subject"),
+            (2_u64, ""),
+            (3_u64, "bad<>:/subject"),
+        ] {
+            let raw =
+                format!("From: fixture@example.test\r\nSubject: {subject}\r\n\r\nbody-{id}\r\n")
+                    .into_bytes();
+            let message = mail_archive_experiment::Message {
+                id,
+                message_id: format!("batch-{id}"),
+                timestamp: 0,
+                sender: "fixture@example.test".into(),
+                recipients: Vec::new(),
+                subject: subject.into(),
+                text_body: format!("body-{id}"),
+                html_body: None,
+                account: "fixture".into(),
+                folder: "Inbox".into(),
+                thread: "thread".into(),
+                attachments: Vec::new(),
+                raw: raw.clone(),
+            };
+            let location = writer.append(&message).unwrap();
+            mail_archive_experiment::insert_metadata(&catalog, &message, &location).unwrap();
+            raws.push(raw);
+        }
+        writer.sync().unwrap();
+        drop(writer);
+        drop(catalog);
+
+        let existing = destination.join("date-same subject.eml");
+        fs::write(&existing, b"must-not-be-overwritten").unwrap();
+        let items = vec![
+            (0, "date".into(), "same subject".into()),
+            (1, "date".into(), "same subject".into()),
+            (2, "date".into(), "".into()),
+            (3, "date".into(), "bad<>:/subject".into()),
+            (99, "date".into(), "missing".into()),
+        ];
+        let summary = export_eml_batch(&root, &items, &destination);
+        assert_eq!(
+            summary,
+            EmlBatchSummary {
+                exported: 4,
+                errors: 1
+            }
+        );
+        assert_eq!(fs::read(&existing).unwrap(), b"must-not-be-overwritten");
+        assert_eq!(
+            fs::read(destination.join("date-same subject-2.eml")).unwrap(),
+            raws[0]
+        );
+        assert_eq!(
+            fs::read(destination.join("date-same subject-3.eml")).unwrap(),
+            raws[1]
+        );
+        assert_eq!(fs::read(destination.join("date.eml")).unwrap(), raws[2]);
+        assert_eq!(
+            fs::read(destination.join("date-bad_subject.eml")).unwrap(),
+            raws[3]
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
