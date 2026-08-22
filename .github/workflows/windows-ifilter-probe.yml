@@ -82,3 +82,19 @@ jobs:
             }
             "extension=$extension persistent_handler=$persistent filter_clsid=$handler dll=$dll"
           }
+      - name: Reproduce reported Windows tests
+        shell: pwsh
+        run: |
+          $tests = @(
+            "recovery_truncates_an_incomplete_tail",
+            "serves_sanitized_html_and_cid_without_exposing_other_messages",
+            "structured_search_combines_filters_without_post_filter_false_negatives"
+          )
+          foreach ($test in $tests) {
+            $log = Join-Path $env:RUNNER_TEMP "$test.stdout.log"
+            $errorLog = Join-Path $env:RUNNER_TEMP "$test.stderr.log"
+            $process = Start-Process -FilePath "cargo" -ArgumentList @("test", "--workspace", $test, "--", "--nocapture") -Wait -PassThru -NoNewWindow -RedirectStandardOutput $log -RedirectStandardError $errorLog
+            "test=$test exit=$($process.ExitCode)"
+            Get-Content -LiteralPath $log | Select-String -Pattern "FAILED|passed|panicked|PermissionDenied|file in use|expected|test result"
+            Get-Content -LiteralPath $errorLog | Select-String -Pattern "FAILED|passed|panicked|PermissionDenied|file in use|expected|test result"
+          }
