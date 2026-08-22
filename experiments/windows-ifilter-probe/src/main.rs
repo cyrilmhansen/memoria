@@ -115,21 +115,26 @@ mod windows_probe {
             format!(".{extension}").to_ascii_lowercase()
         };
         let progid = registry_value(&extension, None)
-            .or_else(|| registry_value(&format!("SystemFileAssociations\\{extension}"), None))
-            .ok_or_else(|| "extension-registration-missing".to_string())?;
-        let persistent = registry_value(&format!("{progid}\\PersistentHandler"), None)
-            .or_else(|| registry_value(&format!("{extension}\\PersistentHandler"), None))
-            .or_else(|| {
-                registry_value(
-                    &format!("SystemFileAssociations\\{extension}\\PersistentHandler"),
-                    None,
-                )
-            })
+            .or_else(|| registry_value(&format!("SystemFileAssociations\\{extension}"), None));
+        let persistent_paths = [
+            progid
+                .as_deref()
+                .map(|value| format!("{value}\\PersistentHandler")),
+            Some(format!("{extension}\\PersistentHandler")),
+            Some(format!("SystemFileAssociations\\{extension}\\PersistentHandler")),
+        ];
+        let persistent = persistent_paths
+            .iter()
+            .flatten()
+            .find_map(|path| registry_value(path, None))
             .unwrap_or_default();
         let addin_paths = [
             format!("CLSID\\{persistent}\\PersistentAddinsRegistered\\{IID_IFILTER}"),
             format!("{persistent}\\PersistentAddinsRegistered\\{IID_IFILTER}"),
-            format!("CLSID\\{progid}\\PersistentAddinsRegistered\\{IID_IFILTER}"),
+            format!(
+                "CLSID\\{}\\PersistentAddinsRegistered\\{IID_IFILTER}",
+                progid.as_deref().unwrap_or("")
+            ),
             format!(
                 "SystemFileAssociations\\{extension}\\PersistentAddinsRegistered\\{IID_IFILTER}"
             ),
@@ -138,7 +143,7 @@ mod windows_probe {
             .iter()
             .find_map(|path| registry_value(path, None))
             .ok_or_else(|| {
-                if persistent.is_empty() {
+                if persistent.is_empty() && progid.is_none() {
                     "persistent-handler-and-ifilter-addin-missing".to_string()
                 } else {
                     "ifilter-addin-missing".to_string()
