@@ -15,7 +15,10 @@ jobs:
           cargo --version
       - name: Build isolated probe
         shell: pwsh
-        run: cargo build --release --manifest-path experiments/windows-ifilter-probe/Cargo.toml
+        run: |
+          cargo build --release --manifest-path experiments/windows-ifilter-probe/Cargo.toml
+          $size = (Get-Item "experiments/windows-ifilter-probe/target/release/windows-ifilter-probe.exe").Length
+          "helper_bytes=$size"
       - name: Generate controlled fixtures
         shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File experiments/windows-ifilter-probe/fixtures/generate-fixtures.ps1
