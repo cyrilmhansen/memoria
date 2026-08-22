@@ -5,9 +5,11 @@ use mail_archive_experiment::gmail::{self, GmailError, GmailTransport, SyncProgr
 use mail_archive_experiment::html_preview::HtmlPreviewServer;
 use mail_archive_experiment::i18n::{self, Language};
 use mail_archive_experiment::{
-    archive_summary, available_gmail_labels, index_gmail_archive, list_attachments,
-    parse_gmail_message, parse_search_date_ms, read_archived_raw, read_attachment,
-    read_html_document, AttachmentFilter, AttachmentInfo, GmailSearchIndex, SearchRequest,
+    archive_summary, available_gmail_labels, discover_providers, index_gmail_archive,
+    list_attachments, parse_gmail_message, parse_search_date_ms, read_archived_raw,
+    read_attachment, read_html_document, selected_provider, AttachmentFilter, AttachmentInfo,
+    BackendKind, ExtractionProvider, GmailSearchIndex, ProviderAvailability, ProviderSelection,
+    SearchRequest,
 };
 mod thumbnail;
 use slint::{Model, ModelRc, SharedString, VecModel, Weak};
@@ -96,6 +98,7 @@ fn localized_ui(language: Language) -> UiText {
         local_archive: t.local_archive.into(),
         gmail_source: t.gmail_source.into(),
         add_account: t.add_account.into(),
+        content_extraction: t.content_extraction.into(),
         search_placeholder: t.search_placeholder.into(),
         search_accessible: t.search_accessible.into(),
         clear: t.clear.into(),
@@ -307,6 +310,94 @@ fn set_archive_summary(ui: &MailWindow, archive: &std::path::Path) {
             ui.set_archive_index(i18n::status(language, "index-unavailable").into());
         }
     }
+}
+
+fn provider_display_name(language: Language, provider: &ExtractionProvider) -> String {
+    match provider.id.as_str() {
+        "memoria-text" => match language {
+            Language::Fr => "Décodeur texte intégré Memoria".into(),
+            Language::En => "Memoria built-in text decoder".into(),
+        },
+        "poppler-pdftotext" => "Poppler pdftotext".into(),
+        "windows-ifilter" => match language {
+            Language::Fr => "IFilter Windows enregistré".into(),
+            Language::En => "Windows registered IFilter".into(),
+        },
+        _ => provider.display_name.clone(),
+    }
+}
+
+fn provider_backend_name(language: Language, backend: BackendKind) -> &'static str {
+    match (language, backend) {
+        (Language::Fr, BackendKind::BuiltIn) => "intégré",
+        (Language::En, BackendKind::BuiltIn) => "built-in",
+        (Language::Fr, BackendKind::ExternalExecutable) => "exécutable externe",
+        (Language::En, BackendKind::ExternalExecutable) => "external executable",
+        (Language::Fr, BackendKind::WindowsIFilter) => "IFilter Windows",
+        (Language::En, BackendKind::WindowsIFilter) => "Windows IFilter",
+    }
+}
+
+fn provider_availability_name(
+    language: Language,
+    availability: ProviderAvailability,
+) -> &'static str {
+    match (language, availability) {
+        (Language::Fr, ProviderAvailability::Available) => "disponible",
+        (Language::En, ProviderAvailability::Available) => "available",
+        (Language::Fr, ProviderAvailability::Unavailable) => "indisponible",
+        (Language::En, ProviderAvailability::Unavailable) => "unavailable",
+    }
+}
+
+fn selected_provider_name(language: Language, mime: &str) -> String {
+    selected_provider(mime, &ProviderSelection::Automatic)
+        .map(|provider| {
+            format!(
+                "{} ({})",
+                provider.id.as_str(),
+                provider_display_name(language, &provider)
+            )
+        })
+        .unwrap_or_else(|| match language {
+            Language::Fr => "aucun provider disponible".into(),
+            Language::En => "no provider available".into(),
+        })
+}
+
+fn extraction_provider_status(language: Language) -> String {
+    let mut lines = discover_providers()
+        .iter()
+        .map(|provider| {
+            let path = provider
+                .executable_path
+                .as_ref()
+                .map(|path| format!(" · {}", path.display()))
+                .unwrap_or_default();
+            format!(
+                "{} — {} · {} · {} · {}{}",
+                provider.id.as_str(),
+                provider_display_name(language, provider),
+                provider_backend_name(language, provider.backend_kind),
+                provider_availability_name(language, provider.availability),
+                provider.supported_types.join(", "),
+                path
+            )
+        })
+        .collect::<Vec<_>>();
+    let automatic = match language {
+        Language::Fr => "Sélection automatique",
+        Language::En => "Automatic selection",
+    };
+    lines.push(format!(
+        "{automatic} · PDF: {} · DOCX: {}",
+        selected_provider_name(language, "application/pdf"),
+        selected_provider_name(
+            language,
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+    ));
+    lines.join("\n")
 }
 
 fn friendly_gmail_error(error: &GmailError) -> String {
@@ -636,6 +727,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ui = MailWindow::new()?;
     let language = Language::system();
     ui.set_texts(localized_ui(language));
+    ui.set_extraction_provider_status(extraction_provider_status(language).into());
     ui.set_attachment_filter_label(i18n::attachment_filter_label(language, "Toutes").into());
     ui.set_status(format!("Index ouvert en {index_open_us} µs").into());
     ui.set_query(SharedString::default());
@@ -1489,6 +1581,16 @@ mod tests {
                     || !matches!(stem.as_bytes().get(3), Some(b'1'..=b'9'))
             );
         }
+    }
+
+    #[test]
+    fn provider_status_exposes_ids_and_automatic_document_selection() {
+        let status = extraction_provider_status(Language::En);
+        assert!(status.contains("memoria-text"));
+        assert!(status.contains("poppler-pdftotext"));
+        assert!(status.contains("Automatic selection"));
+        assert!(status.contains("PDF:"));
+        assert!(status.contains("DOCX:"));
     }
 
     #[test]

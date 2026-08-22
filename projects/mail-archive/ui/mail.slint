@@ -23,7 +23,7 @@ struct UiText {
     file: string, new-archive: string, open-archive: string, recent-archives: string, quit: string,
     archive: string, archive-state: string, sync-now: string, syncing: string, add-gmail: string, back-search: string,
     search-menu: string, focus-search: string, clear-search: string, view: string, zoom-out: string, zoom-reset: string, zoom-in: string, help: string, about: string,
-    archive-choice: string, setup-description: string, create-archive: string, archive-sync: string, local-archive: string, gmail-source: string, add-account: string,
+    archive-choice: string, setup-description: string, create-archive: string, archive-sync: string, local-archive: string, gmail-source: string, add-account: string, content-extraction: string,
     search-placeholder: string, search-accessible: string, clear: string, filters: string, filters-accessible: string,
     from-placeholder: string, from-accessible: string, to-placeholder: string, to-accessible: string, since-placeholder: string, since-accessible: string, until-placeholder: string, until-accessible: string,
     attachment-filter-prefix: string, attachment-filter-accessible: string, mime-placeholder: string, mime-accessible: string, reset-filters: string, labels-prefix: string, empty-search: string, results-accessible: string,
@@ -65,6 +65,7 @@ export component MailWindow inherits Window {
     in property <string> archive-catalog: "Catalogue indisponible";
     in property <string> archive-index: "Index non construit";
     in property <string> source-status: "Source Gmail non configurée";
+    in property <string> extraction-provider-status;
     in property <string> sync-progress: "";
     in property <int> sync-current: 0;
     in property <int> sync-total: -1;
@@ -303,7 +304,24 @@ export component MailWindow inherits Window {
                     }
                 }
             }
-            Rectangle { vertical-stretch: 1; }
+            Rectangle {
+                height: 180px;
+                background: white;
+                border-width: 1px;
+                border-color: #d9dde5;
+                border-radius: 6px;
+                VerticalBox {
+                    padding: 18px;
+                    spacing: 8px;
+                    Text { text: root.texts.content-extraction; color: #202633; font-size: 17px; }
+                    Text {
+                        text: root.extraction-provider-status;
+                        color: #344054;
+                        wrap: word-wrap;
+                        vertical-alignment: top;
+                    }
+                }
+            }
         }
     }
 
