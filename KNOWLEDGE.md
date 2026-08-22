@@ -481,3 +481,20 @@ résultats d'expérience locale :
   PDF via `pdftotext`, DOCX non supporté.
 - **Limite :** Word COM Automation a été testé dans une session interactive,
   mais ne fait pas partie de Memoria et n’est pas requis par l’IFilter.
+
+## 2026-08-22 — Probe IMAP
+
+- **Fait vérifié :** avec GreenMail 2.1.12, `async-imap` 0.11.3 et
+  `BODY.PEEK[]`, 12 fixtures MIME synthétiques sont récupérées byte-for-byte,
+  y compris via un client Windows vers un serveur Linux sur le LAN.
+- **Décision de projet :** IMAP est exploitable pour une future intégration
+  readonly, avec UID associé à mailbox + UIDVALIDITY et aux métadonnées
+  flags/INTERNALDATE ; le client async devra rester derrière un worker. Le
+  probe utilise Tokio ; `async-imap` supporte notamment Tokio et async-std, et
+  le choix du runtime produit reste ouvert.
+- **Limite :** IMAPS rustls a été validé localement avec le certificat GreenMail
+  explicitement accepté par le probe ; l’essai Windows IMAPS n’est pas conclu.
+  Détails : `experiments/2026-08-22-mail-archive-imap-probe.md`.
+- **Question future :** RFC 8474 `OBJECTID` pourrait fournir `MAILBOXID`,
+  `EMAILID` et éventuellement `THREADID` pour compléter le modèle ; cette
+  extension reste optionnelle et n’est pas requise pour IMAP de base.

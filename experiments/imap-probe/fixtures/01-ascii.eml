@@ -1,0 +1,9 @@
+From: probe@example.test
+To: reader@example.test
+Subject: IMAP ASCII fixture
+Date: Thu, 22 Aug 2026 09:00:00 +0000
+Message-ID: <imap-01@example.test>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=us-ascii
+
+Plain ASCII body for the IMAP fidelity probe.

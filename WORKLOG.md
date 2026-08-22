@@ -580,3 +580,14 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
 - Validation native : test ciblé réussi (`1 passed`), extraction DOCX helper
   environ 105 ms, helper CI 169 472 octets, application CI 30 287 360
   octets. Linux reste inchangé : PDF `pdftotext`, DOCX non supporté.
+
+## 2026-08-22 — Probe IMAP
+
+- Créé `experiments/imap-probe/` avec fixtures MIME synthétiques, client
+  `async-imap`/Tokio, `EXAMINE`, `LIST`, UID FETCH `BODY.PEEK[]`, comparaison
+  SHA-256 et erreurs bornées.
+- Validé 12/12 messages byte-exactement en local et depuis Windows vers
+  GreenMail Linux sur le LAN, sans marquage `\\Seen`.
+- Ajouté un mini-chemin IMAPS rustls pour GreenMail local ; le certificat de
+  test est accepté uniquement dans le probe. Rapport :
+  `experiments/2026-08-22-mail-archive-imap-probe.md`.

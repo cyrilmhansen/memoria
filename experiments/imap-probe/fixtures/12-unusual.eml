@@ -1,0 +1,10 @@
+From: probe@example.test
+To: reader@example.test
+Subject: Unusual but valid fixture
+Message-ID: <imap-12@example.test>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: quoted-printable
+
+Line with a soft break=20
+and a literal equals sign =3D.

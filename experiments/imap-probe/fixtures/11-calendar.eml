@@ -1,0 +1,15 @@
+From: calendar@example.test
+To: reader@example.test
+Subject: Calendar fixture
+Date: Thu, 22 Aug 2026 09:10:00 +0000
+Message-ID: <imap-11@example.test>
+MIME-Version: 1.0
+Content-Type: text/calendar; method=REQUEST; charset=utf-8
+
+BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:imap-calendar-11
+SUMMARY:Probe meeting
+END:VEVENT
+END:VCALENDAR

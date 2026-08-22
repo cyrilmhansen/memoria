@@ -1,0 +1,20 @@
+From: probe@example.test
+To: reader@example.test
+Subject: Inline CID fixture
+Date: Thu, 22 Aug 2026 09:05:00 +0000
+Message-ID: <imap-06@example.test>
+MIME-Version: 1.0
+Content-Type: multipart/related; boundary="rel-06"
+
+--rel-06
+Content-Type: text/html; charset=utf-8
+
+<p>Inline image:</p><img src="cid:image-06@example.test">
+--rel-06
+Content-Type: image/png
+Content-ID: <image-06@example.test>
+Content-Disposition: inline
+Content-Transfer-Encoding: base64
+
+iVBORw0KGgo=
+--rel-06--

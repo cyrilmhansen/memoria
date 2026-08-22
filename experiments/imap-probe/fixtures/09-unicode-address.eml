@@ -1,0 +1,9 @@
+From: =?UTF-8?B?w4lsb2RpZSBQcm9iw6k=?= <elodie@example.test>
+To: =?UTF-8?B?5pel5pys6Kqe?= <reader@example.test>
+Subject: =?UTF-8?B?VW5pY29kZSBhZGRyZXNz?=
+Date: Thu, 22 Aug 2026 09:08:00 +0000
+Message-ID: <imap-09@example.test>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Unicode display names are encoded in headers.

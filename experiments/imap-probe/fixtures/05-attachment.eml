@@ -1,0 +1,19 @@
+From: probe@example.test
+To: reader@example.test
+Subject: Base64 attachment fixture
+Date: Thu, 22 Aug 2026 09:04:00 +0000
+Message-ID: <imap-05@example.test>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="mix-05"
+
+--mix-05
+Content-Type: text/plain; charset=utf-8
+
+Message with a small attachment.
+--mix-05
+Content-Type: application/octet-stream
+Content-Disposition: attachment; filename="fixture.bin"
+Content-Transfer-Encoding: base64
+
+AAECAwQFBgcICQ==
+--mix-05--

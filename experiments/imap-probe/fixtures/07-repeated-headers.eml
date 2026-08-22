@@ -1,0 +1,11 @@
+From: probe@example.test
+To: reader@example.test
+Subject: Repeated header fixture
+X-Probe: one
+X-Probe: two
+Date: Thu, 22 Aug 2026 09:06:00 +0000
+Message-ID: <imap-07@example.test>
+MIME-Version: 1.0
+Content-Type: text/plain
+
+Repeated headers are valid and intentionally retained.

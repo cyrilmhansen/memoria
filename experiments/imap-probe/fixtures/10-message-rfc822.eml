@@ -1,0 +1,14 @@
+From: probe@example.test
+To: reader@example.test
+Subject: Nested message fixture
+Date: Thu, 22 Aug 2026 09:09:00 +0000
+Message-ID: <imap-10@example.test>
+MIME-Version: 1.0
+Content-Type: message/rfc822
+
+From: nested@example.test
+To: reader@example.test
+Subject: Nested subject
+Date: Thu, 22 Aug 2026 09:09:01 +0000
+
+Nested message body.

@@ -1,0 +1,17 @@
+From: probe@example.test
+To: reader@example.test
+Subject: Alternative fixture
+Date: Thu, 22 Aug 2026 09:03:00 +0000
+Message-ID: <imap-04@example.test>
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="alt-04"
+
+--alt-04
+Content-Type: text/plain; charset=utf-8
+
+Plain alternative body.
+--alt-04
+Content-Type: text/html; charset=utf-8
+
+<p><strong>HTML</strong> alternative body.</p>
+--alt-04--

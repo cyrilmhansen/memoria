@@ -1,0 +1,10 @@
+From: Probe Sender <probe@example.test>
+To: Reader <reader@example.test>
+Subject: Folded header fixture
+  continued across a folded line
+Date: Thu, 22 Aug 2026 09:07:00 +0000
+Message-ID: <imap-08@example.test>
+MIME-Version: 1.0
+Content-Type: text/plain
+
+Header folding fixture.
