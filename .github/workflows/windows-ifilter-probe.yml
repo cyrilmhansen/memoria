@@ -30,8 +30,8 @@ jobs:
             $output = Join-Path $env:RUNNER_TEMP "$name.stdout"
             $errorOutput = Join-Path $env:RUNNER_TEMP "$name.stderr"
             $watch = [Diagnostics.Stopwatch]::StartNew()
-            & $probe $path 1> $output 2> $errorOutput
-            $exitCode = $LASTEXITCODE
+            $process = Start-Process -FilePath $probe -ArgumentList @($path) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $output -RedirectStandardError $errorOutput
+            $exitCode = $process.ExitCode
             $watch.Stop()
             $text = [IO.File]::ReadAllText($output)
             $diagnostic = [IO.File]::ReadAllText($errorOutput)
@@ -54,8 +54,8 @@ jobs:
             $output = Join-Path $env:RUNNER_TEMP "$($item.name)-direct.stdout"
             $errorOutput = Join-Path $env:RUNNER_TEMP "$($item.name)-direct.stderr"
             $watch = [Diagnostics.Stopwatch]::StartNew()
-            & $probe direct $item.clsid $item.path 1> $output 2> $errorOutput
-            $exitCode = $LASTEXITCODE
+            $process = Start-Process -FilePath $probe -ArgumentList @("direct", $item.clsid, $item.path) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $output -RedirectStandardError $errorOutput
+            $exitCode = $process.ExitCode
             $watch.Stop()
             $text = [IO.File]::ReadAllText($output)
             $diagnostic = [IO.File]::ReadAllText($errorOutput)
