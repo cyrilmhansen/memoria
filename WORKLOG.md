@@ -495,6 +495,19 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
   0 échec bloquant ; recherche fixture validée pour texte et PDF.
 - Rapport : `experiments/2026-08-22-mail-archive-attachment-text-indexing.md`.
 
+## 2026-08-22 — Providers d’extraction observables
+
+- Centralisé la découverte de `memoria-text` et `poppler-pdftotext`, avec
+  disponibilité, version Poppler et chemin résolu sans shell.
+- Ajouté `ProviderSelection::Automatic` et `Explicit(ProviderId)` ; le
+  pipeline réel utilise désormais la même sélection que l’API d’observation.
+- Aucun écran Settings n’existe encore dans Memoria ; aucune surface UI
+  artificielle n’a été ajoutée.
+- La version `pdftotext -v` n’est plus interrogée : la présence du chemin
+  suffit à déclarer le provider disponible. `display_name` reste diagnostique
+  et l’ID stable est la frontière i18n. La découverte `OnceLock` reste figée
+  pendant le processus ; un refresh est réservé à une future surface Settings.
+
 ## 2026-08-21 — Profil CI ThinLTO
 
 - Ajouté `[profile.ci]`, hérité de `release` avec ThinLTO et 8 unités de

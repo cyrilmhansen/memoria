@@ -22,7 +22,10 @@ pub mod gmail;
 pub mod html_preview;
 pub mod i18n;
 
-pub use attachment_text::AttachmentTextStats;
+pub use attachment_text::{
+    discover_providers, providers_for_mime, selected_provider, AttachmentTextStats, BackendKind,
+    ExtractionProvider, ProviderAvailability, ProviderId, ProviderSelection,
+};
 
 pub const DEFAULT_SEED: u64 = 0x4d_41_49_4c_41_52_43;
 const FRAME_MAGIC: &[u8; 8] = b"MAARC001";

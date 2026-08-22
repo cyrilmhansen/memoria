@@ -413,3 +413,12 @@ résultats d'expérience locale :
   formats traitables, 19 textes produits, 5 non supportées et 0 échec
   d’extraction bloquant. Détails :
   [`experiments/2026-08-22-mail-archive-attachment-text-indexing.md`](experiments/2026-08-22-mail-archive-attachment-text-indexing.md).
+- **Décision de projet :** la découverte et la sélection des extracteurs sont
+  centralisées dans `attachment_text`: `Automatic` choisit
+  `memoria-text` pour `text/*` et `poppler-pdftotext` pour PDF lorsqu’il est
+  disponible. Le chemin reste un diagnostic, pas un identifiant de
+  compatibilité ; la version n’est pas interrogée pour éviter tout blocage.
+  `display_name` est également diagnostique : une future UI traduira depuis
+  l’ID technique. La découverte est mise en cache par `OnceLock` pour la durée
+  du processus ; une future surface Settings pourra proposer un refresh.
+  Aucun écran Settings n’existe encore ; l’API est prête à l’alimenter.

@@ -1,7 +1,7 @@
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -12,6 +12,132 @@ use crate::AttachmentPayload;
 pub const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 pub const EXTRACTION_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ProviderId(String);
+
+impl ProviderId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BackendKind {
+    BuiltIn,
+    ExternalExecutable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderAvailability {
+    Available,
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExtractionProvider {
+    pub id: ProviderId,
+    /// Diagnostic fallback; UI text must be translated from `id`.
+    pub display_name: String,
+    pub backend_kind: BackendKind,
+    pub supported_types: Vec<String>,
+    pub availability: ProviderAvailability,
+    pub version: Option<String>,
+    pub executable_path: Option<std::path::PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProviderSelection {
+    Automatic,
+    Explicit(ProviderId),
+}
+
+pub fn discover_providers() -> Vec<ExtractionProvider> {
+    static DISCOVERED: OnceLock<Vec<ExtractionProvider>> = OnceLock::new();
+    DISCOVERED
+        .get_or_init(|| {
+            vec![
+                ExtractionProvider {
+                    id: ProviderId::new("memoria-text"),
+                    display_name: "Memoria built-in text decoder".into(),
+                    backend_kind: BackendKind::BuiltIn,
+                    supported_types: vec!["text/*".into()],
+                    availability: ProviderAvailability::Available,
+                    version: Some("v1".into()),
+                    executable_path: None,
+                },
+                discover_pdftotext(),
+            ]
+        })
+        .clone()
+}
+
+pub fn providers_for_mime(mime: &str) -> Vec<ExtractionProvider> {
+    let normalized = mime.trim().to_ascii_lowercase();
+    discover_providers()
+        .into_iter()
+        .filter(|provider| {
+            provider.availability == ProviderAvailability::Available
+                && provider.supported_types.iter().any(|supported| {
+                    supported == &normalized
+                        || (supported == "text/*" && normalized.starts_with("text/"))
+                })
+        })
+        .collect()
+}
+
+pub fn selected_provider(mime: &str, selection: &ProviderSelection) -> Option<ExtractionProvider> {
+    let candidates = providers_for_mime(mime);
+    match selection {
+        ProviderSelection::Automatic => candidates.into_iter().next(),
+        ProviderSelection::Explicit(id) => {
+            candidates.into_iter().find(|provider| provider.id == *id)
+        }
+    }
+}
+
+fn discover_pdftotext() -> ExtractionProvider {
+    discover_pdftotext_at(resolve_executable("pdftotext"))
+}
+
+fn discover_pdftotext_at(executable_path: Option<std::path::PathBuf>) -> ExtractionProvider {
+    let availability = if executable_path.is_some() {
+        ProviderAvailability::Available
+    } else {
+        ProviderAvailability::Unavailable
+    };
+    ExtractionProvider {
+        id: ProviderId::new("poppler-pdftotext"),
+        display_name: "Poppler pdftotext".into(),
+        backend_kind: BackendKind::ExternalExecutable,
+        supported_types: vec!["application/pdf".into()],
+        availability,
+        version: None,
+        executable_path,
+    }
+}
+
+fn resolve_executable(name: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for directory in std::env::split_paths(&path) {
+        let candidate = directory.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        #[cfg(windows)]
+        for extension in [".exe", ".cmd", ".bat"] {
+            let candidate = directory.join(format!("{name}{extension}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct AttachmentTextStats {
@@ -65,8 +191,19 @@ fn extract_one(payload: &AttachmentPayload) -> ExtractionResult {
     if payload.bytes.len() > MAX_INPUT_BYTES {
         return ExtractionResult::Failed;
     }
-    if payload.info.mime == "application/pdf" {
-        return extract_pdf(&payload.bytes);
+    let provider = selected_provider(&payload.info.mime, &ProviderSelection::Automatic);
+    match provider.as_ref().map(|provider| provider.id.as_str()) {
+        Some("poppler-pdftotext") => {
+            return extract_pdf(
+                &payload.bytes,
+                provider
+                    .as_ref()
+                    .and_then(|provider| provider.executable_path.as_deref())
+                    .expect("available executable"),
+            );
+        }
+        Some("memoria-text") => {}
+        _ => return ExtractionResult::Unsupported,
     }
     if payload.info.mime.starts_with("text/") {
         let text = payload.decoded_text.as_deref().unwrap_or_else(|| "");
@@ -80,10 +217,10 @@ fn extract_one(payload: &AttachmentPayload) -> ExtractionResult {
     ExtractionResult::Unsupported
 }
 
-fn extract_pdf(bytes: &[u8]) -> ExtractionResult {
+fn extract_pdf(bytes: &[u8], executable: &Path) -> ExtractionResult {
     extract_pdf_with_command(
         bytes,
-        Path::new("pdftotext"),
+        executable,
         &["-layout", "-enc", "UTF-8", "-", "-"],
         EXTRACTION_TIMEOUT,
     )
@@ -231,7 +368,14 @@ mod tests {
 
     #[test]
     fn pdf_fixture_uses_optional_system_provider() {
-        let result = extract_pdf(&test_pdf_fixture("phrase-secrete-947"));
+        let Some(provider) = selected_provider("application/pdf", &ProviderSelection::Automatic)
+        else {
+            return;
+        };
+        let result = extract_pdf(
+            &test_pdf_fixture("phrase-secrete-947"),
+            provider.executable_path.as_deref().unwrap(),
+        );
         match result {
             ExtractionResult::Text(text) => assert!(text.contains("phrase-secrete-947")),
             ExtractionResult::Unsupported => {}
@@ -241,7 +385,11 @@ mod tests {
 
     #[test]
     fn malformed_pdf_never_panics_or_returns_unbounded_output() {
-        let result = extract_pdf(b"not a PDF");
+        let Some(provider) = selected_provider("application/pdf", &ProviderSelection::Automatic)
+        else {
+            return;
+        };
+        let result = extract_pdf(b"not a PDF", provider.executable_path.as_deref().unwrap());
         assert!(matches!(
             result,
             ExtractionResult::Failed | ExtractionResult::Unsupported
@@ -274,5 +422,49 @@ mod tests {
         );
         assert!(matches!(result, ExtractionResult::Failed));
         assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn provider_discovery_and_automatic_selection_are_stable() {
+        let providers = discover_providers();
+        assert!(providers
+            .iter()
+            .any(|provider| provider.id.as_str() == "memoria-text"));
+        assert!(providers
+            .iter()
+            .any(|provider| provider.id.as_str() == "poppler-pdftotext"));
+        assert_eq!(
+            providers_for_mime("text/plain")[0].id.as_str(),
+            "memoria-text"
+        );
+        assert!(
+            selected_provider("application/x-unknown", &ProviderSelection::Automatic).is_none()
+        );
+        let text = selected_provider("text/plain", &ProviderSelection::Automatic).unwrap();
+        assert_eq!(text.id.as_str(), "memoria-text");
+        assert_eq!(text.id, ProviderId::new("memoria-text"));
+    }
+
+    #[test]
+    fn missing_pdftotext_is_an_unavailable_provider() {
+        let provider = discover_pdftotext_at(None);
+        assert_eq!(provider.id.as_str(), "poppler-pdftotext");
+        assert_eq!(provider.availability, ProviderAvailability::Unavailable);
+        assert!(provider.executable_path.is_none());
+        assert!(provider.version.is_none());
+    }
+
+    #[test]
+    fn explicit_selection_can_represent_a_future_provider_choice() {
+        let selection = ProviderSelection::Explicit(ProviderId::new("poppler-pdftotext"));
+        let selected = selected_provider("application/pdf", &selection);
+        if discover_providers().iter().any(|provider| {
+            provider.id.as_str() == "poppler-pdftotext"
+                && provider.availability == ProviderAvailability::Available
+        }) {
+            assert_eq!(selected.unwrap().id.as_str(), "poppler-pdftotext");
+        } else {
+            assert!(selected.is_none());
+        }
     }
 }
