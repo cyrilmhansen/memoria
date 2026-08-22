@@ -17,9 +17,12 @@ use tantivy::schema::{
 use tantivy::{doc, Index, IndexReader, IndexWriter, Order, TantivyDocument, Term};
 
 pub mod app_config;
+mod attachment_text;
 pub mod gmail;
 pub mod html_preview;
 pub mod i18n;
+
+pub use attachment_text::AttachmentTextStats;
 
 pub const DEFAULT_SEED: u64 = 0x4d_41_49_4c_41_52_43;
 const FRAME_MAGIC: &[u8; 8] = b"MAARC001";
@@ -261,6 +264,14 @@ pub struct GmailIndexStats {
     pub segments_before_commit: u64,
     pub segments_after_commit: u64,
     pub segments_after_index: u64,
+    pub attachment_encountered: u64,
+    pub attachment_supported: u64,
+    pub attachment_extracted: u64,
+    pub attachment_unsupported: u64,
+    pub attachment_extraction_failures: u64,
+    pub attachment_decoded_bytes: u64,
+    pub attachment_extracted_bytes: u64,
+    pub attachment_extracted_chars: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -300,6 +311,8 @@ pub struct GmailParsedMessage {
     pub labels: Vec<String>,
     pub attachment_types: Vec<String>,
     pub attachment_count: u64,
+    pub attachment_text: String,
+    pub attachment_text_stats: attachment_text::AttachmentTextStats,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -310,6 +323,13 @@ pub struct AttachmentInfo {
     pub decoded_bytes: u64,
     pub content_id: Option<String>,
     pub inline: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AttachmentPayload {
+    pub info: AttachmentInfo,
+    pub bytes: Vec<u8>,
+    pub decoded_text: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -365,10 +385,17 @@ fn walk_mime_parts(
     next_id: &mut u32,
     attachments: &mut Vec<AttachmentInfo>,
     resources: &mut Vec<MimeResourceInfo>,
+    mut payloads: Option<&mut Vec<AttachmentPayload>>,
 ) -> io::Result<()> {
     if !part.subparts.is_empty() {
         for child in &part.subparts {
-            walk_mime_parts(child, next_id, attachments, resources)?;
+            walk_mime_parts(
+                child,
+                next_id,
+                attachments,
+                resources,
+                payloads.as_deref_mut(),
+            )?;
         }
         return Ok(());
     }
@@ -395,14 +422,28 @@ fn walk_mime_parts(
         mailparse::DispositionType::Attachment
     ) || (filename.is_some() && !(inline && content_id.is_some()));
     if downloadable {
-        attachments.push(AttachmentInfo {
+        let info = AttachmentInfo {
             id,
             filename,
             mime: part.ctype.mimetype.to_ascii_lowercase(),
             decoded_bytes: bytes.len() as u64,
             content_id,
             inline,
-        });
+        };
+        attachments.push(info.clone());
+        if let Some(payloads) = payloads.as_deref_mut() {
+            let decoded_text = if info.mime.starts_with("text/") && bytes.len() <= 64 * 1024 * 1024
+            {
+                part.get_body().ok()
+            } else {
+                None
+            };
+            payloads.push(AttachmentPayload {
+                info,
+                bytes,
+                decoded_text,
+            });
+        }
     }
     Ok(())
 }
@@ -413,7 +454,7 @@ pub fn list_attachments(root: &Path, doc_id: u64) -> io::Result<Vec<AttachmentIn
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
     let mut attachments = Vec::new();
     let mut resources = Vec::new();
-    walk_mime_parts(&parsed, &mut 0, &mut attachments, &mut resources)?;
+    walk_mime_parts(&parsed, &mut 0, &mut attachments, &mut resources, None)?;
     Ok(attachments)
 }
 
@@ -423,8 +464,22 @@ pub fn list_mime_resources(root: &Path, doc_id: u64) -> io::Result<Vec<MimeResou
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
     let mut attachments = Vec::new();
     let mut resources = Vec::new();
-    walk_mime_parts(&parsed, &mut 0, &mut attachments, &mut resources)?;
+    walk_mime_parts(&parsed, &mut 0, &mut attachments, &mut resources, None)?;
     Ok(resources)
+}
+
+pub(crate) fn attachment_payloads(parsed: &ParsedMail<'_>) -> io::Result<Vec<AttachmentPayload>> {
+    let mut attachments = Vec::new();
+    let mut resources = Vec::new();
+    let mut payloads = Vec::new();
+    walk_mime_parts(
+        parsed,
+        &mut 0,
+        &mut attachments,
+        &mut resources,
+        Some(&mut payloads),
+    )?;
+    Ok(payloads)
 }
 
 fn collect_html_document(
@@ -1667,6 +1722,16 @@ pub fn parse_gmail_message(
         &mut attachment_types,
         &mut attachment_count,
     )?;
+    let (attachment_text, attachment_text_stats) = if attachment_count > 0 {
+        attachment_text::extract_attachment_texts(&parsed).unwrap_or_else(|_| {
+            let mut stats = AttachmentTextStats::default();
+            stats.encountered = attachment_count;
+            stats.failures = attachment_count;
+            (String::new(), stats)
+        })
+    } else {
+        (String::new(), AttachmentTextStats::default())
+    };
     let header = |name: &str| parsed.headers.get_first_value(name).unwrap_or_default();
     Ok(GmailParsedMessage {
         subject: header("Subject"),
@@ -1680,6 +1745,8 @@ pub fn parse_gmail_message(
         labels,
         attachment_types,
         attachment_count,
+        attachment_text,
+        attachment_text_stats,
     })
 }
 
@@ -2037,6 +2104,7 @@ pub fn create_tantivy(path: &Path) -> tantivy::Result<(Index, TantivyFields)> {
         recipients: schema_builder.add_text_field("recipients", text_options.clone()),
         subject: schema_builder.add_text_field("subject", text_options.clone()),
         body: schema_builder.add_text_field("body", text_options.clone()),
+        attachment_text: schema_builder.add_text_field("attachment_text", text_options.clone()),
         folder: schema_builder.add_text_field("folder", text_options.clone()),
         account: schema_builder.add_text_field("account", text_options.clone()),
         labels: schema_builder.add_text_field("label", text_options.clone()),
@@ -2062,6 +2130,7 @@ pub struct TantivyFields {
     pub recipients: Field,
     pub subject: Field,
     pub body: Field,
+    pub attachment_text: Field,
     pub folder: Field,
     pub account: Field,
     pub labels: Field,
@@ -2151,6 +2220,7 @@ fn tantivy_fields_from_schema(schema: &Schema) -> tantivy::Result<TantivyFields>
         recipients: field("recipients")?,
         subject: field("subject")?,
         body: field("body")?,
+        attachment_text: field("attachment_text")?,
         folder: field("folder")?,
         account: field("account")?,
         labels: field("label")?,
@@ -2408,6 +2478,14 @@ where
             }
         };
         stats.parse_us += parse_started.elapsed().as_micros();
+        stats.attachment_encountered += parsed.attachment_text_stats.encountered;
+        stats.attachment_supported += parsed.attachment_text_stats.supported;
+        stats.attachment_extracted += parsed.attachment_text_stats.extracted;
+        stats.attachment_unsupported += parsed.attachment_text_stats.unsupported;
+        stats.attachment_extraction_failures += parsed.attachment_text_stats.failures;
+        stats.attachment_decoded_bytes += parsed.attachment_text_stats.decoded_bytes;
+        stats.attachment_extracted_bytes += parsed.attachment_text_stats.extracted_bytes;
+        stats.attachment_extracted_chars += parsed.attachment_text_stats.extracted_chars;
         let mut document = doc!(
             fields.doc_id => row.doc_id,
             fields.timestamp => row.timestamp,
@@ -2415,6 +2493,7 @@ where
             fields.recipients => parsed.recipients,
             fields.subject => parsed.subject,
             fields.body => parsed.body,
+            fields.attachment_text => parsed.attachment_text,
             fields.account => row.source_account,
             fields.labels => parsed.labels.join(" "),
             fields.attachment_types => parsed.attachment_types.join(" "),
@@ -2598,7 +2677,7 @@ fn structured_query(
 ) -> tantivy::Result<Box<dyn Query>> {
     let mut queries = Vec::<Box<dyn Query>>::new();
     if !request.text.trim().is_empty() {
-        let parser = QueryParser::for_index(
+        let mut parser = QueryParser::for_index(
             index,
             vec![
                 fields.sender,
@@ -2608,8 +2687,12 @@ fn structured_query(
                 fields.account,
                 fields.labels,
                 fields.attachment_types,
+                fields.attachment_text,
             ],
         );
+        // Attachment text is useful evidence, but a long document must not
+        // outrank a concise match in the message itself by accident.
+        parser.set_field_boost(fields.attachment_text, 0.7);
         queries.push(parser.parse_query(&request.text)?);
     }
     if let Some(value) = request.from.as_deref() {
@@ -3278,6 +3361,104 @@ mod tests {
     }
 
     #[test]
+    fn search_finds_a_message_using_attachment_text_only() {
+        let root = std::env::temp_dir().join(format!(
+            "mail-attachment-text-search-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let catalog = create_metadata(&root.join("metadata.sqlite")).unwrap();
+        let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        let raw = b"From: fixture@example.test\r\nTo: reader@example.test\r\nSubject: hello\r\nContent-Type: multipart/mixed; boundary=part\r\n\r\n--part\r\nContent-Type: text/plain\r\n\r\nhello\r\n--part\r\nContent-Type: text/plain; charset=iso-8859-1\r\nContent-Disposition: attachment; filename=note.txt\r\n\r\ncaf\xe9 phrase-secrete-947\r\n--part--\r\n";
+        let location = writer.append_raw(0, raw).unwrap();
+        insert_gmail_metadata(
+            &catalog,
+            "fixture-account",
+            "gmail-attachment-text",
+            0,
+            "thread-0",
+            "[\"INBOX\"]",
+            Some(1),
+            Some("1"),
+            &location,
+        )
+        .unwrap();
+        writer.sync().unwrap();
+        index_gmail_archive(&root).unwrap();
+        let results = GmailSearchIndex::open(&root)
+            .unwrap()
+            .search("phrase-secrete-947", 10)
+            .unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.doc_id)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+        assert_eq!(
+            GmailSearchIndex::open(&root)
+                .unwrap()
+                .search("café", 10)
+                .unwrap()
+                .iter()
+                .map(|result| result.doc_id)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_finds_a_message_using_pdf_attachment_text_when_provider_exists() {
+        if std::process::Command::new("pdftotext")
+            .arg("-v")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        use base64::Engine;
+        let root =
+            std::env::temp_dir().join(format!("mail-pdf-text-search-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let catalog = create_metadata(&root.join("metadata.sqlite")).unwrap();
+        let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(attachment_text::test_pdf_fixture("phrase-secrete-947"));
+        let raw = format!(
+            "From: fixture@example.test\r\nTo: reader@example.test\r\nSubject: hello\r\nContent-Type: multipart/mixed; boundary=part\r\n\r\n--part\r\nContent-Type: text/plain\r\n\r\nhello\r\n--part\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=note.pdf\r\nContent-Transfer-Encoding: base64\r\n\r\n{encoded}\r\n--part--\r\n"
+        );
+        let location = writer.append_raw(0, raw.as_bytes()).unwrap();
+        insert_gmail_metadata(
+            &catalog,
+            "fixture-account",
+            "gmail-pdf-text",
+            0,
+            "thread-0",
+            "[\"INBOX\"]",
+            Some(1),
+            Some("1"),
+            &location,
+        )
+        .unwrap();
+        writer.sync().unwrap();
+        index_gmail_archive(&root).unwrap();
+        let results = GmailSearchIndex::open(&root)
+            .unwrap()
+            .search("phrase-secrete-947", 10)
+            .unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.doc_id)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn structured_search_combines_filters_without_post_filter_false_negatives() {
         let root =
             std::env::temp_dir().join(format!("mail-structured-search-{}", std::process::id()));
@@ -3318,7 +3499,8 @@ mod tests {
             .unwrap();
         }
         writer.sync().unwrap();
-        index_gmail_archive(&root).unwrap();
+        let index_stats = index_gmail_archive(&root).unwrap();
+        assert_eq!(index_stats.attachment_extraction_failures, 1);
         let index = GmailSearchIndex::open(&root).unwrap();
         let result = index
             .search_request(&SearchRequest {

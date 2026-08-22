@@ -484,6 +484,17 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
 - Binaire release restauré après l’analyse bloat : 31 070 752 octets.
 - Rapport : `experiments/2026-08-21-mail-archive-dependency-security-audit.md`.
 
+## 2026-08-22 — Indexation du texte des pièces jointes
+
+- Inventorié anonymement les 25 pièces jointes de l’archive Gmail réelle.
+- Ajouté `attachment_text` comme champ Tantivy dérivé ; RAW, catalogue et
+  framing inchangés.
+- Intégré le décodage `text/*` et un provider PDF `pdftotext` optionnel,
+  lancé sans shell avec limites d’entrée/sortie et timeout.
+- Rebuild réel : 20 formats supportés, 19 textes extraits, 5 non supportés,
+  0 échec bloquant ; recherche fixture validée pour texte et PDF.
+- Rapport : `experiments/2026-08-22-mail-archive-attachment-text-indexing.md`.
+
 ## 2026-08-21 — Profil CI ThinLTO
 
 - Ajouté `[profile.ci]`, hérité de `release` avec ThinLTO et 8 unités de

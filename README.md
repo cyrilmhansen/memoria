@@ -184,9 +184,12 @@ handlers, forms, iframes and objects are neutralized, and a strict CSP is
 applied. No WebKit, WebView2, WebKitGTK, QtWebEngine or Chromium engine is
 bundled into Memoria.
 
-Attachments are extracted only when requested from the authoritative RAW. The
-current UI does not permanently extract or CAS attachment content, and it does
-not index the text of PDF or Office documents.
+Attachments are extracted only when requested from the authoritative RAW for
+opening/saving. During a derived Tantivy rebuild, `text/*` attachment parts
+and PDF attachments are also processed for search: text parts are decoded
+internally, while PDFs use the optional local `pdftotext` provider with
+explicit size and timeout limits. Office documents are not indexed yet.
+Extracted text is never stored as a second authoritative attachment copy.
 
 ## Storage and recovery model
 
@@ -260,7 +263,8 @@ conclusions.
 
 The next product questions are deliberately limited to durable archive use:
 
-- optionally index attachment text for PDF/Office documents;
+- extend bounded attachment-text indexing beyond the current text/* and PDF
+  support, starting with formats justified by the real corpus;
 - consider automatic/background synchronization after the manual workflow is
   stable;
 - support faithful export/restoration and Gmail-to-Gmail migration workflows;
@@ -276,7 +280,9 @@ These are future directions, not current promises.
 - Gmail is the primary supported source today; other providers are not
   implemented.
 - There is no complete restoration or write-back workflow to Gmail.
-- Attachment contents are not indexed, OCRed or semantically searched.
+- Attachment text indexing currently covers text/* parts and PDF when
+  `pdftotext` is installed; Office contents are not indexed, and there is no
+  OCR or semantic attachment search.
 - Thumbnail support depends on desktop providers installed on the machine.
 - Active HTML and automatic remote resources are intentionally disabled.
 - The Windows build path exists, but native Windows UX/OAuth validation remains

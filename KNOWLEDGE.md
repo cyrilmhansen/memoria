@@ -400,3 +400,16 @@ résultats d'expérience locale :
   +692 KiB historiques après i18n ne sont pas attribuables au catalogue sans
   rebuild contrôlé bit-à-bit.
 - **Rapport :** `experiments/2026-08-21-mail-archive-dependency-security-audit.md`.
+
+## 2026-08-22 — Indexation bornée du texte des pièces jointes
+
+- **Fait vérifié :** le champ Tantivy dérivé `attachment_text` permet de
+  retrouver un message par un terme présent uniquement dans une pièce jointe,
+  sans modifier le RAW ni le catalogue.
+- **Décision de projet :** supporter `text/*` par décodage interne et PDF par
+  le provider système optionnel `pdftotext`, avec entrée/sortie bornées et
+  timeout ; ne pas embarquer de moteur Office généraliste pour le moment.
+- **Fait vérifié sur le corpus réel :** 25 pièces jointes observées, 20
+  formats traitables, 19 textes produits, 5 non supportées et 0 échec
+  d’extraction bloquant. Détails :
+  [`experiments/2026-08-22-mail-archive-attachment-text-indexing.md`](experiments/2026-08-22-mail-archive-attachment-text-indexing.md).
