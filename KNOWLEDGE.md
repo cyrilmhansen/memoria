@@ -435,3 +435,49 @@ résultats d'expérience locale :
   Memoria avant cette campagne native ; les CLSID/DLL concrets resteront des
   diagnostics, pas des identifiants de provider.
 - **Probe :** `experiments/windows-ifilter-probe/` et son rapport.
+
+- **Fait vérifié sur Windows 11 Pro 25H2 x64 :** HTML est extrait par
+  `LoadIFilter`; le handler PDF Windows fonctionne par CLSID direct avec
+  `IPersistStream`, mais `LoadIFilter` renvoie `E_NOINTERFACE` sur ce poste.
+  Le fixture DOCX est rejeté par `IFilter::Init` (`FILTER_E_UNKNOWNFORMAT`) et
+  le fixture TXT ne produit aucun chunk.
+- **Décision de projet :** ne pas intégrer encore `windows-ifilter` ; une
+  intégration devrait découvrir dynamiquement les handlers et conserver le
+  helper isolé, sans CLSID codé en dur.
+
+### Mise à jour du probe natif
+
+- **Fait vérifié :** la résolution dynamique extension/`PersistentHandler`/
+  `PersistentAddinsRegistered`/`IID_IFilter` retrouve sur N16PRO les handlers
+  `.txt`, `.html`, `.pdf` et `.docx`, sans CLSID codé en dur.
+- **Fait vérifié :** PDF est validé par le modèle moderne `CoCreateInstance` +
+  `IPersistStream` + `IFilter`; l’échec `LoadIFilter` n’est pas un rejet.
+- **Fait vérifié :** timeout, sortie excessive et crash contrôlés sont bornés
+  par terminaison et attente du processus enfant.
+- **Limite :** Word COM n’a pas produit le DOCX contrôlé en 30 secondes sur le
+  runner; DOCX reste inconclusif. Aucun backend produit n’est encore intégré.
+
+### Intégration produit PDF Windows
+
+- **Décision :** intégrer `windows-ifilter` uniquement pour
+  `application/pdf`; Automatic le préfère à `poppler-pdftotext` sous Windows.
+- **Fait vérifié dans le code :** Memoria utilise un helper séparé, un fichier
+  temporaire `.pdf` contrôlé et des bornes parentales de 64 MiB / 8 MiB / 10 s.
+  Le helper résout le handler dynamiquement; aucun CLSID n’est dans le code
+  produit. Linux conserve son chemin `pdftotext`.
+- **Limite :** DOCX reste explicitement inconclusif et hors support.
+
+### Intégration produit DOCX Windows
+
+- **Fait vérifié :** sur Windows natif, deux documents Word contrôlés ont été
+  extraits par le handler `.docx` résolu dynamiquement via le helper isolé.
+- **Décision de projet :** `windows-ifilter` couvre désormais
+  `application/pdf` et
+  `application/vnd.openxmlformats-officedocument.wordprocessingml.document`
+  sous Windows. Le helper choisit uniquement les extensions contrôlées `.pdf`
+  et `.docx`; aucun CLSID Office n’est codé en dur.
+- **Fait vérifié :** le test produit DOCX retrouve un terme présent uniquement
+  dans la pièce jointe via `attachment_text` et Tantivy. Linux reste inchangé :
+  PDF via `pdftotext`, DOCX non supporté.
+- **Limite :** Word COM Automation a été testé dans une session interactive,
+  mais ne fait pas partie de Memoria et n’est pas requis par l’IFilter.

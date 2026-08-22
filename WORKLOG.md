@@ -530,3 +530,53 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
 - Aucun IFilter réel n'a été chargé : la validation PDF/DOCX native et toute
   intégration de `windows-ifilter` sont volontairement reportées.
 - Rapport : `experiments/2026-08-22-windows-ifilter-text-extraction.md`.
+
+## 2026-08-22 — Intégration IFilter PDF Memoria
+
+- Ajouté le provider Windows `windows-ifilter` uniquement pour
+  `application/pdf`, avant `poppler-pdftotext` sous Windows.
+- Ajouté `memoria-ifilter-helper.exe`, avec résolution registre dynamique et
+  chemin `CoCreateInstance` + `IPersistStream` + `IFilter`; le processus
+  principal ne charge aucun IFilter.
+- Le parent écrit un fichier temporaire contrôlé `.pdf`, borne entrée/sortie/
+  durée et nettoie après fermeture des handles.
+- Linux reste inchangé; aucun support DOCX n’est annoncé.
+
+## 2026-08-22 — Validation IFilter sur Windows natif
+
+- Probe exécuté sur Windows 11 Pro 25H2 x64 (`N16PRO-memoria-gui`) avec
+  fixtures générées localement et sans données personnelles.
+- HTML : succès via `LoadIFilter`; PDF : `LoadIFilter` unsupported mais CLSID
+  direct + `IPersistStream` extrait la phrase fixture ; DOCX :
+  `FILTER_E_UNKNOWNFORMAT`; TXT : succès sans chunks.
+- Helper release : 170 496 octets ; extraction PDF directe environ 68 ms.
+- Reproduction native des trois tests signalés : recovery et HTML échouent
+  par durées de vie de handles/fichiers Windows ; structured search reste à
+  isoler, assertion inchangée.
+- Conclusion : pas d’intégration produit IFilter dans cette passe.
+
+## 2026-08-22 — Résolution dynamique IFilter Windows
+
+- Étendu le probe avec la résolution registre effective et le chemin moderne
+  `CLSID → IPersistStream → IFilter`, sans CLSID machine dans le code.
+- Validé dynamiquement PDF sur N16PRO; HTML reste validé mais hors périmètre
+  utile, TXT est couvert par `memoria-text`.
+- Word COM a été tenté avec un sous-processus borné à 30 s; le runner n’a pas
+  produit de fixture DOCX, donc le support DOCX reste inconclusif.
+- Exercé le superviseur contrôlé : timeout, sortie >8 MiB et crash sont
+  terminés/attendus proprement. Aucun backend produit n’a encore été intégré.
+- Rapport : `experiments/2026-08-22-windows-ifilter-text-extraction.md`.
+
+## 2026-08-22 — Intégration IFilter DOCX Memoria
+
+- Étendu `windows-ifilter` à
+  `application/vnd.openxmlformats-officedocument.wordprocessingml.document`
+  avec une extension temporaire contrôlée `.docx`; PDF reste `.pdf`.
+- Le helper résout désormais dynamiquement les handlers `.pdf` et `.docx`.
+  Aucun CLSID Office n’a été ajouté au produit et Word Automation reste hors
+  du processus Memoria.
+- Ajouté un test produit Windows : terme présent uniquement dans un DOCX,
+  extraction via IFilter, champ `attachment_text`, puis recherche Tantivy.
+- Validation native : test ciblé réussi (`1 passed`), extraction DOCX helper
+  environ 105 ms, helper CI 169 472 octets, application CI 30 287 360
+  octets. Linux reste inchangé : PDF `pdftotext`, DOCX non supporté.

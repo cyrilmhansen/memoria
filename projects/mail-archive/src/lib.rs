@@ -3461,6 +3461,61 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn search_finds_a_message_using_docx_attachment_text_when_provider_exists() {
+        use base64::Engine;
+        let Some(fixture) = std::env::var_os("MEMORIA_IFILTER_DOCX_FIXTURE") else {
+            return;
+        };
+        let fixture = PathBuf::from(fixture);
+        if !fixture.is_file() {
+            return;
+        }
+        let provider = selected_provider(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            &ProviderSelection::Automatic,
+        )
+        .expect("Windows IFilter DOCX provider should be available");
+        assert_eq!(provider.id.as_str(), "windows-ifilter");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(fs::read(fixture).unwrap());
+        let raw = format!(
+            "From: fixture@example.test\r\nTo: reader@example.test\r\nSubject: hello\r\nContent-Type: multipart/mixed; boundary=part\r\n\r\n--part\r\nContent-Type: text/plain\r\n\r\nhello\r\n--part\r\nContent-Type: application/vnd.openxmlformats-officedocument.wordprocessingml.document\r\nContent-Disposition: attachment; filename=note.docx\r\nContent-Transfer-Encoding: base64\r\n\r\n{encoded}\r\n--part--\r\n"
+        );
+        let root =
+            std::env::temp_dir().join(format!("mail-docx-text-search-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let catalog = create_metadata(&root.join("metadata.sqlite")).unwrap();
+        let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        let location = writer.append_raw(0, raw.as_bytes()).unwrap();
+        insert_gmail_metadata(
+            &catalog,
+            "fixture-account",
+            "fixture-docx-text",
+            0,
+            "thread-0",
+            "[\"INBOX\"]",
+            Some(1),
+            Some("1"),
+            &location,
+        )
+        .unwrap();
+        writer.sync().unwrap();
+        index_gmail_archive(&root).unwrap();
+        let results = GmailSearchIndex::open(&root)
+            .unwrap()
+            .search("memoria-word-automation-fixture-947", 10)
+            .unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.doc_id)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn structured_search_combines_filters_without_post_filter_false_negatives() {
         let root =

@@ -1,6 +1,8 @@
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
+#[cfg(windows)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -12,6 +14,8 @@ use crate::AttachmentPayload;
 pub const MAX_INPUT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 pub const EXTRACTION_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(windows)]
+static IFILTER_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ProviderId(String);
@@ -30,6 +34,7 @@ impl ProviderId {
 pub enum BackendKind {
     BuiltIn,
     ExternalExecutable,
+    WindowsIFilter,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,7 +65,7 @@ pub fn discover_providers() -> Vec<ExtractionProvider> {
     static DISCOVERED: OnceLock<Vec<ExtractionProvider>> = OnceLock::new();
     DISCOVERED
         .get_or_init(|| {
-            vec![
+            let providers = vec![
                 ExtractionProvider {
                     id: ProviderId::new("memoria-text"),
                     display_name: "Memoria built-in text decoder".into(),
@@ -71,9 +76,98 @@ pub fn discover_providers() -> Vec<ExtractionProvider> {
                     executable_path: None,
                 },
                 discover_pdftotext(),
-            ]
+            ];
+            #[cfg(windows)]
+            {
+                let mut providers = providers;
+                providers.insert(1, discover_windows_ifilter());
+                providers
+            }
+            #[cfg(not(windows))]
+            {
+                providers
+            }
         })
         .clone()
+}
+
+#[cfg(windows)]
+fn discover_windows_ifilter() -> ExtractionProvider {
+    let executable_path = resolve_ifilter_helper();
+    let supported_types = executable_path
+        .as_deref()
+        .map(|path| {
+            [
+                ("application/pdf", ".pdf"),
+                (
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    ".docx",
+                ),
+            ]
+            .into_iter()
+            .filter_map(|(mime, extension)| {
+                ifilter_helper_supports_extension(path, extension).then_some(mime.into())
+            })
+            .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let available = !supported_types.is_empty();
+    ExtractionProvider {
+        id: ProviderId::new("windows-ifilter"),
+        display_name: "Windows registered IFilter".into(),
+        backend_kind: BackendKind::WindowsIFilter,
+        supported_types,
+        availability: if available {
+            ProviderAvailability::Available
+        } else {
+            ProviderAvailability::Unavailable
+        },
+        version: None,
+        executable_path: available.then_some(executable_path).flatten(),
+    }
+}
+
+#[cfg(windows)]
+fn resolve_ifilter_helper() -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("MEMORIA_IFILTER_HELPER") {
+        let path = std::path::PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let current = std::env::current_exe().ok()?;
+    let sibling = current.parent()?.join("memoria-ifilter-helper.exe");
+    sibling.is_file().then_some(sibling)
+}
+
+#[cfg(windows)]
+fn ifilter_helper_supports_extension(program: &Path, extension: &str) -> bool {
+    let mut child = match Command::new(program)
+        .args(["discover", extension])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(5)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 pub fn providers_for_mime(mime: &str) -> Vec<ExtractionProvider> {
@@ -193,6 +287,24 @@ fn extract_one(payload: &AttachmentPayload) -> ExtractionResult {
     }
     let provider = selected_provider(&payload.info.mime, &ProviderSelection::Automatic);
     match provider.as_ref().map(|provider| provider.id.as_str()) {
+        #[cfg(windows)]
+        Some("windows-ifilter") => {
+            let extension = match payload.info.mime.as_str() {
+                "application/pdf" => ".pdf",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
+                    ".docx"
+                }
+                _ => return ExtractionResult::Unsupported,
+            };
+            return extract_windows_ifilter(
+                &payload.bytes,
+                provider
+                    .as_ref()
+                    .and_then(|provider| provider.executable_path.as_deref())
+                    .expect("available helper"),
+                extension,
+            );
+        }
         Some("poppler-pdftotext") => {
             return extract_pdf(
                 &payload.bytes,
@@ -215,6 +327,95 @@ fn extract_one(payload: &AttachmentPayload) -> ExtractionResult {
         return ExtractionResult::Text(text.chars().take(MAX_OUTPUT_BYTES).collect());
     }
     ExtractionResult::Unsupported
+}
+
+#[cfg(windows)]
+fn extract_windows_ifilter(bytes: &[u8], helper: &Path, extension: &str) -> ExtractionResult {
+    let serial = IFILTER_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let directory =
+        std::env::temp_dir().join(format!("memoria-ifilter-{}-{serial}", std::process::id()));
+    if std::fs::create_dir(&directory).is_err() {
+        return ExtractionResult::Failed;
+    }
+    let input = directory.join(format!("attachment{extension}"));
+    let result = match std::fs::write(&input, bytes) {
+        Ok(()) => run_ifilter_helper(helper, &input),
+        Err(_) => ExtractionResult::Failed,
+    };
+    let _ = std::fs::remove_file(&input);
+    let _ = std::fs::remove_dir(&directory);
+    result
+}
+
+#[cfg(windows)]
+fn run_ifilter_helper(program: &Path, input: &Path) -> ExtractionResult {
+    let mut child = match Command::new(program)
+        .arg(input)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return ExtractionResult::Unsupported
+        }
+        Err(_) => return ExtractionResult::Failed,
+    };
+    let (limit_sender, limit_receiver) = mpsc::channel();
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let reader = thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut buffer = [0u8; 8192];
+        let mut truncated = false;
+        loop {
+            let read = stdout.read(&mut buffer).map_err(|_| ())?;
+            if read == 0 {
+                break;
+            }
+            let remaining = MAX_OUTPUT_BYTES.saturating_sub(output.len());
+            if read > remaining {
+                output.extend_from_slice(&buffer[..remaining]);
+                truncated = true;
+                let _ = limit_sender.send(());
+                break;
+            }
+            output.extend_from_slice(&buffer[..read]);
+        }
+        Ok::<_, ()>((output, truncated))
+    });
+    let deadline = Instant::now() + EXTRACTION_TIMEOUT;
+    let mut limited = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if limit_receiver.try_recv().is_ok() => {
+                limited = true;
+                let _ = child.kill();
+                break child.wait().ok();
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                break child.wait().ok();
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(5)),
+            Err(_) => {
+                let _ = child.kill();
+                break child.wait().ok();
+            }
+        }
+    };
+    let (output, truncated) = reader.join().ok().and_then(Result::ok).unwrap_or_default();
+    if limited || truncated || !status.as_ref().is_some_and(|status| status.success()) {
+        return if status
+            .as_ref()
+            .is_some_and(|status| status.code() == Some(3))
+        {
+            ExtractionResult::Unsupported
+        } else {
+            ExtractionResult::Failed
+        };
+    }
+    ExtractionResult::Text(String::from_utf8_lossy(&output).trim().to_string())
 }
 
 fn extract_pdf(bytes: &[u8], executable: &Path) -> ExtractionResult {

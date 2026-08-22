@@ -10,42 +10,83 @@ not load an IFilter DLL in the Memoria process. The probe is a minimal helper
 boundary: it accepts one path, calls the documented `LoadIFilter` API, emits
 UTF-8 text on stdout, and reports only bounded diagnostics on stderr.
 
-## Status
+## Native Windows result
 
-The current Linux environment can type-check the probe for
-`x86_64-pc-windows-msvc`, but it cannot observe the registry and installed
-IFilter handlers. Native Windows execution is therefore still required before
-adding `windows-ifilter` to Memoria's discovered providers.
+The probe was run on Windows 11 Pro 25H2 x64, runner `N16PRO-memoria-gui`,
+with Rust 1.98.0. The release helper with dynamic registry lookup and the
+supervisor probe was 290,816 bytes and built in about 24 seconds on the
+latest run.
+
+The observed registrations supplied for this machine were:
+
+| extension | CLSID | DLL | LoadIFilter / dynamic direct result |
+|---|---|---|---|
+| `.txt` | `{c1243ca0-bf96-11cd-b579-08002b30bfeb}` | `C:\Windows\System32\query.dll` | LoadIFilter loaded, but returned zero chunks on the generated fixture |
+| `.html` | `{e0ca5340-4534-11cf-b952-00aa0051fe20}` | `C:\Windows\System32\nlhtml.dll` | LoadIFilter success, 3 text chunks, phrase found |
+| `.pdf` | `{6C337B26-3E38-4F98-813B-FBA18BAB64F5}` | `C:\Windows\System32\Windows.Data.Pdf.dll` | LoadIFilter unsupported; dynamically resolved direct CLSID + IPersistStream succeeded, phrase found |
+| `.docx` | `{5A98B233-3C59-4B31-944C-0E560D85E6C3}` | `...\Microsoft Shared\Filters\OFFFILTX.DLL` | dynamically resolved; Word-generated fixture succeeded through direct COM/IPersistStream/IFilter |
+
+The controlled fixture phrase was never written to the report or diagnostics;
+the workflow only reported a boolean match. Timings were approximately:
+
+- TXT: 80 ms process wall time, 0 chunks;
+- HTML: 32 ms, 3 chunks / 3 text chunks;
+- PDF through direct CLSID: 68 ms, 9 chunks / 1 text chunk;
+- DOCX: 171 ms probe-reported extraction, 38 chunks / 6 text chunks; fixture phrase found.
+
+The dynamic PDF run resolved the registered handler and found the fixture
+phrase; its helper diagnostic measured about 22 ms (about 111 ms including the
+process launch and redirected I/O in the workflow).
+
+The PDF result is a real extraction proof for the registered Windows PDF
+handler. `LoadIFilter` is a legacy/convenience path and returned
+`E_NOINTERFACE` for this PDF, while the modern direct Windows Search model
+(registered CLSID → `CoCreateInstance` → `IPersistStream` → `IFilter`) worked.
+The initial minimal OPC fixture was rejected as `FILTER_E_UNKNOWNFORMAT`, but
+the separately supplied Word-generated DOCX fixture succeeds through the
+registered handler and the modern direct Windows Search model
+(`CoCreateInstance` → `IPersistStream` → `IFilter`). This validates DOCX
+extraction on this Windows installation; it does not claim that every Windows
+installation has the Office handler.
 
 ## Implementation
 
 - Windows bindings: official `windows` crate, `Win32_Storage_IndexServer` and
   COM/structured-storage features.
-- API path: `CoInitializeEx` → `LoadIFilter` → `IFilter::Init` →
+- Legacy path: `CoInitializeEx` → `LoadIFilter` → `IFilter::Init` →
   `GetChunk`/`GetText`.
-- The stable future Memoria identity would be `windows-ifilter`; a concrete
-  CLSID or DLL path is diagnostic only and is not hardcoded.
+- Modern path: dynamic registration lookup from extension/ProgID or
+  `SystemFileAssociations`, through `PersistentHandler` and
+  `PersistentAddinsRegistered\{89BCB740-6119-101A-BCB7-00DD010655AF}`, then
+  `CoCreateInstance` → `IPersistStream` → `IFilter`.
+- The stable future Memoria identity is `windows-ifilter`; a concrete CLSID,
+  DLL path, and threading model are machine diagnostics only and are not
+  hardcoded.
 - The helper enforces 64 MiB input and 8 MiB extracted-text limits. Memoria
   must still own the 10 s timeout and kill/wait the helper; a child process is
   the isolation boundary for crashes, leaks, or a stuck third-party filter.
-- `LoadIFilter` is intentionally tried before any direct CLSID/registry
-  inventory. Direct registry inspection and explicit CLSID trials remain a
-  follow-up only if native results show multiple relevant handlers or explain
-  a failure.
+- `LoadIFilter` is intentionally tried as a legacy/convenience diagnostic
+  before the direct CLSID path. The probe exposes dynamic registration and
+  extraction through `discover` and `dynamic`.
 
-## Native Windows campaign pending
+## Isolation and limits
 
-No PDF, DOCX, or other Windows provider result is claimed from Linux. On a
-real Windows machine the probe must be run against controlled fixtures and
-report only aggregate status, extraction success, phrase-match status, and
-timing. Missing handlers are a valid `unsupported` result; a loaded handler
-that fails during `Init`/chunk extraction is a separate `failed` result.
+The probe remains a separate process and all IFilter DLLs were loaded only
+there. Controlled native Windows supervision exercises produced the following
+bounded outcomes: `test-sleep` → timeout at about 10 s, `test-output` →
+output-too-large at about 20 ms, and `test-crash` → crashed at about 20 ms.
+Each path terminates and waits for the child. These are supervisor tests, not
+claims about crashing a real system provider.
+
+Missing handlers are reported as `unsupported`; a loaded handler that fails
+during `Init`/chunk extraction is reported as `failed`.
 
 Controlled fixtures are generated by
 `experiments/windows-ifilter-probe/fixtures/generate-fixtures.ps1` and contain
 the same phrase in TXT, a minimal generated PDF, a minimal generated DOCX, and
-HTML. The generated files are deliberately not committed. The script uses
-only PowerShell/.NET ZIP support and does not use any personal document.
+HTML. The separately supplied Word-generated DOCX was used only as a local
+test artifact and is not retained in the repository. The generated files are
+deliberately not committed and use no personal document.
 
 ## Linux-side validation
 
@@ -53,12 +94,49 @@ The probe passes `cargo check` on Linux and for
 `x86_64-pc-windows-msvc` with the cached official `windows 0.62.2` bindings.
 `cargo-xwin` linking could not be completed in this environment because its
 MSVC CRT setup needed a network download and DNS/network access was
-unavailable. No native Windows run, provider inventory, PDF/DOCX result, or
-binary size is therefore reported here.
+unavailable. The native run above supplies the actual provider results.
+
+## Other Windows regressions reproduced
+
+The same native runner reproduced all three reported tests as failures:
+
+- `recovery_truncates_an_incomplete_tail`: Win32 access denied while the test
+  still holds the `ArchiveWriter` segment handle; Windows does not permit the
+  second `set_len` in that state.
+- `serves_sanitized_html_and_cid_without_exposing_other_messages`: cleanup
+  removes the temporary tree while the SQLite connection/archive writer are
+  still alive; Windows reports a file-in-use error.
+- `structured_search_combines_filters_without_post_filter_false_negatives`:
+  the assertion still returns zero on Windows. The campaign identified the
+  exact assertion but did not yet isolate whether the mismatch is in the
+  fixture/index/query path, so no assertion was changed.
+
+These failures are deliberately not mixed into the IFilter work.
 
 ## Decision
 
-Do not integrate the provider yet. The isolation design is validated at the
-API/probe level, but provider availability and actual PDF/DOCX extraction are
-not established until a native Windows run. Memoria's existing Linux
-selection (`memoria-text` and optional `poppler-pdftotext`) is unchanged.
+**Validated:** Windows PDF IFilter through the modern direct registration and
+`IPersistStream` path. `LoadIFilter` remains useful diagnostic evidence but is
+not used as a rejection criterion. **Validated:** DOCX through the registered
+Office handler and a real Word-generated fixture on this Windows installation.
+**Validated but not useful for Memoria:** HTML. TXT is irrelevant because
+`memoria-text` remains preferred.
+
+The stable provider boundary is `windows-ifilter`, with dynamic handler
+discovery and an isolated helper. The product integration covers
+`application/pdf` and
+`application/vnd.openxmlformats-officedocument.wordprocessingml.document` on
+Windows. Linux remains unchanged (`memoria-text` and optional
+`poppler-pdftotext`); DOCX is unsupported there.
+
+The product helper is separate from `mail-archive-app`; it receives a private
+controlled `.pdf` or `.docx`, resolves the registered handler dynamically, and
+returns UTF-8 text. The parent enforces the 64 MiB input, 8 MiB output and 10
+second timeout bounds. Native product validation on the same Windows host
+built `mail-archive-app` and `memoria-ifilter-helper`, discovered both
+handlers, and passed the PDF and DOCX attachment-text search tests. The CI
+profile sizes were 30,287,360 bytes for the application and 169,472 bytes for
+the helper; direct DOCX helper extraction took about 105 ms.
+The full Windows workspace run still has the three previously documented,
+unrelated failures involving Windows file-handle lifetimes and structured
+search.

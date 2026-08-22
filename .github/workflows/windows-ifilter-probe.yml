@@ -107,6 +107,17 @@ jobs:
           foreach ($mode in @("test-sleep", "test-output", "test-crash")) {
             & $probe supervise $mode
           }
+          exit 0
+      - name: Validate Memoria PDF attachment indexing
+        shell: pwsh
+        run: |
+          cargo build --profile ci -p mail-archive-experiment --bin mail-archive-app --bin memoria-ifilter-helper
+          $helper = (Get-Item "target/ci/memoria-ifilter-helper.exe").Length
+          $app = (Get-Item "target/ci/mail-archive-app.exe").Length
+          "memoria_ifilter_helper_bytes=$helper"
+          "memoria_app_bytes=$app"
+          $env:MEMORIA_IFILTER_HELPER = (Resolve-Path "target/ci/memoria-ifilter-helper.exe").Path
+          cargo test --workspace search_finds_a_message_using_pdf_attachment_text_when_provider_exists -- --nocapture
       - name: Report registered filter handlers
         shell: pwsh
         run: |
