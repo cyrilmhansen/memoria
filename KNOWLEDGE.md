@@ -422,3 +422,16 @@ résultats d'expérience locale :
   l’ID technique. La découverte est mise en cache par `OnceLock` pour la durée
   du processus ; une future surface Settings pourra proposer un refresh.
   Aucun écran Settings n’existe encore ; l’API est prête à l’alimenter.
+
+## 2026-08-22 — Probe Windows IFilter
+
+- **Fait vérifié :** un helper isolé peut appeler l’API Windows officielle
+  `LoadIFilter` puis `IFilter::Init`/`GetChunk`/`GetText` avec les bindings
+  `windows`, sans charger un filtre tiers dans Memoria.
+- **Limite vérifiée :** l’environnement Linux ne permet pas d’observer les
+  handlers enregistrés sur Windows. PDF/DOCX et leur disponibilité réelle
+  restent à valider sur Windows natif.
+- **Décision de projet :** ne pas intégrer `windows-ifilter` dans la sélection
+  Memoria avant cette campagne native ; les CLSID/DLL concrets resteront des
+  diagnostics, pas des identifiants de provider.
+- **Probe :** `experiments/windows-ifilter-probe/` et son rapport.

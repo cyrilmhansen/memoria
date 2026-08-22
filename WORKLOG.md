@@ -519,3 +519,14 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
   `cargo test --workspace` et build `cargo build --profile ci` passés.
 - Mesure locale : binaire CI Linux de 36 609 152 octets contre 31 070 752
   octets pour le release historique ; aucun run GitHub n'a encore été exécuté.
+
+## 2026-08-22 — Probe Windows IFilter
+
+- Créé un probe/helper Windows isolé utilisant les bindings officiels `windows`
+  et `LoadIFilter`/`IFilter`, avec limites d'entrée et de sortie.
+- Vérifié la compilation native Linux et le `cargo check` ciblant
+  `x86_64-pc-windows-msvc`; le cross-link `cargo-xwin` reste bloqué par
+  l'absence réseau/cache CRT dans l'environnement courant.
+- Aucun IFilter réel n'a été chargé : la validation PDF/DOCX native et toute
+  intégration de `windows-ifilter` sont volontairement reportées.
+- Rapport : `experiments/2026-08-22-windows-ifilter-text-extraction.md`.
