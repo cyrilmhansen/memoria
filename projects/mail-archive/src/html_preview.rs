@@ -476,6 +476,11 @@ mod tests {
         resource.read_to_end(&mut resource_response).unwrap();
         assert!(String::from_utf8_lossy(&resource_response).contains("Content-Type: image/png"));
         assert!(resource_response.ends_with(b"hello"));
+        drop(resource);
+        drop(stream);
+        drop(server);
+        drop(connection);
+        drop(writer);
         fs::remove_dir_all(root).unwrap();
     }
 }

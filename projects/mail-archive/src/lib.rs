@@ -3686,9 +3686,10 @@ mod tests {
         };
         writer.append(&generate_message(config, 0)).unwrap();
         writer.sync().unwrap();
+        drop(writer);
         let path = root.join("segment-000000.arc");
         let length = fs::metadata(&path).unwrap().len();
-        let file = OpenOptions::new().append(true).open(&path).unwrap();
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
         file.set_len(length + 9).unwrap();
         drop(file);
         let (frames, truncated) = recover_segments(&root).unwrap();
