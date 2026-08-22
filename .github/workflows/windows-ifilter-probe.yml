@@ -8,7 +8,11 @@ jobs:
     runs-on: [self-hosted, Windows, X64, memoria-gui, windows-uia, ifilter]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify installed Rust toolchain
+        shell: pwsh
+        run: |
+          rustc --version
+          cargo --version
       - name: Build isolated probe
         shell: pwsh
         run: cargo build --release --manifest-path experiments/windows-ifilter-probe/Cargo.toml
