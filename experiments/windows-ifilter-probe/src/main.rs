@@ -24,7 +24,10 @@ mod windows_probe {
         FILTER_S_LAST_TEXT, IFILTER_INIT_CANON_PARAGRAPHS, IFILTER_INIT_CANON_SPACES,
         IFILTER_INIT_INDEXING_ONLY, STAT_CHUNK,
     };
-    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+    use windows::Win32::System::Com::{
+        CLSIDFromString, CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile,
+        CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, STGM_READ,
+    };
 
     const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
     const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
@@ -34,7 +37,13 @@ mod windows_probe {
         value.encode_wide().chain(std::iter::once(0)).collect()
     }
 
-    fn extract(path: &Path) -> Result<String, String> {
+    struct Extracted {
+        text: String,
+        chunks: u32,
+        text_chunks: u32,
+    }
+
+    fn extract(path: &Path) -> Result<Extracted, String> {
         let metadata = std::fs::metadata(path).map_err(|error| format!("input: {error}"))?;
         if metadata.len() > MAX_INPUT_BYTES {
             return Err("input-too-large".into());
@@ -51,6 +60,32 @@ mod windows_probe {
             return Err("unsupported-null-filter".into());
         }
         let filter = unsafe { IFilter::from_raw(raw_filter as _) };
+        read_filter(filter)
+    }
+
+    fn extract_direct(clsid: &str, path: &Path) -> Result<Extracted, String> {
+        let metadata = std::fs::metadata(path).map_err(|error| format!("input: {error}"))?;
+        if metadata.len() > MAX_INPUT_BYTES {
+            return Err("input-too-large".into());
+        }
+        let _com = ComGuard::new()?;
+        let clsid_wide = wide(OsStr::new(clsid));
+        let clsid = unsafe { CLSIDFromString(PCWSTR(clsid_wide.as_ptr())) }
+            .map_err(|error| format!("clsid-parse: {error}"))?;
+        let filter: IFilter = unsafe {
+            CoCreateInstance(&clsid, None, CLSCTX_INPROC_SERVER)
+                .map_err(|error| format!("cocreate: {error}"))?
+        };
+        let persist: IPersistFile = filter
+            .cast()
+            .map_err(|error| format!("ipersistfile: {error}"))?;
+        let path_wide = wide(path.as_os_str());
+        unsafe { persist.Load(PCWSTR(path_wide.as_ptr()), STGM_READ) }
+            .map_err(|error| format!("persist-load: {error}"))?;
+        read_filter(filter)
+    }
+
+    fn read_filter(filter: IFilter) -> Result<Extracted, String> {
         let flags = IFILTER_INIT_INDEXING_ONLY.0
             | IFILTER_INIT_CANON_PARAGRAPHS.0
             | IFILTER_INIT_CANON_SPACES.0;
@@ -61,6 +96,8 @@ mod windows_probe {
         }
 
         let mut output = String::new();
+        let mut chunks = 0;
+        let mut text_chunks = 0;
         loop {
             let mut chunk = STAT_CHUNK::default();
             let status = unsafe { filter.GetChunk(&mut chunk) };
@@ -70,9 +107,11 @@ mod windows_probe {
             if status < 0 {
                 return Err(format!("get-chunk-hresult=0x{status:08x}"));
             }
+            chunks += 1;
             if chunk.flags.0 & CHUNK_TEXT.0 == 0 {
                 continue;
             }
+            text_chunks += 1;
             loop {
                 let mut buffer = vec![0u16; 4096];
                 let mut count = buffer.len() as u32;
@@ -93,7 +132,11 @@ mod windows_probe {
                 }
             }
         }
-        Ok(output)
+        Ok(Extracted {
+            text: output,
+            chunks,
+            text_chunks,
+        })
     }
 
     struct ComGuard;
@@ -115,20 +158,39 @@ mod windows_probe {
     fn main_impl() -> i32 {
         let mut args = env::args_os();
         let _program = args.next();
-        let Some(path) = args.next() else {
-            eprintln!("usage: windows-ifilter-probe <path>");
+        let Some(first) = args.next() else {
+            eprintln!("usage: windows-ifilter-probe <path> | direct <clsid> <path>");
             return 2;
+        };
+        let (direct_clsid, path) = if first == "direct" {
+            let Some(clsid) = args.next() else {
+                eprintln!("usage: windows-ifilter-probe direct <clsid> <path>");
+                return 2;
+            };
+            let Some(path) = args.next() else {
+                eprintln!("usage: windows-ifilter-probe direct <clsid> <path>");
+                return 2;
+            };
+            (Some(clsid), path)
+        } else {
+            (None, first)
         };
         let path = Path::new(&path);
         let started = Instant::now();
-        match extract(path) {
-            Ok(text) => {
+        let result = match direct_clsid.as_deref() {
+            Some(clsid) => extract_direct(&clsid.to_string_lossy(), path),
+            None => extract(path),
+        };
+        match result {
+            Ok(extracted) => {
                 // stdout is deliberately the helper protocol: UTF-8 text only.
-                let _ = io::stdout().write_all(text.as_bytes());
+                let _ = io::stdout().write_all(extracted.text.as_bytes());
                 let _ = io::stdout().flush();
                 eprintln!(
-                    "status=success bytes={} elapsed_ms={}",
-                    text.len(),
+                    "status=success bytes={} chunks={} text_chunks={} elapsed_ms={}",
+                    extracted.text.len(),
+                    extracted.chunks,
+                    extracted.text_chunks,
                     started.elapsed().as_millis()
                 );
                 0

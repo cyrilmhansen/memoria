@@ -22,6 +22,7 @@ jobs:
       - name: Run controlled fixtures
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $false
           $probe = "experiments/windows-ifilter-probe/target/release/windows-ifilter-probe.exe"
           $phrase = "memoria-ifilter-probe-947"
           foreach ($name in @("sample.txt", "sample.html", "sample.pdf", "sample.docx")) {
@@ -38,6 +39,29 @@ jobs:
             $status = if ($exitCode -eq 0) { "success" } elseif ($exitCode -eq 3) { "unsupported" } else { "failed" }
             "fixture=$name status=$status phrase_found=$match elapsed_ms=$($watch.ElapsedMilliseconds) stdout_bytes=$([Text.Encoding]::UTF8.GetByteCount($text))"
             if ($diagnostic -match "status=(\w+)") { "fixture=$name diagnostic_status=$($Matches[1])" }
+          }
+      - name: Try observed PDF and DOCX handlers directly
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $probe = "experiments/windows-ifilter-probe/target/release/windows-ifilter-probe.exe"
+          $phrase = "memoria-ifilter-probe-947"
+          $direct = @(
+            @{ name = "pdf"; clsid = "{6C337B26-3E38-4F98-813B-FBA18BAB64F5}"; path = "experiments/windows-ifilter-probe/fixtures/sample.pdf" },
+            @{ name = "docx"; clsid = "{5A98B233-3C59-4B31-944C-0E560D85E6C3}"; path = "experiments/windows-ifilter-probe/fixtures/sample.docx" }
+          )
+          foreach ($item in $direct) {
+            $output = Join-Path $env:RUNNER_TEMP "$($item.name)-direct.stdout"
+            $errorOutput = Join-Path $env:RUNNER_TEMP "$($item.name)-direct.stderr"
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            & $probe direct $item.clsid $item.path 1> $output 2> $errorOutput
+            $exitCode = $LASTEXITCODE
+            $watch.Stop()
+            $text = [IO.File]::ReadAllText($output)
+            $diagnostic = [IO.File]::ReadAllText($errorOutput)
+            $match = $text.Contains($phrase)
+            "direct=$($item.name) exit=$exitCode phrase_found=$match elapsed_ms=$($watch.ElapsedMilliseconds) stdout_bytes=$([Text.Encoding]::UTF8.GetByteCount($text))"
+            $diagnostic.Trim()
           }
       - name: Report registered filter handlers
         shell: pwsh
