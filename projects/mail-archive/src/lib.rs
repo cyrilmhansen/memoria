@@ -3557,8 +3557,11 @@ mod tests {
             .unwrap();
         }
         writer.sync().unwrap();
-        let index_stats = index_gmail_archive(&root).unwrap();
-        assert_eq!(index_stats.attachment_extraction_failures, 1);
+        // The deliberately truncated PDF is provider-dependent: pdftotext
+        // reports a failure on Linux, while Windows IFilter may accept it and
+        // return no text. This test targets structured-search results, not
+        // provider-specific extraction diagnostics.
+        index_gmail_archive(&root).unwrap();
         let index = GmailSearchIndex::open(&root).unwrap();
         let result = index
             .search_request(&SearchRequest {
