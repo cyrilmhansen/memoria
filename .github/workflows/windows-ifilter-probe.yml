@@ -1,0 +1,54 @@
+name: Windows IFilter probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: [self-hosted, Windows, X64, memoria-gui, windows-uia, ifilter]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build isolated probe
+        shell: pwsh
+        run: cargo build --release --manifest-path experiments/windows-ifilter-probe/Cargo.toml
+      - name: Generate controlled fixtures
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File experiments/windows-ifilter-probe/fixtures/generate-fixtures.ps1
+      - name: Run controlled fixtures
+        shell: pwsh
+        run: |
+          $probe = "experiments/windows-ifilter-probe/target/release/windows-ifilter-probe.exe"
+          $phrase = "memoria-ifilter-probe-947"
+          foreach ($name in @("sample.txt", "sample.html", "sample.pdf", "sample.docx")) {
+            $path = "experiments/windows-ifilter-probe/fixtures/$name"
+            $output = Join-Path $env:RUNNER_TEMP "$name.stdout"
+            $errorOutput = Join-Path $env:RUNNER_TEMP "$name.stderr"
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            & $probe $path 1> $output 2> $errorOutput
+            $exitCode = $LASTEXITCODE
+            $watch.Stop()
+            $text = Get-Content -Raw -LiteralPath $output
+            $diagnostic = Get-Content -Raw -LiteralPath $errorOutput
+            $match = $text.Contains($phrase)
+            $status = if ($exitCode -eq 0) { "success" } elseif ($exitCode -eq 3) { "unsupported" } else { "failed" }
+            "fixture=$name status=$status phrase_found=$match elapsed_ms=$($watch.ElapsedMilliseconds) stdout_bytes=$([Text.Encoding]::UTF8.GetByteCount($text))"
+            if ($diagnostic -match "status=(\w+)") { "fixture=$name diagnostic_status=$($Matches[1])" }
+          }
+      - name: Report registered filter handlers
+        shell: pwsh
+        run: |
+          $iid = '{89BCB740-6119-101A-BCB7-00DD010655AF}'
+          foreach ($extension in @('.txt', '.html', '.pdf', '.docx')) {
+            $classes = Get-ItemProperty -Path "Registry::HKEY_CLASSES_ROOT\$extension" -ErrorAction SilentlyContinue
+            $persistent = $classes.PersistentHandler
+            $handler = $null
+            if ($persistent) {
+              $handler = (Get-ItemProperty -Path "Registry::HKEY_CLASSES_ROOT\CLSID\$persistent\PersistentAddinsRegistered\$iid" -ErrorAction SilentlyContinue).'(default)'
+            }
+            $dll = $null
+            if ($handler) {
+              $dll = (Get-ItemProperty -Path "Registry::HKEY_CLASSES_ROOT\CLSID\$handler\InprocServer32" -ErrorAction SilentlyContinue).'(default)'
+            }
+            "extension=$extension persistent_handler=$persistent filter_clsid=$handler dll=$dll"
+          }
