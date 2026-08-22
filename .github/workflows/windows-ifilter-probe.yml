@@ -22,6 +22,16 @@ jobs:
       - name: Generate controlled fixtures
         shell: pwsh
         run: powershell -ExecutionPolicy Bypass -File experiments/windows-ifilter-probe/fixtures/generate-fixtures.ps1
+      - name: Generate real Word DOCX fixture with timeout
+        shell: pwsh
+        run: |
+          $script = (Resolve-Path "experiments/windows-ifilter-probe/fixtures/generate-word-fixture.ps1").Path
+          $process = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $script) -PassThru -WindowStyle Hidden
+          if (-not $process.WaitForExit(30000)) {
+            Stop-Process -Id $process.Id -Force
+            throw "Word fixture generation timed out"
+          }
+          if ($process.ExitCode -ne 0) { throw "Word fixture generation failed: $($process.ExitCode)" }
       - name: Run controlled fixtures
         shell: pwsh
         run: |
