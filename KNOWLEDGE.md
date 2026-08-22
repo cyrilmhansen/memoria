@@ -503,3 +503,23 @@ résultats d'expérience locale :
 - **Question future :** RFC 8474 `OBJECTID` pourrait fournir `MAILBOXID`,
   `EMAILID` et éventuellement `THREADID` pour compléter le modèle ; cette
   extension reste optionnelle et n’est pas requise pour IMAP de base.
+
+## 2026-08-22 — Premier import IMAP readonly
+
+- **Fait vérifié :** un CLI IMAPS dédié utilise `EXAMINE` et `BODY.PEEK[]`,
+  écrit les RAW via `ArchiveWriter`, conserve une table de provenance IMAP
+  (`imap_messages`) non reconstructible depuis le RAW seul, puis réutilise le
+  pipeline Tantivy existant. Le RAW MIME reste l'autorité ; parsing, catalogue
+  de recherche et index restent dérivables/reconstructibles.
+- **Fait vérifié :** GreenMail 2.1.12 a produit 12 nouveaux messages Linux et
+  Windows, puis 0 nouveau message lors d’un import identique ; les RAW et une
+  exportation EML sont byte-exacts.
+- **Décision :** l’identité de cette première passe est
+  source+mailbox+UIDVALIDITY+UID ; un changement de UIDVALIDITY est signalé,
+  sans rapprochement automatique. Cette identité est protégée par une
+  `PRIMARY KEY` SQLite, et Tokio reste isolé derrière `sync_imap`.
+- **Atomicité :** `append_raw` précède l'insertion du mapping IMAP ; une panne
+  peut laisser un RAW orphelin mais ne doit pas créer de référence catalogue
+  vers une frame inexistante. Une transaction durable RAW+SQLite reste une
+  question distincte.
+- Détails : `experiments/2026-08-22-mail-archive-imap-import.md`.

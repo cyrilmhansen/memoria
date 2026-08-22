@@ -600,3 +600,15 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
   avec greeting, login, EXAMINE et FETCH des 12 fixtures.
 - L’échec Windows initial est classé `GREENMAIL_TEST_CERTIFICATE`; STARTTLS
   reste hors de cette campagne.
+
+## 2026-08-22 — Premier import IMAP Memoria
+
+- Ajouté le module `imap` et le CLI `imap-import` : IMAPS validé par CA,
+  `EXAMINE`, `BODY.PEEK[]`, runtime Tokio isolé, insertion RAW/catalogue et
+  mise à jour Tantivy.
+- Ajouté `imap_messages` comme table de provenance IMAP avec identité
+  source/mailbox/UIDVALIDITY/UID ; ces métadonnées observées ne sont pas
+  reconstructibles depuis le RAW seul. Pas de modification du framing RAW.
+- Validé GreenMail Linux puis Windows natif : 12 nouveaux messages, second
+  import à 0 nouveau, recherches Unicode/attachment et export EML byte-exact.
+- Rapport : `experiments/2026-08-22-mail-archive-imap-import.md`.

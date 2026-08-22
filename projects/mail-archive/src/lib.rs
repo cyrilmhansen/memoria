@@ -21,6 +21,7 @@ mod attachment_text;
 pub mod gmail;
 pub mod html_preview;
 pub mod i18n;
+pub mod imap;
 
 pub use attachment_text::{
     discover_providers, providers_for_mime, selected_provider, AttachmentTextStats, BackendKind,
@@ -577,10 +578,11 @@ impl GmailSearchIndex {
         let reader = index
             .reader()
             .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+        create_metadata(&root.join("metadata.sqlite")).map_err(sqlite_io)?;
         let catalog = Connection::open(root.join("metadata.sqlite")).map_err(sqlite_io)?;
         let source_rows: i64 = catalog
             .query_row(
-                "SELECT COUNT(*) FROM gmail_messages WHERE source_state='present'",
+                "SELECT (SELECT COUNT(*) FROM gmail_messages WHERE source_state='present') + (SELECT COUNT(*) FROM imap_messages WHERE source_state='present')",
                 [],
                 |row| row.get(0),
             )
@@ -1805,6 +1807,7 @@ pub fn create_metadata(path: &Path) -> rusqlite::Result<Connection> {
     }
     let connection = Connection::open(path)?;
     connection.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL; CREATE TABLE IF NOT EXISTS messages (doc_id INTEGER PRIMARY KEY, message_id TEXT NOT NULL UNIQUE, timestamp INTEGER NOT NULL, sender TEXT NOT NULL, recipients TEXT NOT NULL, subject TEXT NOT NULL, account TEXT NOT NULL, folder TEXT NOT NULL, thread TEXT NOT NULL, segment TEXT NOT NULL, archive_offset INTEGER NOT NULL, frame_bytes INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS attachments (doc_id INTEGER NOT NULL, filename TEXT NOT NULL, mime TEXT NOT NULL, bytes INTEGER NOT NULL, content_hash TEXT NOT NULL, PRIMARY KEY(doc_id, filename)); CREATE INDEX IF NOT EXISTS messages_timestamp ON messages(timestamp); CREATE INDEX IF NOT EXISTS messages_sender ON messages(sender); CREATE INDEX IF NOT EXISTS messages_folder ON messages(folder); CREATE TABLE IF NOT EXISTS gmail_state (source_account TEXT PRIMARY KEY, history_id TEXT NOT NULL, complete INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS gmail_messages (source_account TEXT NOT NULL, gmail_message_id TEXT NOT NULL, doc_id INTEGER NOT NULL UNIQUE, thread_id TEXT NOT NULL, label_ids TEXT NOT NULL, internal_date_ms INTEGER, message_history_id TEXT, source_state TEXT NOT NULL, first_seen_unix INTEGER NOT NULL, last_seen_unix INTEGER NOT NULL, PRIMARY KEY(source_account, gmail_message_id)); CREATE INDEX IF NOT EXISTS gmail_messages_state ON gmail_messages(source_account, source_state);")?;
+    connection.execute_batch("CREATE TABLE IF NOT EXISTS imap_messages (source_account TEXT NOT NULL, mailbox TEXT NOT NULL, uid_validity INTEGER NOT NULL, uid INTEGER NOT NULL, doc_id INTEGER NOT NULL UNIQUE, flags TEXT NOT NULL, internal_date TEXT, internal_date_ms INTEGER, rfc822_size INTEGER, source_state TEXT NOT NULL, first_seen_unix INTEGER NOT NULL, last_seen_unix INTEGER NOT NULL, PRIMARY KEY(source_account, mailbox, uid_validity, uid)); CREATE INDEX IF NOT EXISTS imap_messages_state ON imap_messages(source_account, source_state);")?;
     Ok(connection)
 }
 
@@ -1884,6 +1887,65 @@ pub fn insert_gmail_metadata(
     connection.execute(
         "INSERT INTO gmail_messages(source_account,gmail_message_id,doc_id,thread_id,label_ids,internal_date_ms,message_history_id,source_state,first_seen_unix,last_seen_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,'present',?8,?8)",
         params![source_account, gmail_id, doc_id, thread_id, label_ids_json, internal_date_ms, message_history_id, now],
+    )?;
+    Ok(())
+}
+
+pub fn imap_message_exists(
+    connection: &Connection,
+    source_account: &str,
+    mailbox: &str,
+    uid_validity: u32,
+    uid: u32,
+) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM imap_messages WHERE source_account=?1 AND mailbox=?2 AND uid_validity=?3 AND uid=?4)",
+        params![source_account, mailbox, uid_validity as i64, uid as i64],
+        |row| row.get(0),
+    )
+}
+
+pub fn insert_imap_metadata(
+    connection: &Connection,
+    source_account: &str,
+    mailbox: &str,
+    uid_validity: u32,
+    uid: u32,
+    flags_json: &str,
+    internal_date: Option<&str>,
+    internal_date_ms: Option<i64>,
+    rfc822_size: Option<u32>,
+    doc_id: i64,
+    location: &ArchiveLocation,
+) -> rusqlite::Result<()> {
+    let message_id = format!("imap:{source_account}:{mailbox}:{uid_validity}:{uid}");
+    connection.execute(
+        "INSERT INTO messages(doc_id,message_id,timestamp,sender,recipients,subject,account,folder,thread,segment,archive_offset,frame_bytes) VALUES (?1,?2,?3,'','','',?4,?5,'',?6,?7,?8)",
+        params![
+            doc_id,
+            message_id,
+            internal_date_ms.unwrap_or(0),
+            source_account,
+            mailbox,
+            location.segment,
+            location.offset as i64,
+            location.frame_bytes as i64
+        ],
+    )?;
+    connection.execute(
+        "INSERT INTO imap_messages(source_account,mailbox,uid_validity,uid,doc_id,flags,internal_date,internal_date_ms,rfc822_size,source_state,first_seen_unix,last_seen_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'present',?10,?10)",
+        params![
+            source_account,
+            mailbox,
+            uid_validity as i64,
+            uid as i64,
+            doc_id,
+            flags_json,
+            internal_date,
+            internal_date_ms,
+            rfc822_size.map(i64::from),
+            chrono_like_now()
+        ],
     )?;
     Ok(())
 }
@@ -2298,14 +2360,22 @@ fn for_each_gmail_catalog_row<F>(root: &Path, mut visit: F) -> io::Result<()>
 where
     F: FnMut(GmailCatalogRow) -> io::Result<()>,
 {
-    let connection = Connection::open(root.join("metadata.sqlite")).map_err(sqlite_io)?;
+    let connection = create_metadata(&root.join("metadata.sqlite")).map_err(sqlite_io)?;
     let mut statement = connection
         .prepare(
-            "SELECT g.doc_id,g.source_account,g.label_ids,g.source_state,
-                    COALESCE(g.internal_date_ms,0),
-                    m.segment,m.archive_offset,m.frame_bytes
-             FROM gmail_messages g JOIN messages m ON m.doc_id=g.doc_id
-             ORDER BY g.doc_id",
+            "SELECT doc_id,source_account,labels,source_state,timestamp,segment,archive_offset,frame_bytes
+             FROM (
+               SELECT g.doc_id AS doc_id,g.source_account AS source_account,g.label_ids AS labels,g.source_state AS source_state,
+                      COALESCE(g.internal_date_ms,0) AS timestamp,
+                      m.segment AS segment,m.archive_offset AS archive_offset,m.frame_bytes AS frame_bytes
+               FROM gmail_messages g JOIN messages m ON m.doc_id=g.doc_id
+               UNION ALL
+               SELECT i.doc_id AS doc_id,i.source_account AS source_account,'[]' AS labels,i.source_state AS source_state,
+                      COALESCE(i.internal_date_ms,0) AS timestamp,
+                      m.segment AS segment,m.archive_offset AS archive_offset,m.frame_bytes AS frame_bytes
+               FROM imap_messages i JOIN messages m ON m.doc_id=i.doc_id
+             )
+             ORDER BY doc_id",
         )
         .map_err(sqlite_io)?;
     let rows = statement
