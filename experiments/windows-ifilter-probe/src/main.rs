@@ -25,9 +25,10 @@ mod windows_probe {
         IFILTER_INIT_INDEXING_ONLY, STAT_CHUNK,
     };
     use windows::Win32::System::Com::{
-        CLSIDFromString, CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile,
+        CLSIDFromString, CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistStream,
         CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, STGM_READ,
     };
+    use windows::Win32::UI::Shell::SHCreateStreamOnFileEx;
 
     const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
     const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
@@ -76,12 +77,15 @@ mod windows_probe {
             CoCreateInstance(&clsid, None, CLSCTX_INPROC_SERVER)
                 .map_err(|error| format!("cocreate: {error}"))?
         };
-        let persist: IPersistFile = filter
+        let persist: IPersistStream = filter
             .cast()
-            .map_err(|error| format!("ipersistfile: {error}"))?;
+            .map_err(|error| format!("ipersiststream: {error}"))?;
         let path_wide = wide(path.as_os_str());
-        unsafe { persist.Load(PCWSTR(path_wide.as_ptr()), STGM_READ) }
-            .map_err(|error| format!("persist-load: {error}"))?;
+        let stream = unsafe {
+            SHCreateStreamOnFileEx(PCWSTR(path_wide.as_ptr()), STGM_READ.0, 0, false, None)
+        }
+        .map_err(|error| format!("stream-open: {error}"))?;
+        unsafe { persist.Load(&stream) }.map_err(|error| format!("persist-load: {error}"))?;
         read_filter(filter)
     }
 

@@ -38,7 +38,7 @@ jobs:
             $match = $text.Contains($phrase)
             $status = if ($exitCode -eq 0) { "success" } elseif ($exitCode -eq 3) { "unsupported" } else { "failed" }
             "fixture=$name status=$status phrase_found=$match elapsed_ms=$($watch.ElapsedMilliseconds) stdout_bytes=$([Text.Encoding]::UTF8.GetByteCount($text))"
-            if ($diagnostic -match "status=(\w+)") { "fixture=$name diagnostic_status=$($Matches[1])" }
+            $diagnostic.Trim()
           }
       - name: Try observed PDF and DOCX handlers directly
         shell: pwsh
@@ -68,15 +68,17 @@ jobs:
         run: |
           $iid = '{89BCB740-6119-101A-BCB7-00DD010655AF}'
           foreach ($extension in @('.txt', '.html', '.pdf', '.docx')) {
-            $classes = Get-ItemProperty -Path "Registry::HKEY_CLASSES_ROOT\$extension" -ErrorAction SilentlyContinue
-            $persistent = $classes.PersistentHandler
+            $classKey = Get-Item -Path "Registry::HKEY_CLASSES_ROOT\$extension" -ErrorAction SilentlyContinue
+            $persistent = if ($classKey) { $classKey.GetValue('') } else { $null }
             $handler = $null
             if ($persistent) {
-              $handler = (Get-ItemProperty -Path "Registry::HKEY_CLASSES_ROOT\CLSID\$persistent\PersistentAddinsRegistered\$iid" -ErrorAction SilentlyContinue).'(default)'
+              $handlerKey = Get-Item -Path "Registry::HKEY_CLASSES_ROOT\CLSID\$persistent\PersistentAddinsRegistered\$iid" -ErrorAction SilentlyContinue
+              if ($handlerKey) { $handler = $handlerKey.GetValue('') }
             }
             $dll = $null
             if ($handler) {
-              $dll = (Get-ItemProperty -Path "Registry::HKEY_CLASSES_ROOT\CLSID\$handler\InprocServer32" -ErrorAction SilentlyContinue).'(default)'
+              $dllKey = Get-Item -Path "Registry::HKEY_CLASSES_ROOT\CLSID\$handler\InprocServer32" -ErrorAction SilentlyContinue
+              if ($dllKey) { $dll = $dllKey.GetValue('') }
             }
             "extension=$extension persistent_handler=$persistent filter_clsid=$handler dll=$dll"
           }
