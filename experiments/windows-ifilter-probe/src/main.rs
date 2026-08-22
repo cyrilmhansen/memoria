@@ -125,10 +125,25 @@ mod windows_probe {
                     None,
                 )
             })
-            .ok_or_else(|| "persistent-handler-missing".to_string())?;
-        let addin = format!("{persistent}\\PersistentAddinsRegistered\\{IID_IFILTER}");
-        let clsid = registry_value(&addin, None)
-            .ok_or_else(|| "ifilter-addin-missing".to_string())?;
+            .unwrap_or_default();
+        let addin_paths = [
+            format!("CLSID\\{persistent}\\PersistentAddinsRegistered\\{IID_IFILTER}"),
+            format!("{persistent}\\PersistentAddinsRegistered\\{IID_IFILTER}"),
+            format!("CLSID\\{progid}\\PersistentAddinsRegistered\\{IID_IFILTER}"),
+            format!(
+                "SystemFileAssociations\\{extension}\\PersistentAddinsRegistered\\{IID_IFILTER}"
+            ),
+        ];
+        let clsid = addin_paths
+            .iter()
+            .find_map(|path| registry_value(path, None))
+            .ok_or_else(|| {
+                if persistent.is_empty() {
+                    "persistent-handler-and-ifilter-addin-missing".to_string()
+                } else {
+                    "ifilter-addin-missing".to_string()
+                }
+            })?;
         let inproc = format!("CLSID\\{clsid}\\InprocServer32");
         Ok(RegisteredIFilter {
             extension,
