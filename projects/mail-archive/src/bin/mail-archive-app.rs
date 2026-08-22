@@ -5,11 +5,11 @@ use mail_archive_experiment::gmail::{self, GmailError, GmailTransport, SyncProgr
 use mail_archive_experiment::html_preview::HtmlPreviewServer;
 use mail_archive_experiment::i18n::{self, Language};
 use mail_archive_experiment::{
-    archive_summary, available_gmail_labels, discover_providers, index_gmail_archive,
-    list_attachments, parse_gmail_message, parse_search_date_ms, read_archived_raw,
-    read_attachment, read_html_document, selected_provider, AttachmentFilter, AttachmentInfo,
-    BackendKind, ExtractionProvider, GmailSearchIndex, ProviderAvailability, ProviderSelection,
-    SearchRequest,
+    archive_summary, available_gmail_labels, discover_providers, export_message_eml,
+    index_gmail_archive, list_attachments, parse_gmail_message, parse_search_date_ms,
+    read_archived_raw, read_attachment, read_html_document, selected_provider, AttachmentFilter,
+    AttachmentInfo, BackendKind, ExtractionProvider, GmailSearchIndex, ProviderAvailability,
+    ProviderSelection, SearchRequest,
 };
 mod thumbnail;
 use slint::{Model, ModelRc, SharedString, VecModel, Weak};
@@ -75,6 +75,7 @@ fn localized_ui(language: Language) -> UiText {
         new_archive: t.new_archive.into(),
         open_archive: t.open_archive.into(),
         recent_archives: t.recent_archives.into(),
+        export_eml: t.export_eml.into(),
         quit: t.quit.into(),
         archive: t.archive.into(),
         archive_state: t.archive_state.into(),
@@ -242,6 +243,35 @@ fn attachment_filename(info: &AttachmentInfo) -> String {
         value.insert(0, '_');
     }
     value
+}
+
+fn eml_filename(date: &str, subject: &str, doc_id: u64) -> String {
+    let mut value = format!("{date}-{subject}")
+        .replace(['/', '\\'], "_")
+        .replace("..", "_");
+    value.retain(|character| !character.is_control() && !"<>:\"|?*".contains(character));
+    value = value
+        .trim_matches([' ', '.', '-'])
+        .chars()
+        .take(96)
+        .collect();
+    if value.is_empty() {
+        value = format!("message-{doc_id}");
+    }
+    let reserved = value
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if matches!(reserved.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (reserved.len() == 4
+            && (reserved.starts_with("COM") || reserved.starts_with("LPT"))
+            && reserved.as_bytes()[3].is_ascii_digit()
+            && reserved.as_bytes()[3] != b'0')
+    {
+        value.insert(0, '_');
+    }
+    format!("{value}.eml")
 }
 
 fn attachment_rows(infos: &[AttachmentInfo]) -> Vec<AttachmentRow> {
@@ -1178,6 +1208,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let weak = ui.as_weak();
+    let archive_for_export_eml = current_archive.clone();
+    let selected_for_export_eml = selected_doc_id.clone();
+    let export_language = language;
+    ui.on_export_eml_requested(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let Some(archive) = archive_for_export_eml.borrow().clone() else {
+            ui.set_status(i18n::status(export_language, "archive-inaccessible").into());
+            return;
+        };
+        let doc_id = selected_for_export_eml.load(Ordering::Acquire);
+        if doc_id == 0 {
+            ui.set_status(i18n::status(export_language, "no-selected").into());
+            return;
+        }
+        let filename = eml_filename(
+            ui.get_message_date().as_str(),
+            ui.get_message_subject().as_str(),
+            doc_id,
+        );
+        let strings = i18n::UiStrings::for_language(export_language);
+        let Some(destination) = rfd::FileDialog::new()
+            .set_title(strings.export_eml)
+            .set_file_name(&filename)
+            .save_file()
+        else {
+            ui.set_status(i18n::status(export_language, "cancelled").into());
+            return;
+        };
+        let weak = ui.as_weak();
+        thread::spawn(move || {
+            let result = export_message_eml(&archive, doc_id, &destination)
+                .map_err(|error| error.to_string());
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_status(match result {
+                        Ok(()) => i18n::status(export_language, "eml-exported").into(),
+                        Err(error) => format!(
+                            "{}: {error}",
+                            i18n::status(export_language, "eml-export-failed")
+                        )
+                        .into(),
+                    });
+                }
+            });
+        });
+    });
+
+    let weak = ui.as_weak();
     let archive_for_open_attachment = current_archive.clone();
     let selected_for_open_attachment = selected_doc_id.clone();
     let temp_for_open_attachment = temp_attachments.clone();
@@ -1581,6 +1659,14 @@ mod tests {
                     || !matches!(stem.as_bytes().get(3), Some(b'1'..=b'9'))
             );
         }
+    }
+
+    #[test]
+    fn eml_export_names_are_safe_and_have_a_stable_fallback() {
+        let name = eml_filename("2026-08-22 10:20", "Sujet: résumé/essai", 42);
+        assert_eq!(name, "2026-08-22 1020-Sujet résumé_essai.eml");
+        assert_eq!(eml_filename("", "", 42), "message-42.eml");
+        assert!(!eml_filename("", "CON", 42).starts_with("CON."));
     }
 
     #[test]

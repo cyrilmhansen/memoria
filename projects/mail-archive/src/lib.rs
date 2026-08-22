@@ -2769,6 +2769,11 @@ pub fn read_archived_raw(root: &Path, doc_id: u64) -> io::Result<Vec<u8>> {
     read_record(&root.join("archive"), &location).map(|(_, raw)| raw)
 }
 
+pub fn export_message_eml(root: &Path, doc_id: u64, destination: &Path) -> io::Result<()> {
+    let raw = read_archived_raw(root, doc_id)?;
+    fs::write(destination, raw)
+}
+
 pub fn sqlite_search(connection: &Connection, query: &str) -> rusqlite::Result<Vec<SearchHit>> {
     let mut statement = connection.prepare(
         "SELECT doc_id, bm25(docs) FROM docs WHERE docs MATCH ?1 ORDER BY rank LIMIT 20",
@@ -3639,6 +3644,89 @@ mod tests {
                 .map(|item| item.doc_id),
             Some(1)
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn export_message_eml_is_byte_exact_for_realistic_mime() {
+        let root = std::env::temp_dir().join(format!(
+            "mail-export-eml-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("archive")).unwrap();
+        create_metadata(&root.join("metadata.sqlite")).unwrap();
+        let raw = b"From: sender@example.test\r\nTo: recipient@example.test\r\nSubject: Caf\xc3\xa9\r\nContent-Type: multipart/mixed; boundary=outer\r\nX-Raw: \xc3\xa9\r\n\r\n--outer\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nBonjour \xc3\xa9\r\n--outer\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=piece.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nAQIDBA==\r\n--outer--\r\n";
+        let message = Message {
+            id: 42,
+            message_id: "eml-fixture".into(),
+            timestamp: 0,
+            sender: "sender@example.test".into(),
+            recipients: vec!["recipient@example.test".into()],
+            subject: "Café".into(),
+            text_body: "Bonjour é".into(),
+            html_body: None,
+            account: "fixture".into(),
+            folder: "Inbox".into(),
+            thread: "thread".into(),
+            attachments: Vec::new(),
+            raw: raw.to_vec(),
+        };
+        let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        let location = writer.append(&message).unwrap();
+        writer.sync().unwrap();
+        let catalog = create_metadata(&root.join("metadata.sqlite")).unwrap();
+        insert_metadata(&catalog, &message, &location).unwrap();
+        drop(catalog);
+        drop(writer);
+        let destination = root.join("export.eml");
+        export_message_eml(&root, 42, &destination).unwrap();
+        let exported = fs::read(destination).unwrap();
+        assert_eq!(exported, raw);
+        assert!(mailparse::parse_mail(&exported).is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn export_message_eml_reports_destination_errors() {
+        let root = std::env::temp_dir().join(format!(
+            "mail-export-error-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("archive")).unwrap();
+        create_metadata(&root.join("metadata.sqlite")).unwrap();
+        let raw = b"From: sender@example.test\r\n\r\nbody";
+        let message = Message {
+            id: 7,
+            message_id: "eml-error-fixture".into(),
+            timestamp: 0,
+            sender: "sender@example.test".into(),
+            recipients: Vec::new(),
+            subject: String::new(),
+            text_body: "body".into(),
+            html_body: None,
+            account: "fixture".into(),
+            folder: "Inbox".into(),
+            thread: "thread".into(),
+            attachments: Vec::new(),
+            raw: raw.to_vec(),
+        };
+        let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        let location = writer.append(&message).unwrap();
+        writer.sync().unwrap();
+        let catalog = create_metadata(&root.join("metadata.sqlite")).unwrap();
+        insert_metadata(&catalog, &message, &location).unwrap();
+        drop(catalog);
+        drop(writer);
+        let error =
+            export_message_eml(&root, 7, &root.join("missing").join("export.eml")).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+        ));
         let _ = fs::remove_dir_all(root);
     }
 

@@ -20,7 +20,7 @@ struct AttachmentRow {
 struct UiText {
     window-title: string,
     main-accessible: string,
-    file: string, new-archive: string, open-archive: string, recent-archives: string, quit: string,
+    file: string, new-archive: string, open-archive: string, recent-archives: string, export-eml: string, quit: string,
     archive: string, archive-state: string, sync-now: string, syncing: string, add-gmail: string, back-search: string,
     search-menu: string, focus-search: string, clear-search: string, view: string, zoom-out: string, zoom-reset: string, zoom-in: string, help: string, about: string,
     archive-choice: string, setup-description: string, create-archive: string, archive-sync: string, local-archive: string, gmail-source: string, add-account: string, content-extraction: string,
@@ -102,6 +102,7 @@ export component MailWindow inherits Window {
     callback create-archive-requested();
     callback add-source-requested();
     callback quit-requested();
+    callback export-eml-requested();
     callback open-attachment(int);
     callback save-attachment(int);
     callback open-html();
@@ -137,6 +138,11 @@ export component MailWindow inherits Window {
             MenuItem { title: root.texts.new-archive; activated => { root.create-archive-requested(); } }
             MenuItem { title: root.texts.open-archive; activated => { root.open-archive-requested(); } }
             MenuItem { title: root.texts.recent-archives; activated => { root.open-archive-requested(); } }
+            MenuItem {
+                title: root.texts.export-eml;
+                enabled: root.selected-index >= 0;
+                activated => { root.export-eml-requested(); }
+            }
             MenuSeparator { }
             MenuItem { title: root.texts.quit; activated => { root.quit-requested(); } }
         }
