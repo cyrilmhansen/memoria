@@ -13,7 +13,7 @@ fn main() {
 mod windows_probe {
     use std::env;
     use std::ffi::OsStr;
-    use std::io::{self, Write};
+    use std::io::{self, Read, Write};
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
     use std::time::Instant;
@@ -28,14 +28,114 @@ mod windows_probe {
         CLSIDFromString, CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistStream,
         CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, STGM_READ,
     };
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CLASSES_ROOT, KEY_READ,
+        REG_VALUE_TYPE,
+    };
     use windows::Win32::UI::Shell::SHCreateStreamOnFileEx;
 
     const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
     const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
     const IID_IFILTER: &str = "{89BCB740-6119-101A-BCB7-00DD010655AF}";
 
+    #[derive(Debug)]
+    struct RegisteredIFilter {
+        extension: String,
+        clsid: String,
+        dll_path: Option<String>,
+        threading_model: Option<String>,
+    }
+
     fn wide(value: &OsStr) -> Vec<u16> {
         value.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    fn registry_value(key_path: &str, value_name: Option<&str>) -> Option<String> {
+        let key_path = wide(OsStr::new(key_path));
+        let value_name = value_name.map(|value| wide(OsStr::new(value)));
+        let value_name = value_name
+            .as_ref()
+            .map_or(PCWSTR::null(), |value| PCWSTR(value.as_ptr()));
+        let mut key = HKEY::default();
+        let status = unsafe {
+            RegOpenKeyExW(
+                HKEY_CLASSES_ROOT,
+                PCWSTR(key_path.as_ptr()),
+                None,
+                KEY_READ,
+                &mut key,
+            )
+        };
+        if status.0 != 0 {
+            return None;
+        }
+        let mut value_type = REG_VALUE_TYPE(0);
+        let mut byte_len = 0u32;
+        let query = unsafe {
+            RegQueryValueExW(
+                key,
+                value_name,
+                None,
+                Some(&mut value_type),
+                None,
+                Some(&mut byte_len),
+            )
+        };
+        if query.0 != 0 || byte_len == 0 {
+            unsafe { let _ = RegCloseKey(key); }
+            return None;
+        }
+        let mut bytes = vec![0u8; byte_len as usize];
+        let query = unsafe {
+            RegQueryValueExW(
+                key,
+                value_name,
+                None,
+                Some(&mut value_type),
+                Some(bytes.as_mut_ptr()),
+                Some(&mut byte_len),
+            )
+        };
+        unsafe { let _ = RegCloseKey(key); }
+        if query.0 != 0 {
+            return None;
+        }
+        let units = bytes[..byte_len as usize]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .take_while(|unit| *unit != 0)
+            .collect::<Vec<_>>();
+        Some(String::from_utf16_lossy(&units))
+    }
+
+    fn discover_registered_ifilter(extension: &str) -> Result<RegisteredIFilter, String> {
+        let extension = if extension.starts_with('.') {
+            extension.to_ascii_lowercase()
+        } else {
+            format!(".{extension}").to_ascii_lowercase()
+        };
+        let progid = registry_value(&extension, None)
+            .or_else(|| registry_value(&format!("SystemFileAssociations\\{extension}"), None))
+            .ok_or_else(|| "extension-registration-missing".to_string())?;
+        let persistent = registry_value(&format!("{progid}\\PersistentHandler"), None)
+            .or_else(|| registry_value(&format!("{extension}\\PersistentHandler"), None))
+            .or_else(|| {
+                registry_value(
+                    &format!("SystemFileAssociations\\{extension}\\PersistentHandler"),
+                    None,
+                )
+            })
+            .ok_or_else(|| "persistent-handler-missing".to_string())?;
+        let addin = format!("{persistent}\\PersistentAddinsRegistered\\{IID_IFILTER}");
+        let clsid = registry_value(&addin, None)
+            .ok_or_else(|| "ifilter-addin-missing".to_string())?;
+        let inproc = format!("CLSID\\{clsid}\\InprocServer32");
+        Ok(RegisteredIFilter {
+            extension,
+            clsid,
+            dll_path: registry_value(&inproc, None),
+            threading_model: registry_value(&inproc, Some("ThreadingModel")),
+        })
     }
 
     struct Extracted {
@@ -87,6 +187,16 @@ mod windows_probe {
         .map_err(|error| format!("stream-open: {error}"))?;
         unsafe { persist.Load(&stream) }.map_err(|error| format!("persist-load: {error}"))?;
         read_filter(filter)
+    }
+
+    fn extract_dynamic(path: &Path) -> Result<(RegisteredIFilter, Extracted), String> {
+        let extension = path
+            .extension()
+            .and_then(OsStr::to_str)
+            .ok_or_else(|| "extension-missing".to_string())?;
+        let registration = discover_registered_ifilter(extension)?;
+        let extracted = extract_direct(&registration.clsid, path)?;
+        Ok((registration, extracted))
     }
 
     fn read_filter(filter: IFilter) -> Result<Extracted, String> {
@@ -143,6 +253,93 @@ mod windows_probe {
         })
     }
 
+    fn controlled_child(mode: &str) -> i32 {
+        match mode {
+            "test-sleep" => {
+                std::thread::sleep(std::time::Duration::from_secs(20));
+                0
+            }
+            "test-output" => {
+                let block = vec![b'x'; 64 * 1024];
+                for _ in 0..(9 * 1024 * 1024 / block.len()) {
+                    let _ = io::stdout().write_all(&block);
+                }
+                let _ = io::stdout().flush();
+                0
+            }
+            "test-crash" => std::process::exit(97),
+            _ => 2,
+        }
+    }
+
+    fn supervise(mode: &str) -> i32 {
+        let executable = match env::current_exe() {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("supervisor-error={error}");
+                return 2;
+            }
+        };
+        let mut child = match std::process::Command::new(executable)
+            .arg(mode)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                eprintln!("supervisor-spawn-error={error}");
+                return 2;
+            }
+        };
+        let stdout = child.stdout.take().expect("piped stdout");
+        let reader = std::thread::spawn(move || {
+            let mut reader = io::BufReader::new(stdout);
+            let mut buffer = [0u8; 64 * 1024];
+            let mut total = 0usize;
+            loop {
+                let count = match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(count) => count,
+                    Err(_) => break,
+                };
+                total += count;
+                if total > MAX_OUTPUT_BYTES {
+                    break;
+                }
+            }
+            total
+        });
+        let started = Instant::now();
+        let result = loop {
+            if reader.is_finished() {
+                let bytes = reader.join().unwrap_or(usize::MAX);
+                if bytes > MAX_OUTPUT_BYTES {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break "output-too-large";
+                }
+                let status = child.wait();
+                break if status.map(|status| status.success()).unwrap_or(false) {
+                    "completed"
+                } else {
+                    "crashed"
+                };
+            }
+            if started.elapsed() > std::time::Duration::from_secs(10) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                break "timeout";
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        eprintln!(
+            "mode={mode} result={result} elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
+        if result == "completed" { 0 } else { 4 }
+    }
+
     struct ComGuard;
     impl ComGuard {
         fn new() -> Result<Self, String> {
@@ -163,9 +360,65 @@ mod windows_probe {
         let mut args = env::args_os();
         let _program = args.next();
         let Some(first) = args.next() else {
-            eprintln!("usage: windows-ifilter-probe <path> | direct <clsid> <path>");
+            eprintln!("usage: <path> | direct <clsid> <path> | dynamic <path> | discover <extension>");
             return 2;
         };
+        if first == "discover" {
+            let Some(extension) = args.next() else { return 2 };
+            match discover_registered_ifilter(&extension.to_string_lossy()) {
+                Ok(registration) => {
+                    eprintln!(
+                        "extension={} clsid={} dll={} threading_model={}",
+                        registration.extension,
+                        registration.clsid,
+                        registration.dll_path.as_deref().unwrap_or(""),
+                        registration.threading_model.as_deref().unwrap_or("")
+                    );
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("status=unsupported reason={error} iid_ifilter={IID_IFILTER}");
+                    return 3;
+                }
+            }
+        }
+        if first == "dynamic" {
+            let Some(path) = args.next() else { return 2 };
+            let path = Path::new(&path);
+            let started = Instant::now();
+            match extract_dynamic(path) {
+                Ok((registration, extracted)) => {
+                    let _ = io::stdout().write_all(extracted.text.as_bytes());
+                    let _ = io::stdout().flush();
+                    eprintln!(
+                        "status=success extension={} clsid={} dll={} threading_model={} bytes={} chunks={} text_chunks={} elapsed_ms={}",
+                        registration.extension,
+                        registration.clsid,
+                        registration.dll_path.as_deref().unwrap_or(""),
+                        registration.threading_model.as_deref().unwrap_or(""),
+                        extracted.text.len(),
+                        extracted.chunks,
+                        extracted.text_chunks,
+                        started.elapsed().as_millis()
+                    );
+                    return 0;
+                }
+                Err(reason) => {
+                    eprintln!("status=failed reason={reason}");
+                    return 4;
+                }
+            }
+        }
+        if first == "supervise" {
+            let Some(mode) = args.next() else { return 2 };
+            if !matches!(mode.to_string_lossy().as_ref(), "test-sleep" | "test-output" | "test-crash") {
+                return 2;
+            }
+            return supervise(&mode.to_string_lossy());
+        }
+        if matches!(first.to_string_lossy().as_ref(), "test-sleep" | "test-output" | "test-crash") {
+            return controlled_child(&first.to_string_lossy());
+        }
         let (direct_clsid, path) = if first == "direct" {
             let Some(clsid) = args.next() else {
                 eprintln!("usage: windows-ifilter-probe direct <clsid> <path>");

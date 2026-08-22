@@ -44,4 +44,31 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 [IO.Compression.ZipFile]::CreateFromDirectory($scratch, $docx)
 Remove-Item -LiteralPath $scratch -Recurse -Force
 
+# A real Word-generated package is kept separate from the minimal OPC fixture.
+# This is only created on the controlled Windows probe host; it is never
+# committed or derived from a personal document.
+$wordFixture = Join-Path $root 'sample-word.docx'
+$word = $null
+$document = $null
+Remove-Item -LiteralPath $wordFixture -Force -ErrorAction SilentlyContinue
+try {
+    $word = New-Object -ComObject Word.Application
+    $word.Visible = $false
+    $document = $word.Documents.Add()
+    $range = $document.Range(0, 0)
+    $range.Text = 'memoria-ifilter-probe-947'
+    $document.SaveAs2($wordFixture, 16)
+    $document.Close(0)
+    $word.Quit(0)
+    [Runtime.InteropServices.Marshal]::ReleaseComObject($range) | Out-Null
+    [Runtime.InteropServices.Marshal]::ReleaseComObject($document) | Out-Null
+    [Runtime.InteropServices.Marshal]::ReleaseComObject($word) | Out-Null
+    Write-Host 'word_fixture=generated'
+}
+catch {
+    if ($document) { try { $document.Close(0) } catch {} }
+    if ($word) { try { $word.Quit(0) } catch {} }
+    Write-Host 'word_fixture=unavailable'
+}
+
 Write-Host "Generated controlled fixtures under $root"

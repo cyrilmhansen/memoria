@@ -28,8 +28,9 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $false
           $probe = "experiments/windows-ifilter-probe/target/release/windows-ifilter-probe.exe"
           $phrase = "memoria-ifilter-probe-947"
-          foreach ($name in @("sample.txt", "sample.html", "sample.pdf", "sample.docx")) {
+          foreach ($name in @("sample.txt", "sample.html", "sample.pdf", "sample.docx", "sample-word.docx")) {
             $path = "experiments/windows-ifilter-probe/fixtures/$name"
+            if (-not (Test-Path -LiteralPath $path)) { "fixture=$name status=unavailable"; continue }
             $output = Join-Path $env:RUNNER_TEMP "$name.stdout"
             $errorOutput = Join-Path $env:RUNNER_TEMP "$name.stderr"
             $watch = [Diagnostics.Stopwatch]::StartNew()
@@ -66,25 +67,38 @@ jobs:
             "direct=$($item.name) exit=$exitCode phrase_found=$match elapsed_ms=$($watch.ElapsedMilliseconds) stdout_bytes=$([Text.Encoding]::UTF8.GetByteCount($text))"
             $diagnostic.Trim()
           }
+      - name: Resolve registered handlers and extract dynamically
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $probe = "experiments/windows-ifilter-probe/target/release/windows-ifilter-probe.exe"
+          $phrase = "memoria-ifilter-probe-947"
+          foreach ($extension in @(".txt", ".html", ".pdf", ".docx")) {
+            & $probe discover $extension
+          }
+          foreach ($name in @("sample.pdf", "sample-word.docx")) {
+            $path = "experiments/windows-ifilter-probe/fixtures/$name"
+            if (-not (Test-Path -LiteralPath $path)) { "dynamic=$name status=unavailable"; continue }
+            $output = Join-Path $env:RUNNER_TEMP "$name.dynamic.stdout"
+            $errorOutput = Join-Path $env:RUNNER_TEMP "$name.dynamic.stderr"
+            $process = Start-Process -FilePath $probe -ArgumentList @("dynamic", $path) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $output -RedirectStandardError $errorOutput
+            $text = [IO.File]::ReadAllText($output)
+            $diagnostic = [IO.File]::ReadAllText($errorOutput)
+            "dynamic=$name exit=$($process.ExitCode) phrase_found=$($text.Contains($phrase)) stdout_bytes=$([Text.Encoding]::UTF8.GetByteCount($text))"
+            $diagnostic.Trim()
+          }
+      - name: Exercise helper supervision bounds
+        shell: pwsh
+        run: |
+          $probe = "experiments/windows-ifilter-probe/target/release/windows-ifilter-probe.exe"
+          foreach ($mode in @("test-sleep", "test-output", "test-crash")) {
+            & $probe supervise $mode
+          }
       - name: Report registered filter handlers
         shell: pwsh
         run: |
-          $iid = '{89BCB740-6119-101A-BCB7-00DD010655AF}'
-          foreach ($extension in @('.txt', '.html', '.pdf', '.docx')) {
-            $classKey = Get-Item -Path "Registry::HKEY_CLASSES_ROOT\$extension" -ErrorAction SilentlyContinue
-            $persistent = if ($classKey) { $classKey.GetValue('') } else { $null }
-            $handler = $null
-            if ($persistent) {
-              $handlerKey = Get-Item -Path "Registry::HKEY_CLASSES_ROOT\CLSID\$persistent\PersistentAddinsRegistered\$iid" -ErrorAction SilentlyContinue
-              if ($handlerKey) { $handler = $handlerKey.GetValue('') }
-            }
-            $dll = $null
-            if ($handler) {
-              $dllKey = Get-Item -Path "Registry::HKEY_CLASSES_ROOT\CLSID\$handler\InprocServer32" -ErrorAction SilentlyContinue
-              if ($dllKey) { $dll = $dllKey.GetValue('') }
-            }
-            "extension=$extension persistent_handler=$persistent filter_clsid=$handler dll=$dll"
-          }
+          $probe = "experiments/windows-ifilter-probe/target/release/windows-ifilter-probe.exe"
+          foreach ($extension in @('.txt', '.html', '.pdf', '.docx')) { & $probe discover $extension }
       - name: Reproduce reported Windows tests
         shell: pwsh
         run: |
