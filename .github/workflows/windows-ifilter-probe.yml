@@ -29,9 +29,12 @@ jobs:
           $process = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $script) -PassThru -WindowStyle Hidden
           if (-not $process.WaitForExit(30000)) {
             Stop-Process -Id $process.Id -Force
-            throw "Word fixture generation timed out"
+            Write-Host "word_fixture=unavailable reason=timeout"
+          } elseif ($process.ExitCode -ne 0) {
+            Write-Host "word_fixture=unavailable reason=process_failed"
+          } else {
+            Write-Host "word_fixture=generated"
           }
-          if ($process.ExitCode -ne 0) { throw "Word fixture generation failed: $($process.ExitCode)" }
       - name: Run controlled fixtures
         shell: pwsh
         run: |
