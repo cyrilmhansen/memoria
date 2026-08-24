@@ -636,5 +636,19 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
   construite avec le delimiter découvert `.`, `Projects.Alpha`/`.Beta`,
   relance à zéro et ajout limité à `Projects.Alpha`.
 - LIST a retourné le nom protocolaire modified UTF-7 `Caf&AOk-`, delimiter `.`,
-  sans SPECIAL-USE ni capacité IMAP4rev2/UTF8-ACCEPT. Le replay Windows reste
-  à effectuer, N16PRO n’ayant pas accepté la connexion SSH pendant cette passe.
+  sans SPECIAL-USE ni capacité IMAP4rev2/UTF8-ACCEPT. Le replay Windows a
+  ensuite été validé sur N16PRO.
+
+## 2026-08-24 — Replay Windows IMAP incrémental et multi-mailbox
+
+- Rejoué sur N16PRO au commit `0f348371515d1e57b241894e2a767019541750e0` avec
+  GreenMail Linux, CA de test dédiée et validation rustls normale.
+- Validé l'incrémental `12 → 0 → 3 → 0`, puis `--limit 5` avec frontières
+  `0→5→10→15` et répétition sans fetch.
+- Validé `LIST`/`EXAMINE` multi-mailbox avec delimiter `.`, hiérarchie
+  `Projects.Alpha`/`Projects.Beta`, `Caf&AOk-` et `Projects/with-slash`;
+  seul `Projects.Alpha` a fetché le message ajouté au troisième passage.
+- Vérifié l'absence de `\\Seen`, 20 occurrences, 12 RAW distincts et 8
+  duplications byte-identiques sans fusion de provenance; export EML byte-exact
+  vérifié sur une frame de l'archive Windows.
+- `cargo check --workspace` et `cargo test --workspace` natifs Windows passent.

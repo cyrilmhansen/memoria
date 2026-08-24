@@ -543,5 +543,16 @@ résultats d'expérience locale :
   l’identité logique reste mailbox + UIDVALIDITY + UID.
 - Le CLI accepte plusieurs `--mailbox` et `--all-mailboxes`; GreenMail 2.1.12
   a validé l’import indépendant, la relance sans refetch et l’ajout limité à
-  une mailbox. SPECIAL-USE n’était pas annoncé par ce serveur; le replay
-  Windows reste à effectuer.
+  une mailbox. Le même scénario a été rejoué nativement sous Windows avec
+  delimiter `.`, `Caf&AOk-` réutilisable tel quel, `/` ordinaire et sans
+  `\\Seen`; SPECIAL-USE n’était pas annoncé par ce serveur.
+- **Fait vérifié :** le replay Windows multi-mailbox a importé 20 occurrences,
+  puis 0 refetch au second passage; après un ajout dans `Projects.Alpha`, seul
+  ce mailbox a fetché un RAW. L’archive contenait 12 RAW distincts et 8
+  occurrences byte-identiques supplémentaires, sans fusion heuristique.
+- **Fait vérifié :** le replay Windows incrémental a validé
+  `0→12→15`, puis `0` fetch inchangé, ainsi que les tranches `--limit 5`
+  `0→5→10→15` et une répétition à zéro. `UIDVALIDITY` est restée stable et
+  les FLAGS sont restées sans `\\Seen`.
+- La validation native `cargo check --workspace` et `cargo test --workspace`
+  a passé sur le clone au commit `0f348371515d1e57b241894e2a767019541750e0`.

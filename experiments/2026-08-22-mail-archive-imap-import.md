@@ -62,7 +62,9 @@ dans deux mailboxes ne sont ni fusionnées ni dédupliquées.
 
 Le mot de passe et la CA sont fournis hors archive et hors dépôt. Aucun secret
 n’est écrit dans les logs. Le port TLS implicite est utilisé ; STARTTLS,
-OAuth IMAP et la découverte de mailboxes restent hors périmètre.
+OAuth IMAP et la synchronisation Gmail via IMAP restent hors périmètre de
+ce CLI de développement; la découverte de mailboxes est désormais supportée
+et validée séparément avec GreenMail.
 
 ## Runtime et sécurité
 
@@ -169,8 +171,26 @@ GreenMail n’a pas annoncé SPECIAL-USE; l’interopérabilité de cette extens
 reste donc non mesurée au niveau serveur. Les tests unitaires conservent la
 distinction des attributs SPECIAL-USE.
 
-Le replay Windows de cette nouvelle logique reste pendante : N16PRO répondait
-encore sans établir la connexion SSH au moment de la campagne.
+Le replay Windows de cette logique a ensuite été exécuté sur N16PRO avec le
+même GreenMail TLS et la même CA de test. Le premier import multi-mailbox a
+retourné 20 occurrences : INBOX=15, Projects.Alpha=1,
+Projects.Beta=1, Caf&AOk-=1 et Projects/with-slash=1; Projects et Empty
+étaient vides. Le second import a retourné `raw_fetched=0` pour chaque
+mailbox. Après l'ajout d'un message dans Projects.Alpha, seul ce mailbox a
+retourné `raw_fetched=1` et `new_messages=1`.
+
+Le même replay Windows a observé `CAPABILITY`, `LIST "" "*"`, le delimiter
+`.`, `LIST "" "Projects.%"`, puis `EXAMINE` des deux enfants. Le nom
+modified UTF-7 `Caf&AOk-` a été réutilisé tel quel et `/` est resté un
+caractère ordinaire dans `Projects/with-slash`. Les FLAGS contrôlées sont
+restées vides (`\\Seen` absent). GreenMail n'annonce toujours pas
+SPECIAL-USE.
+
+Dans l'archive produite par Windows, 20 occurrences contiennent 12 RAW
+distincts et 8 occurrences supplémentaires byte-identiques. Les occurrences
+partagées restent donc des provenances séparées. Les frames contrôlées ont
+été comparées aux fixtures par SHA-256; l'export EML de la frame Windows
+correspondante a également produit le SHA-256 du RAW, sans reconstruction MIME.
 
 La clé est aussi une contrainte `PRIMARY KEY` SQLite sur
 `imap_messages(source_account, mailbox, uid_validity, uid)` ; le contrôle
@@ -224,10 +244,23 @@ serveur a été redémarré avec une nouvelle UIDVALIDITY : l'import a refusé l
 campagne avec `UidValidityChanged` avant toute utilisation de l'ancienne
 frontière.
 
-Le chemin Windows natif n'a pas pu être rejoué dans cette passe : l'hôte
-N16PRO était momentanément injoignable en SSH (`No route to host`). Le check
-Windows précédent du chemin IMAP complet reste valide, mais la nouvelle
-sélection incrémentale devra être rejouée sur ce runner.
+Le replay Windows de la sélection incrémentale a été exécuté sur N16PRO avec
+la même CA TLS. Résultats :
+
+```text
+initial       examined=12 raw_fetched=12 new=12 frontier 0  -> 12
+unchanged     examined=0  raw_fetched=0  new=0  frontier 12 -> 12
+after +3      examined=3  raw_fetched=3  new=3  frontier 12 -> 15
+repeat        examined=0  raw_fetched=0  new=0  frontier 15 -> 15
+
+--limit 5     raw_fetched=5 new=5 frontier 0  -> 5
+--limit 5     raw_fetched=5 new=5 frontier 5  -> 10
+--limit 5     raw_fetched=5 new=5 frontier 10 -> 15
+repeat        raw_fetched=0 new=0 frontier 15 -> 15
+```
+
+`UIDVALIDITY` est restée stable et `UIDNEXT` a progressé de 13 à 16 après
+l'ajout des trois messages. Les FLAGS contrôlées sont restées sans `\\Seen`.
 
 ## Validation GreenMail Linux
 
@@ -281,6 +314,12 @@ examined=12 new_messages=0 network_bytes=0 archive_bytes_added=0 indexed=0
 Les 12 frames Windows ont été relues hors ligne : 4 214 octets et 12 SHA-256
 identiques aux fixtures. Les recherches Unicode et attachment ont retrouvé
 les mêmes documents. Les flags récupérés restent `seen=false`.
+
+Le clone Windows de cette validation était exactement au commit
+`0f348371515d1e57b241894e2a767019541750e0`. La validation native a également
+passé `cargo check --workspace` et `cargo test --workspace` sans échec :
+45 tests de bibliothèque, 7 tests de l'application, 1 test thumbnail et
+2 tests workspace ont réussi.
 
 ## Coût et limites
 
