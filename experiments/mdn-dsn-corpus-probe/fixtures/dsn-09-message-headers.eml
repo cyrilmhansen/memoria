@@ -1,0 +1,34 @@
+From: notifier@example.invalid
+To: sender@example.invalid
+Subject: Synthetic dsn-09-message-headers
+Message-ID: <dsn-09-message-headers@example.invalid>
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=delivery-status; boundary="report-dsn-09-message-headers"
+
+--report-dsn-09-message-headers
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Synthetic report dsn-09-message-headers.
+--report-dsn-09-message-headers
+Content-Type: message/delivery-status
+Content-Transfer-Encoding: 7bit
+
+Arrival-Date: Thu, 21 Aug 2026 10:00:00 +0000
+Reporting-MTA: dns; mta.example.invalid
+
+Final-Recipient: rfc822; headers@example.invalid
+Action: failed
+Status: 5.0.0
+Diagnostic-Code: smtp; 550 headers
+Remote-MTA: dns; remote.example.invalid
+
+--report-dsn-09-message-headers
+Content-Type: text/rfc822-headers
+Content-Transfer-Encoding: 7bit
+
+From: sender@example.invalid
+Message-ID: <dsn-09-message-headers-original@example.invalid>
+Subject: headers dsn-09-message-headers
+
+--report-dsn-09-message-headers--

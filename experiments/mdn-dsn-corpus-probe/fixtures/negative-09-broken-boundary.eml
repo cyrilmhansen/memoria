@@ -1,0 +1,8 @@
+From: notifier@example.invalid
+Content-Type: multipart/report; report-type=disposition-notification; boundary=broken
+
+--other
+Content-Type: text/plain
+
+wrong boundary
+--other--

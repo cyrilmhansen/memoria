@@ -1,0 +1,8 @@
+From: friend@example.invalid
+To: reader@example.invalid
+Subject: Status update
+Message-ID: <negative-02-undelivered-body@example.invalid>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Undelivered mail is mentioned as ordinary prose.

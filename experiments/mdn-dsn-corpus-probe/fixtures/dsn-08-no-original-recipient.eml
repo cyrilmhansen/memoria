@@ -1,0 +1,24 @@
+From: notifier@example.invalid
+To: sender@example.invalid
+Subject: Synthetic dsn-08-no-original-recipient
+Message-ID: <dsn-08-no-original-recipient@example.invalid>
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=delivery-status; boundary="report-dsn-08-no-original-recipient"
+
+--report-dsn-08-no-original-recipient
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Synthetic report dsn-08-no-original-recipient.
+--report-dsn-08-no-original-recipient
+Content-Type: message/delivery-status
+Content-Transfer-Encoding: 7bit
+
+Arrival-Date: Thu, 21 Aug 2026 10:00:00 +0000
+Reporting-MTA: dns; mta.example.invalid
+
+Final-Recipient: rfc822; final@example.invalid
+Action: delivered
+Status: 2.0.0
+
+--report-dsn-08-no-original-recipient--

@@ -1,0 +1,9 @@
+{
+  "case": "negative-06-incoherent-status",
+  "kind": "dsn",
+  "validity": "malformed",
+  "original_message_id": null,
+  "recipients": [],
+  "action": null,
+  "message_fields": {}
+}

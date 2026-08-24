@@ -1,0 +1,22 @@
+From: notifier@example.invalid
+To: sender@example.invalid
+Subject: Synthetic negative-05-wrong-report-type
+Message-ID: <negative-05-wrong-report-type@example.invalid>
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=unknown-report; boundary="report-negative-05-wrong-report-type"
+
+--report-negative-05-wrong-report-type
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Synthetic report negative-05-wrong-report-type.
+--report-negative-05-wrong-report-type
+Content-Type: message/disposition-notification
+Content-Transfer-Encoding: 7bit
+
+Reporting-UA: Atlas MUA; corpus-probe
+Original-Recipient: rfc822; recipient@example.invalid
+Final-Recipient: rfc822; recipient@example.invalid
+Disposition: automatic-action/MDN-sent-automatically; displayed
+
+--report-negative-05-wrong-report-type--

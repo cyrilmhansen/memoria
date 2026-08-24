@@ -1,0 +1,21 @@
+{
+  "case": "dsn-12-case-and-folding",
+  "kind": "dsn",
+  "validity": "valid",
+  "original_message_id": null,
+  "recipients": [
+    {
+      "original_recipient": "orig-case@example.invalid",
+      "final_recipient": "case@example.invalid",
+      "action": "FAILED",
+      "status": "5.1.1",
+      "diagnostic_code": "550 case",
+      "extra_fields": {}
+    }
+  ],
+  "action": null,
+  "message_fields": {
+    "arrival-date": "Thu, 21 Aug 2026 10:00:00 +0000",
+    "reporting-mta": "dns; mta.example.invalid"
+  }
+}

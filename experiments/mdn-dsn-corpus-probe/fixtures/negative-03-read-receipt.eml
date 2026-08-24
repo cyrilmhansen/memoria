@@ -1,0 +1,8 @@
+From: friend@example.invalid
+To: reader@example.invalid
+Subject: Read receipt
+Message-ID: <negative-03-read-receipt@example.invalid>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+Your message has been displayed in a quoted discussion.

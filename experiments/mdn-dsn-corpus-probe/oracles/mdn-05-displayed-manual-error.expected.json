@@ -1,0 +1,18 @@
+{
+  "case": "mdn-05-displayed-manual-error",
+  "kind": "mdn",
+  "validity": "valid",
+  "original_message_id": "<mdn-05-displayed-manual-error-original@example.invalid>",
+  "recipients": [
+    {
+      "original_recipient": "recipient@example.invalid",
+      "final_recipient": "recipient@example.invalid",
+      "action": "manual-action/MDN-sent-manually; displayed/error",
+      "status": null,
+      "diagnostic_code": null,
+      "extra_fields": {}
+    }
+  ],
+  "action": "manual-action/MDN-sent-manually; displayed/error",
+  "message_fields": {}
+}

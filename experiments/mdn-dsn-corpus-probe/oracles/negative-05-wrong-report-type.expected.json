@@ -1,0 +1,9 @@
+{
+  "case": "negative-05-wrong-report-type",
+  "kind": "mdn",
+  "validity": "unsupported",
+  "original_message_id": null,
+  "recipients": [],
+  "action": null,
+  "message_fields": {}
+}

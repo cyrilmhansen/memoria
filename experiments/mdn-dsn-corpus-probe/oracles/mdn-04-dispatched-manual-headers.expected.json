@@ -1,0 +1,18 @@
+{
+  "case": "mdn-04-dispatched-manual-headers",
+  "kind": "mdn",
+  "validity": "valid",
+  "original_message_id": "<mdn-04-dispatched-manual-headers-original@example.invalid>",
+  "recipients": [
+    {
+      "original_recipient": "recipient@example.invalid",
+      "final_recipient": "recipient@example.invalid",
+      "action": "manual-action/MDN-sent-manually; dispatched",
+      "status": null,
+      "diagnostic_code": null,
+      "extra_fields": {}
+    }
+  ],
+  "action": "manual-action/MDN-sent-manually; dispatched",
+  "message_fields": {}
+}

@@ -1,0 +1,18 @@
+{
+  "case": "mdn-13-original-id-without-third",
+  "kind": "mdn",
+  "validity": "valid",
+  "original_message_id": "<mdn-13-original@example.invalid>",
+  "recipients": [
+    {
+      "original_recipient": "recipient@example.invalid",
+      "final_recipient": "recipient@example.invalid",
+      "action": "automatic-action/MDN-sent-automatically; displayed",
+      "status": null,
+      "diagnostic_code": null,
+      "extra_fields": {}
+    }
+  ],
+  "action": "automatic-action/MDN-sent-automatically; displayed",
+  "message_fields": {}
+}

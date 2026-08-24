@@ -1,0 +1,37 @@
+{
+  "case": "dsn-05-three-results",
+  "kind": "dsn",
+  "validity": "valid",
+  "original_message_id": null,
+  "recipients": [
+    {
+      "original_recipient": null,
+      "final_recipient": "one@example.invalid",
+      "action": "failed",
+      "status": "5.2.0",
+      "diagnostic_code": "550 mailbox",
+      "extra_fields": {}
+    },
+    {
+      "original_recipient": "orig-two@example.invalid",
+      "final_recipient": "two@example.invalid",
+      "action": "delayed",
+      "status": "4.4.1",
+      "diagnostic_code": "451 retry",
+      "extra_fields": {}
+    },
+    {
+      "original_recipient": null,
+      "final_recipient": "three@example.invalid",
+      "action": "delivered",
+      "status": "2.0.0",
+      "diagnostic_code": null,
+      "extra_fields": {}
+    }
+  ],
+  "action": null,
+  "message_fields": {
+    "arrival-date": "Thu, 21 Aug 2026 10:00:00 +0000",
+    "reporting-mta": "dns; mta.example.invalid"
+  }
+}

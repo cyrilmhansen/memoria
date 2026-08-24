@@ -1,0 +1,18 @@
+{
+  "case": "mdn-06-deleted-auto-full",
+  "kind": "mdn",
+  "validity": "valid",
+  "original_message_id": "<mdn-06-deleted-auto-full-original@example.invalid>",
+  "recipients": [
+    {
+      "original_recipient": "recipient@example.invalid",
+      "final_recipient": "recipient@example.invalid",
+      "action": "automatic-action/MDN-sent-automatically; deleted",
+      "status": null,
+      "diagnostic_code": null,
+      "extra_fields": {}
+    }
+  ],
+  "action": "automatic-action/MDN-sent-automatically; deleted",
+  "message_fields": {}
+}

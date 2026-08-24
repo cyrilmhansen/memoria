@@ -1,0 +1,21 @@
+From: notifier@example.invalid
+To: sender@example.invalid
+Subject: Synthetic negative-10-missing-required
+Message-ID: <negative-10-missing-required@example.invalid>
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=delivery-status; boundary="report-negative-10-missing-required"
+
+--report-negative-10-missing-required
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Synthetic report negative-10-missing-required.
+--report-negative-10-missing-required
+Content-Type: message/delivery-status
+Content-Transfer-Encoding: 7bit
+
+Reporting-MTA: dns; mta.example.invalid
+
+Final-Recipient: rfc822; missing-action@example.invalid
+
+--report-negative-10-missing-required--

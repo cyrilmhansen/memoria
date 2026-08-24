@@ -1,0 +1,37 @@
+From: notifier@example.invalid
+To: sender@example.invalid
+Subject: Synthetic dsn-05-three-results
+Message-ID: <dsn-05-three-results@example.invalid>
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=delivery-status; boundary="report-dsn-05-three-results"
+
+--report-dsn-05-three-results
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Synthetic report dsn-05-three-results.
+--report-dsn-05-three-results
+Content-Type: message/delivery-status
+Content-Transfer-Encoding: 7bit
+
+Arrival-Date: Thu, 21 Aug 2026 10:00:00 +0000
+Reporting-MTA: dns; mta.example.invalid
+
+Final-Recipient: rfc822; one@example.invalid
+Action: failed
+Status: 5.2.0
+Diagnostic-Code: smtp; 550 mailbox
+Remote-MTA: dns; remote.example.invalid
+
+Original-Recipient: rfc822; orig-two@example.invalid
+Final-Recipient: rfc822; two@example.invalid
+Action: delayed
+Status: 4.4.1
+Diagnostic-Code: smtp; 451 retry
+Remote-MTA: dns; remote.example.invalid
+
+Final-Recipient: rfc822; three@example.invalid
+Action: delivered
+Status: 2.0.0
+
+--report-dsn-05-three-results--

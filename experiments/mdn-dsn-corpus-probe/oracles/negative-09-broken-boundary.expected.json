@@ -1,0 +1,9 @@
+{
+  "case": "negative-09-broken-boundary",
+  "kind": "mdn",
+  "validity": "malformed",
+  "original_message_id": null,
+  "recipients": [],
+  "action": null,
+  "message_fields": {}
+}

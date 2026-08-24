@@ -1,0 +1,18 @@
+{
+  "case": "mdn-09-no-third-part",
+  "kind": "mdn",
+  "validity": "valid",
+  "original_message_id": null,
+  "recipients": [
+    {
+      "original_recipient": "recipient@example.invalid",
+      "final_recipient": "recipient@example.invalid",
+      "action": "manual-action/MDN-sent-manually; deleted",
+      "status": null,
+      "diagnostic_code": null,
+      "extra_fields": {}
+    }
+  ],
+  "action": "manual-action/MDN-sent-manually; deleted",
+  "message_fields": {}
+}

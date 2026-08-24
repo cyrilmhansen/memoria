@@ -1,0 +1,42 @@
+From: notifier@example.invalid
+To: sender@example.invalid
+Subject: Synthetic dsn-13-relayed-expanded-fields
+Message-ID: <dsn-13-relayed-expanded-fields@example.invalid>
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=delivery-status; boundary="report-dsn-13-relayed-expanded-fields"
+
+--report-dsn-13-relayed-expanded-fields
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Synthetic report dsn-13-relayed-expanded-fields.
+--report-dsn-13-relayed-expanded-fields
+Content-Type: message/delivery-status
+Content-Transfer-Encoding: 7bit
+
+Arrival-Date: Thu, 21 Aug 2026 10:00:00 +0000
+DSN-Gateway: dns; gateway.example.invalid
+Original-Envelope-Id: env-947@example.invalid
+Received-From-MTA: dns; relay.example.invalid
+Reporting-MTA: dns; mta.example.invalid
+
+Final-Recipient: rfc822; relayed@example.invalid
+Action: relayed
+Status: 2.0.0
+Last-Attempt-Date: Thu, 21 Aug 2026 10:05:00 +0000
+Remote-MTA: dns; remote.example.invalid
+
+Final-Recipient: rfc822; expanded@example.invalid
+Action: expanded
+Status: 2.0.0
+Final-Log-ID: log-947@example.invalid
+Remote-MTA: dns; remote.example.invalid
+
+Final-Recipient: rfc822; retry@example.invalid
+Action: delayed
+Status: 4.2.0
+Last-Attempt-Date: Thu, 21 Aug 2026 10:05:00 +0000
+Will-Retry-Until: Thu, 21 Aug 2026 11:00:00 +0000
+Remote-MTA: dns; remote.example.invalid
+
+--report-dsn-13-relayed-expanded-fields--

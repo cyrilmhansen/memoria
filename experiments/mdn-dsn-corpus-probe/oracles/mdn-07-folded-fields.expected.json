@@ -1,0 +1,18 @@
+{
+  "case": "mdn-07-folded-fields",
+  "kind": "mdn",
+  "validity": "valid",
+  "original_message_id": "<mdn-07-folded-fields-original@example.invalid>",
+  "recipients": [
+    {
+      "original_recipient": "recipient@example.invalid",
+      "final_recipient": "recipient@example.invalid",
+      "action": "manual-action/MDN-sent-manually; displayed",
+      "status": null,
+      "diagnostic_code": null,
+      "extra_fields": {}
+    }
+  ],
+  "action": "manual-action/MDN-sent-manually; displayed",
+  "message_fields": {}
+}

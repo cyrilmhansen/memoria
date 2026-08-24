@@ -1,0 +1,9 @@
+{
+  "case": "dsn-14-missing-reporting-mta",
+  "kind": "dsn",
+  "validity": "malformed",
+  "original_message_id": null,
+  "recipients": [],
+  "action": null,
+  "message_fields": {}
+}

@@ -1,0 +1,21 @@
+{
+  "case": "dsn-10-full-original",
+  "kind": "dsn",
+  "validity": "valid",
+  "original_message_id": "<dsn-10-full-original-original@example.invalid>",
+  "recipients": [
+    {
+      "original_recipient": "orig-full@example.invalid",
+      "final_recipient": "full@example.invalid",
+      "action": "failed",
+      "status": "5.1.1",
+      "diagnostic_code": "550 full",
+      "extra_fields": {}
+    }
+  ],
+  "action": null,
+  "message_fields": {
+    "arrival-date": "Thu, 21 Aug 2026 10:00:00 +0000",
+    "reporting-mta": "dns; mta.example.invalid"
+  }
+}

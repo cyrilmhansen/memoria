@@ -1,0 +1,32 @@
+From: notifier@example.invalid
+To: sender@example.invalid
+Subject: Synthetic rfc6533-02-global-dsn-unitext
+Message-ID: <rfc6533-02-global-dsn-unitext@example.invalid>
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=delivery-status; boundary="report-rfc6533-02-global-dsn-unitext"
+
+--report-rfc6533-02-global-dsn-unitext
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Synthetic report rfc6533-02-global-dsn-unitext.
+--report-rfc6533-02-global-dsn-unitext
+Content-Type: message/global-delivery-status
+Content-Transfer-Encoding: 7bit
+
+Reporting-MTA: dns; mta.example.invalid
+
+Original-Recipient: utf-8; unitext-\x{00E9}@example.invalid
+Final-Recipient: utf-8; destinataire-\x{00E9}@example.invalid
+Action: failed
+Status: 5.1.1
+Diagnostic-Code: smtp; bo\x{00EE}te inconnue
+
+--report-rfc6533-02-global-dsn-unitext
+Content-Type: message/global-headers
+Content-Transfer-Encoding: 7bit
+
+Message-ID: <rfc6533-02-original@example.invalid>
+Subject: UTF-8
+
+--report-rfc6533-02-global-dsn-unitext--

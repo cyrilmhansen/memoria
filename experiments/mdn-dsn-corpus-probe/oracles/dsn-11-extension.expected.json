@@ -1,0 +1,22 @@
+{
+  "case": "dsn-11-extension",
+  "kind": "dsn",
+  "validity": "valid",
+  "original_message_id": null,
+  "recipients": [
+    {
+      "original_recipient": null,
+      "final_recipient": "extension@example.invalid",
+      "action": "delayed",
+      "status": "4.3.0",
+      "diagnostic_code": "451 extension",
+      "extra_fields": {}
+    }
+  ],
+  "action": null,
+  "message_fields": {
+    "arrival-date": "Thu, 21 Aug 2026 10:00:00 +0000",
+    "reporting-mta": "dns; mta.example.invalid",
+    "x-corpus-message": "deterministic"
+  }
+}

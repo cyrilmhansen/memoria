@@ -1,0 +1,35 @@
+From: notifier@example.invalid
+To: sender@example.invalid
+Subject: Synthetic mdn-05-displayed-manual-error
+Message-ID: <mdn-05-displayed-manual-error@example.invalid>
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=disposition-notification; boundary="report-mdn-05-displayed-manual-error"
+
+--report-mdn-05-displayed-manual-error
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Synthetic report mdn-05-displayed-manual-error.
+--report-mdn-05-displayed-manual-error
+Content-Type: message/disposition-notification
+Content-Transfer-Encoding: 7bit
+
+Reporting-UA: Atlas MUA; corpus-probe
+Original-Recipient: rfc822; recipient@example.invalid
+Original-Message-ID: <mdn-05-displayed-manual-error-original@example.invalid>
+Final-Recipient: rfc822; recipient@example.invalid
+Disposition: manual-action/MDN-sent-manually; displayed/error
+Error: synthetic modifier error
+
+--report-mdn-05-displayed-manual-error
+Content-Type: message/rfc822
+Content-Transfer-Encoding: 7bit
+
+From: sender@example.invalid
+To: recipient@example.invalid
+Message-ID: <mdn-05-displayed-manual-error-original@example.invalid>
+Subject: original mdn-05-displayed-manual-error
+
+Original body.
+
+--report-mdn-05-displayed-manual-error--

@@ -1,0 +1,29 @@
+{
+  "case": "dsn-04-two-recipients",
+  "kind": "dsn",
+  "validity": "valid",
+  "original_message_id": null,
+  "recipients": [
+    {
+      "original_recipient": "orig-failed@example.invalid",
+      "final_recipient": "failed@example.invalid",
+      "action": "failed",
+      "status": "5.1.1",
+      "diagnostic_code": "550 rejected",
+      "extra_fields": {}
+    },
+    {
+      "original_recipient": null,
+      "final_recipient": "delivered@example.invalid",
+      "action": "delivered",
+      "status": "2.0.0",
+      "diagnostic_code": null,
+      "extra_fields": {}
+    }
+  ],
+  "action": null,
+  "message_fields": {
+    "arrival-date": "Thu, 21 Aug 2026 10:00:00 +0000",
+    "reporting-mta": "dns; mta.example.invalid"
+  }
+}

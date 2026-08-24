@@ -1,0 +1,31 @@
+From: notifier@example.invalid
+To: sender@example.invalid
+Subject: Synthetic mdn-14-third-without-original-id
+Message-ID: <mdn-14-third-without-original-id@example.invalid>
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=disposition-notification; boundary="report-mdn-14-third-without-original-id"
+
+--report-mdn-14-third-without-original-id
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Synthetic report mdn-14-third-without-original-id.
+--report-mdn-14-third-without-original-id
+Content-Type: message/disposition-notification
+Content-Transfer-Encoding: 7bit
+
+Reporting-UA: Atlas MUA; corpus-probe
+Final-Recipient: rfc822; recipient@example.invalid
+Disposition: manual-action/MDN-sent-manually; processed
+
+--report-mdn-14-third-without-original-id
+Content-Type: message/rfc822
+Content-Transfer-Encoding: 7bit
+
+From: sender@example.invalid
+To: recipient@example.invalid
+Subject: no message id
+
+Original body without Message-ID.
+
+--report-mdn-14-third-without-original-id--

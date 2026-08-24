@@ -1,0 +1,33 @@
+From: notifier@example.invalid
+To: sender@example.invalid
+Subject: Synthetic dsn-03-delivered-one
+Message-ID: <dsn-03-delivered-one@example.invalid>
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=delivery-status; boundary="report-dsn-03-delivered-one"
+
+--report-dsn-03-delivered-one
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Synthetic report dsn-03-delivered-one.
+--report-dsn-03-delivered-one
+Content-Type: message/delivery-status
+Content-Transfer-Encoding: 7bit
+
+Arrival-Date: Thu, 21 Aug 2026 10:00:00 +0000
+Reporting-MTA: dns; mta.example.invalid
+
+Original-Recipient: rfc822; orig-delivered@example.invalid
+Final-Recipient: rfc822; delivered@example.invalid
+Action: delivered
+Status: 2.0.0
+
+--report-dsn-03-delivered-one
+Content-Type: text/rfc822-headers
+Content-Transfer-Encoding: 7bit
+
+From: sender@example.invalid
+Message-ID: <dsn-03-delivered-one-original@example.invalid>
+Subject: headers dsn-03-delivered-one
+
+--report-dsn-03-delivered-one--

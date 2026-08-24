@@ -1,0 +1,9 @@
+{
+  "case": "negative-10-missing-required",
+  "kind": "dsn",
+  "validity": "malformed",
+  "original_message_id": null,
+  "recipients": [],
+  "action": null,
+  "message_fields": {}
+}

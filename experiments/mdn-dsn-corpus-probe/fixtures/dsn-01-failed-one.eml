@@ -1,0 +1,38 @@
+From: notifier@example.invalid
+To: sender@example.invalid
+Subject: Synthetic dsn-01-failed-one
+Message-ID: <dsn-01-failed-one@example.invalid>
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=delivery-status; boundary="report-dsn-01-failed-one"
+
+--report-dsn-01-failed-one
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Synthetic report dsn-01-failed-one.
+--report-dsn-01-failed-one
+Content-Type: message/delivery-status
+Content-Transfer-Encoding: 7bit
+
+Arrival-Date: Thu, 21 Aug 2026 10:00:00 +0000
+Reporting-MTA: dns; mta.example.invalid
+
+Original-Recipient: rfc822; orig-failed@example.invalid
+Final-Recipient: rfc822; failed@example.invalid
+Action: failed
+Status: 5.1.1
+Diagnostic-Code: smtp; 550 5.1.1 unknown
+Remote-MTA: dns; remote.example.invalid
+
+--report-dsn-01-failed-one
+Content-Type: message/rfc822
+Content-Transfer-Encoding: 7bit
+
+From: sender@example.invalid
+To: recipient@example.invalid
+Message-ID: <dsn-01-failed-one-original@example.invalid>
+Subject: original dsn-01-failed-one
+
+Original body.
+
+--report-dsn-01-failed-one--

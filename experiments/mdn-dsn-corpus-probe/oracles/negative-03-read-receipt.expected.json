@@ -1,0 +1,9 @@
+{
+  "case": "negative-03-read-receipt",
+  "kind": "ordinary",
+  "validity": "valid",
+  "original_message_id": null,
+  "recipients": [],
+  "action": null,
+  "message_fields": {}
+}

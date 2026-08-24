@@ -1,0 +1,5 @@
+From: notifier@example.invalid
+Content-Type: message/disposition-notification
+
+Final-Recipient: rfc822; recipient@example.invalid
+Disposition: manual-action/MDN-sent-manually; displayed

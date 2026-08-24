@@ -1,0 +1,8 @@
+From: friend@example.invalid
+To: reader@example.invalid
+Subject: Delivery Status Notification
+Message-ID: <negative-01-delivery-subject@example.invalid>
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+
+This is an ordinary message, not a report.

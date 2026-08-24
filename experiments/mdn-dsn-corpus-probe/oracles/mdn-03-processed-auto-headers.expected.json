@@ -1,0 +1,18 @@
+{
+  "case": "mdn-03-processed-auto-headers",
+  "kind": "mdn",
+  "validity": "valid",
+  "original_message_id": "<mdn-03-processed-auto-headers-original@example.invalid>",
+  "recipients": [
+    {
+      "original_recipient": "recipient@example.invalid",
+      "final_recipient": "recipient@example.invalid",
+      "action": "automatic-action/MDN-sent-automatically; processed",
+      "status": null,
+      "diagnostic_code": null,
+      "extra_fields": {}
+    }
+  ],
+  "action": "automatic-action/MDN-sent-automatically; processed",
+  "message_fields": {}
+}

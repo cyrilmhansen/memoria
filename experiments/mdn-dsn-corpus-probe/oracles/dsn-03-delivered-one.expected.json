@@ -1,0 +1,21 @@
+{
+  "case": "dsn-03-delivered-one",
+  "kind": "dsn",
+  "validity": "valid",
+  "original_message_id": "<dsn-03-delivered-one-original@example.invalid>",
+  "recipients": [
+    {
+      "original_recipient": "orig-delivered@example.invalid",
+      "final_recipient": "delivered@example.invalid",
+      "action": "delivered",
+      "status": "2.0.0",
+      "diagnostic_code": null,
+      "extra_fields": {}
+    }
+  ],
+  "action": null,
+  "message_fields": {
+    "arrival-date": "Thu, 21 Aug 2026 10:00:00 +0000",
+    "reporting-mta": "dns; mta.example.invalid"
+  }
+}

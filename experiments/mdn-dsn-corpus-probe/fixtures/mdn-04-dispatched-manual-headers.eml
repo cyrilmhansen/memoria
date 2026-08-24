@@ -1,0 +1,31 @@
+From: notifier@example.invalid
+To: sender@example.invalid
+Subject: Synthetic mdn-04-dispatched-manual-headers
+Message-ID: <mdn-04-dispatched-manual-headers@example.invalid>
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=disposition-notification; boundary="report-mdn-04-dispatched-manual-headers"
+
+--report-mdn-04-dispatched-manual-headers
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Synthetic report mdn-04-dispatched-manual-headers.
+--report-mdn-04-dispatched-manual-headers
+Content-Type: message/disposition-notification
+Content-Transfer-Encoding: 7bit
+
+Reporting-UA: Atlas MUA; corpus-probe
+Original-Recipient: rfc822; recipient@example.invalid
+Original-Message-ID: <mdn-04-dispatched-manual-headers-original@example.invalid>
+Final-Recipient: rfc822; recipient@example.invalid
+Disposition: manual-action/MDN-sent-manually; dispatched
+
+--report-mdn-04-dispatched-manual-headers
+Content-Type: text/rfc822-headers
+Content-Transfer-Encoding: 7bit
+
+From: sender@example.invalid
+Message-ID: <mdn-04-dispatched-manual-headers-original@example.invalid>
+Subject: headers mdn-04-dispatched-manual-headers
+
+--report-mdn-04-dispatched-manual-headers--

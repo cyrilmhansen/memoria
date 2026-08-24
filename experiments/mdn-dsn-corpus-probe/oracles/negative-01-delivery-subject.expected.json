@@ -1,0 +1,9 @@
+{
+  "case": "negative-01-delivery-subject",
+  "kind": "ordinary",
+  "validity": "valid",
+  "original_message_id": null,
+  "recipients": [],
+  "action": null,
+  "message_fields": {}
+}

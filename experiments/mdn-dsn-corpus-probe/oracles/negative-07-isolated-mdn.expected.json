@@ -1,0 +1,9 @@
+{
+  "case": "negative-07-isolated-mdn",
+  "kind": "mdn",
+  "validity": "malformed",
+  "original_message_id": null,
+  "recipients": [],
+  "action": null,
+  "message_fields": {}
+}

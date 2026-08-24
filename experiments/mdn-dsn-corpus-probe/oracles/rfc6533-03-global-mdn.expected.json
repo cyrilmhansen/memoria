@@ -1,0 +1,9 @@
+{
+  "case": "rfc6533-03-global-mdn",
+  "kind": "mdn",
+  "validity": "unsupported",
+  "original_message_id": null,
+  "recipients": [],
+  "action": null,
+  "message_fields": {}
+}

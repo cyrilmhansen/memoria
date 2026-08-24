@@ -1,0 +1,47 @@
+{
+  "case": "dsn-13-relayed-expanded-fields",
+  "kind": "dsn",
+  "validity": "valid",
+  "original_message_id": null,
+  "recipients": [
+    {
+      "original_recipient": null,
+      "final_recipient": "relayed@example.invalid",
+      "action": "relayed",
+      "status": "2.0.0",
+      "diagnostic_code": null,
+      "extra_fields": {
+        "last-attempt-date": "Thu, 21 Aug 2026 10:05:00 +0000"
+      }
+    },
+    {
+      "original_recipient": null,
+      "final_recipient": "expanded@example.invalid",
+      "action": "expanded",
+      "status": "2.0.0",
+      "diagnostic_code": null,
+      "extra_fields": {
+        "final-log-id": "log-947@example.invalid"
+      }
+    },
+    {
+      "original_recipient": null,
+      "final_recipient": "retry@example.invalid",
+      "action": "delayed",
+      "status": "4.2.0",
+      "diagnostic_code": null,
+      "extra_fields": {
+        "last-attempt-date": "Thu, 21 Aug 2026 10:05:00 +0000",
+        "will-retry-until": "Thu, 21 Aug 2026 11:00:00 +0000"
+      }
+    }
+  ],
+  "action": null,
+  "message_fields": {
+    "arrival-date": "Thu, 21 Aug 2026 10:00:00 +0000",
+    "dsn-gateway": "dns; gateway.example.invalid",
+    "original-envelope-id": "env-947@example.invalid",
+    "received-from-mta": "dns; relay.example.invalid",
+    "reporting-mta": "dns; mta.example.invalid"
+  }
+}

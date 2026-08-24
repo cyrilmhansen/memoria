@@ -1,0 +1,18 @@
+{
+  "case": "mdn-02-deleted-manual-none",
+  "kind": "mdn",
+  "validity": "valid",
+  "original_message_id": "<mdn-02-deleted-manual-none-original@example.invalid>",
+  "recipients": [
+    {
+      "original_recipient": null,
+      "final_recipient": "recipient@example.invalid",
+      "action": "manual-action/MDN-sent-manually; deleted",
+      "status": null,
+      "diagnostic_code": null,
+      "extra_fields": {}
+    }
+  ],
+  "action": "manual-action/MDN-sent-manually; deleted",
+  "message_fields": {}
+}

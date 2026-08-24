@@ -1,0 +1,21 @@
+{
+  "case": "dsn-02-delayed-one",
+  "kind": "dsn",
+  "validity": "valid",
+  "original_message_id": null,
+  "recipients": [
+    {
+      "original_recipient": null,
+      "final_recipient": "delayed@example.invalid",
+      "action": "delayed",
+      "status": "4.2.0",
+      "diagnostic_code": "451 4.2.0 temporary",
+      "extra_fields": {}
+    }
+  ],
+  "action": null,
+  "message_fields": {
+    "arrival-date": "Thu, 21 Aug 2026 10:00:00 +0000",
+    "reporting-mta": "dns; mta.example.invalid"
+  }
+}

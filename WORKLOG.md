@@ -652,3 +652,18 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
   duplications byte-identiques sans fusion de provenance; export EML byte-exact
   vérifié sur une frame de l'archive Windows.
 - `cargo check --workspace` et `cargo test --workspace` natifs Windows passent.
+
+## 2026-08-24 — Corpus expérimental MDN/DSN
+
+- Durci `experiments/mdn-dsn-corpus-probe/` : 40 messages MIME synthétiques,
+  oracles golden générés par spécification mais indépendants de mailparse,
+  et mutations qui doivent échouer avec l’oracle inchangé.
+- Vérifié avec `mailparse 0.16.1` la représentation effective des rapports
+  MDN/DSN, des groupes DSN, des troisièmes parties et des types RFC 6533 ;
+  ajouté les champs DSN per-message RFC 3464, les contrôles MDN requis et les
+  cas croisés `Original-Message-ID`.
+- Corrigé `dsn-13` : champs per-recipient déplacés dans leurs blocs, avec
+  `Will-Retry-Until` uniquement sur le destinataire `delayed`; mutation
+  invalidante ajoutée.
+- Le probe classe les rapports valides, malformés et non supportés sans
+  modifier Memoria ; rapport : `experiments/2026-08-24-mdn-dsn-corpus.md`.

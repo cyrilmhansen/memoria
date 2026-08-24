@@ -1,0 +1,31 @@
+From: notifier@example.invalid
+To: sender@example.invalid
+Subject: Synthetic dsn-04-two-recipients
+Message-ID: <dsn-04-two-recipients@example.invalid>
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=delivery-status; boundary="report-dsn-04-two-recipients"
+
+--report-dsn-04-two-recipients
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Synthetic report dsn-04-two-recipients.
+--report-dsn-04-two-recipients
+Content-Type: message/delivery-status
+Content-Transfer-Encoding: 7bit
+
+Arrival-Date: Thu, 21 Aug 2026 10:00:00 +0000
+Reporting-MTA: dns; mta.example.invalid
+
+Original-Recipient: rfc822; orig-failed@example.invalid
+Final-Recipient: rfc822; failed@example.invalid
+Action: failed
+Status: 5.1.1
+Diagnostic-Code: smtp; 550 rejected
+Remote-MTA: dns; remote.example.invalid
+
+Final-Recipient: rfc822; delivered@example.invalid
+Action: delivered
+Status: 2.0.0
+
+--report-dsn-04-two-recipients--

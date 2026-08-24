@@ -1,0 +1,21 @@
+{
+  "case": "dsn-06-remote-mta",
+  "kind": "dsn",
+  "validity": "valid",
+  "original_message_id": "<dsn-06-remote-mta-original@example.invalid>",
+  "recipients": [
+    {
+      "original_recipient": "orig-remote@example.invalid",
+      "final_recipient": "remote@example.invalid",
+      "action": "failed",
+      "status": "5.7.1",
+      "diagnostic_code": "550 policy",
+      "extra_fields": {}
+    }
+  ],
+  "action": null,
+  "message_fields": {
+    "arrival-date": "Thu, 21 Aug 2026 10:00:00 +0000",
+    "reporting-mta": "dns; mta.example.invalid"
+  }
+}

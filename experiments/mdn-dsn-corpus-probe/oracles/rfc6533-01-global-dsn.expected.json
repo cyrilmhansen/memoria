@@ -1,0 +1,9 @@
+{
+  "case": "rfc6533-01-global-dsn",
+  "kind": "dsn",
+  "validity": "unsupported",
+  "original_message_id": null,
+  "recipients": [],
+  "action": null,
+  "message_fields": {}
+}

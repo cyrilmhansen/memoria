@@ -1,0 +1,23 @@
+From: notifier@example.invalid
+To: sender@example.invalid
+Subject: Synthetic rfc6533-03-global-mdn
+Message-ID: <rfc6533-03-global-mdn@example.invalid>
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=disposition-notification; boundary="report-rfc6533-03-global-mdn"
+
+--report-rfc6533-03-global-mdn
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Synthetic report rfc6533-03-global-mdn.
+--report-rfc6533-03-global-mdn
+Content-Type: message/global-disposition-notification
+Content-Transfer-Encoding: 7bit
+
+Reporting-UA: Atlas MUA; corpus-probe
+Original-Recipient: rfc822; destinataire@example.invalid
+Original-Message-ID: <rfc6533-03-original@example.invalid>
+Final-Recipient: rfc822; destinataire@example.invalid
+Disposition: automatic-action/MDN-sent-automatically; displayed
+
+--report-rfc6533-03-global-mdn--

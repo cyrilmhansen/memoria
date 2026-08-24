@@ -1,0 +1,28 @@
+From: notifier@example.invalid
+To: sender@example.invalid
+Subject: Synthetic dsn-12-case-and-folding
+Message-ID: <dsn-12-case-and-folding@example.invalid>
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=delivery-status; boundary="report-dsn-12-case-and-folding"
+
+--report-dsn-12-case-and-folding
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 7bit
+
+Synthetic report dsn-12-case-and-folding.
+--report-dsn-12-case-and-folding
+Content-Type: message/delivery-status
+Content-Transfer-Encoding: 7bit
+
+Arrival-Date: Thu, 21 Aug 2026 10:00:00 +0000
+Reporting-MTA: dns; mta.example.invalid
+
+Original-Recipient: rfc822; orig-case@example.invalid
+Final-Recipient: rfc822;
+ case@example.invalid
+Action: FAILED
+Status: 5.1.1
+Diagnostic-Code: smtp; 550 case
+Remote-MTA: dns; remote.example.invalid
+
+--report-dsn-12-case-and-folding--

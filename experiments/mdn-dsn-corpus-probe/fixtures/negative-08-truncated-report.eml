@@ -1,0 +1,7 @@
+From: notifier@example.invalid
+Content-Type: multipart/report; report-type=delivery-status; boundary=broken
+
+--broken
+Content-Type: text/plain
+
+partial

@@ -531,6 +531,24 @@ résultats d'expérience locale :
   pas utilisés pour calculer la frontière. Le parcours FETCH traite les
   messages un par un.
 - Détails : `experiments/2026-08-22-mail-archive-imap-import.md`.
+
+## 2026-08-24 — Probe synthétique MDN/DSN
+
+- **Fait vérifié :** `mailparse 0.16.1` expose l’arbre MIME
+  `multipart/report` et ses sous-parties, mais ne fournit pas de modèle
+  sémantique MDN/DSN : les champs et groupes destinataires doivent être
+  interprétés par une couche dédiée au-dessus de `ParsedMail`.
+- **Décision expérimentale :** conserver un corpus synthétique de 42 fixtures
+  (14 MDN, 13 DSN, 11 négatifs, 4 RFC 6533 prospectives) ; les oracles sont
+  indépendants du modèle mailparse mais générés depuis les mêmes spécifications
+  déterministes que les `.eml`. Les tests de mutation vérifient leur pouvoir
+  discriminant. Les messages textuellement similaires sans structure MIME
+  restent ordinaires.
+- **Fait vérifié :** les champs per-message/per-destinataire RFC 3464 sont
+  séparés ; `Will-Retry-Until` n’est présent que pour un destinataire `delayed`.
+  `Original-Message-ID` dépend du `Message-ID` original, pas de la présence
+  d’une troisième partie.
+- Détails : `experiments/2026-08-24-mdn-dsn-corpus.md`.
 ## IMAP multi-mailbox
 
 - `LIST` expose les noms protocolaire, delimiter, attributs et SPECIAL-USE sans
