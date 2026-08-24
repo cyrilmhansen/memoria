@@ -1,6 +1,6 @@
 use flate2::{write::GzEncoder, Compression};
 use mailparse::{parse_mail, MailHeaderMap, ParsedMail};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -1807,7 +1807,7 @@ pub fn create_metadata(path: &Path) -> rusqlite::Result<Connection> {
     }
     let connection = Connection::open(path)?;
     connection.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL; CREATE TABLE IF NOT EXISTS messages (doc_id INTEGER PRIMARY KEY, message_id TEXT NOT NULL UNIQUE, timestamp INTEGER NOT NULL, sender TEXT NOT NULL, recipients TEXT NOT NULL, subject TEXT NOT NULL, account TEXT NOT NULL, folder TEXT NOT NULL, thread TEXT NOT NULL, segment TEXT NOT NULL, archive_offset INTEGER NOT NULL, frame_bytes INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS attachments (doc_id INTEGER NOT NULL, filename TEXT NOT NULL, mime TEXT NOT NULL, bytes INTEGER NOT NULL, content_hash TEXT NOT NULL, PRIMARY KEY(doc_id, filename)); CREATE INDEX IF NOT EXISTS messages_timestamp ON messages(timestamp); CREATE INDEX IF NOT EXISTS messages_sender ON messages(sender); CREATE INDEX IF NOT EXISTS messages_folder ON messages(folder); CREATE TABLE IF NOT EXISTS gmail_state (source_account TEXT PRIMARY KEY, history_id TEXT NOT NULL, complete INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS gmail_messages (source_account TEXT NOT NULL, gmail_message_id TEXT NOT NULL, doc_id INTEGER NOT NULL UNIQUE, thread_id TEXT NOT NULL, label_ids TEXT NOT NULL, internal_date_ms INTEGER, message_history_id TEXT, source_state TEXT NOT NULL, first_seen_unix INTEGER NOT NULL, last_seen_unix INTEGER NOT NULL, PRIMARY KEY(source_account, gmail_message_id)); CREATE INDEX IF NOT EXISTS gmail_messages_state ON gmail_messages(source_account, source_state);")?;
-    connection.execute_batch("CREATE TABLE IF NOT EXISTS imap_messages (source_account TEXT NOT NULL, mailbox TEXT NOT NULL, uid_validity INTEGER NOT NULL, uid INTEGER NOT NULL, doc_id INTEGER NOT NULL UNIQUE, flags TEXT NOT NULL, internal_date TEXT, internal_date_ms INTEGER, rfc822_size INTEGER, source_state TEXT NOT NULL, first_seen_unix INTEGER NOT NULL, last_seen_unix INTEGER NOT NULL, PRIMARY KEY(source_account, mailbox, uid_validity, uid)); CREATE INDEX IF NOT EXISTS imap_messages_state ON imap_messages(source_account, source_state);")?;
+    connection.execute_batch("CREATE TABLE IF NOT EXISTS imap_messages (source_account TEXT NOT NULL, mailbox TEXT NOT NULL, uid_validity INTEGER NOT NULL, uid INTEGER NOT NULL, doc_id INTEGER NOT NULL UNIQUE, flags TEXT NOT NULL, internal_date TEXT, internal_date_ms INTEGER, rfc822_size INTEGER, source_state TEXT NOT NULL, first_seen_unix INTEGER NOT NULL, last_seen_unix INTEGER NOT NULL, PRIMARY KEY(source_account, mailbox, uid_validity, uid)); CREATE INDEX IF NOT EXISTS imap_messages_state ON imap_messages(source_account, source_state); CREATE TABLE IF NOT EXISTS imap_scan_state (source_account TEXT NOT NULL, mailbox TEXT NOT NULL, uid_validity INTEGER NOT NULL, scanned_through_uid INTEGER NOT NULL, last_uid_next INTEGER NOT NULL, updated_unix INTEGER NOT NULL, PRIMARY KEY(source_account, mailbox, uid_validity));")?;
     Ok(connection)
 }
 
@@ -1903,6 +1903,67 @@ pub fn imap_message_exists(
         params![source_account, mailbox, uid_validity as i64, uid as i64],
         |row| row.get(0),
     )
+}
+
+pub fn imap_scan_state(
+    connection: &Connection,
+    source_account: &str,
+    mailbox: &str,
+) -> rusqlite::Result<Option<(u32, u32)>> {
+    connection
+        .query_row(
+            "SELECT uid_validity, scanned_through_uid FROM imap_scan_state WHERE source_account=?1 AND mailbox=?2",
+            params![source_account, mailbox],
+            |row| Ok((row.get::<_, i64>(0)? as u32, row.get::<_, i64>(1)? as u32)),
+        )
+        .optional()
+}
+
+pub fn imap_known_uid_validity(
+    connection: &Connection,
+    source_account: &str,
+    mailbox: &str,
+) -> rusqlite::Result<Option<u32>> {
+    let state = connection
+        .query_row(
+            "SELECT uid_validity FROM imap_scan_state WHERE source_account=?1 AND mailbox=?2 LIMIT 1",
+            params![source_account, mailbox],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if state.is_some() {
+        return Ok(state.map(|value| value as u32));
+    }
+    connection
+        .query_row(
+            "SELECT uid_validity FROM imap_messages WHERE source_account=?1 AND mailbox=?2 LIMIT 1",
+            params![source_account, mailbox],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map(|value| value.map(|value| value as u32))
+}
+
+pub fn upsert_imap_scan_state(
+    connection: &Connection,
+    source_account: &str,
+    mailbox: &str,
+    uid_validity: u32,
+    scanned_through_uid: u32,
+    last_uid_next: u32,
+) -> rusqlite::Result<()> {
+    connection.execute(
+        "INSERT INTO imap_scan_state(source_account,mailbox,uid_validity,scanned_through_uid,last_uid_next,updated_unix) VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(source_account,mailbox,uid_validity) DO UPDATE SET scanned_through_uid=excluded.scanned_through_uid,last_uid_next=excluded.last_uid_next,updated_unix=excluded.updated_unix",
+        params![
+            source_account,
+            mailbox,
+            uid_validity as i64,
+            scanned_through_uid as i64,
+            last_uid_next as i64,
+            chrono_like_now()
+        ],
+    )?;
+    Ok(())
 }
 
 pub fn insert_imap_metadata(

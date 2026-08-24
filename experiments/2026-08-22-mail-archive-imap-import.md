@@ -91,6 +91,51 @@ localisation de frame. La séquence ne constitue toutefois pas une transaction
 atomique RAW+SQLite lors d'une panne matérielle : cette garantie plus forte
 reste une dette distincte.
 
+## Synchronisation incrémentale minimale
+
+La table `imap_scan_state` conserve, pour chaque
+`source_account + mailbox + UIDVALIDITY`, une frontière
+`scanned_through_uid` et le dernier `UIDNEXT` observé. Cette frontière est une
+métadonnée de provenance/synchronisation : elle n'appartient pas au message
+MIME et n'est pas reconstructible depuis le RAW.
+
+Au début d'une campagne, `EXAMINE` relève `UIDVALIDITY` et `UIDNEXT`. Après une
+frontière publiée, le client demande seulement `scanned_through_uid + 1`. La
+borne supérieure est `UIDNEXT - 1` sans limite, ou la fin de la tranche
+`--limit`. Le snapshot est borné au début de la campagne ; les messages
+arrivés ensuite sont laissés à la campagne suivante. La frontière n'est
+écrite qu'après la fin propre du FETCH et la synchronisation de l'archive.
+
+`--limit N` borne le nombre d'UID de la campagne courante à partir de la
+frontière et avance celle-ci jusqu'à la borne effectivement parcourue. Une
+interruption réseau suit la règle inverse : les messages déjà écrits restent
+protégés par l'identité SQLite, mais aucune nouvelle borne n'est publiée.
+Cette frontière est la borne UID parcourue, jamais le plus grand UID retourné
+ou présent dans SQLite ; des UID absents dans une tranche n'empêchent donc pas
+sa progression.
+
+Résultats GreenMail synthétiques (12 fixtures, puis 3 nouvelles, campagne
+limitée à 5) :
+
+```text
+limit 1       examined=5  raw_fetched=5  new=5  frontier 0  -> 5
+limit 2       examined=5  raw_fetched=5  new=5  frontier 5  -> 10
+limit 3       examined=5  raw_fetched=5  new=5  frontier 10 -> 15
+limit repeat  examined=0  raw_fetched=0  new=0  frontier 15 -> 15
+```
+
+Le parcours traite chaque réponse FETCH au fil de l'eau : le vecteur global
+des messages récupérés a été supprimé ; la mémoire de cette étape est donc
+bornée par le message courant et les structures d'archive/catalogue. Le
+serveur a été redémarré avec une nouvelle UIDVALIDITY : l'import a refusé la
+campagne avec `UidValidityChanged` avant toute utilisation de l'ancienne
+frontière.
+
+Le chemin Windows natif n'a pas pu être rejoué dans cette passe : l'hôte
+N16PRO était momentanément injoignable en SSH (`No route to host`). Le check
+Windows précédent du chemin IMAP complet reste valide, mais la nouvelle
+sélection incrémentale devra être rejouée sur ce runner.
+
 ## Validation GreenMail Linux
 
 Serveur : GreenMail standalone 2.1.12, Linux, IMAPS 3993, certificat serveur
@@ -162,5 +207,7 @@ Windows mail-archive-app 30 222 848 octets
 Le chemin importe actuellement les RAW récupérés de la campagne dans une
 collection de travail avant l’écriture. C’est acceptable pour cette première
 campagne, mais devra être réexaminé avant de viser de très grandes mailboxes.
-Il n’y a pas encore de synchronisation incrémentale IMAP, de suppression,
-MOVE/COPY, CONDSTORE/QRESYNC, IDLE, OBJECTID, STARTTLS ou onboarding UI.
+Il n’y a pas encore de suppression, MOVE/COPY, CONDSTORE/QRESYNC, IDLE,
+OBJECTID, STARTTLS ou onboarding UI. Le refetch complet et la matérialisation
+du message courant restent les prochains sujets de scalabilité si les
+mailboxes deviennent très grandes.

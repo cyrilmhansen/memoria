@@ -1,7 +1,6 @@
 use crate::GmailIndexStats;
 use async_imap::types::Fetch;
 use futures::TryStreamExt;
-use rusqlite::OptionalExtension;
 use rustls::pki_types::{pem::PemObject, CertificateDer, ServerName};
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
@@ -30,10 +29,14 @@ pub struct ImapConfig {
 #[derive(Clone, Debug, Default)]
 pub struct ImapSyncStats {
     pub examined: u64,
+    pub raw_fetched: u64,
     pub new_messages: u64,
     pub network_bytes: u64,
     pub archive_bytes_added: u64,
     pub uid_validity: u32,
+    pub uid_next: u32,
+    pub frontier_before: u32,
+    pub frontier_after: Option<u32>,
     pub index: Option<GmailIndexStats>,
 }
 
@@ -43,6 +46,13 @@ pub enum ImapError {
     Io(String),
     Protocol(String),
     UidValidityChanged { expected: u32, observed: u32 },
+}
+
+struct FetchRun {
+    uid_validity: u32,
+    uid_next: u32,
+    examined: u64,
+    scanned_through_uid: Option<u32>,
 }
 
 impl std::fmt::Display for ImapError {
@@ -63,6 +73,7 @@ impl std::error::Error for ImapError {}
 
 #[derive(Debug)]
 struct FetchedMessage {
+    uid_validity: u32,
     uid: u32,
     flags_json: String,
     internal_date: Option<String>,
@@ -78,79 +89,96 @@ pub fn sync_imap(root: &Path, config: &ImapConfig) -> Result<ImapSyncStats, Imap
     if config.source_account.is_empty() {
         return Err(ImapError::Config("source account must not be empty".into()));
     }
+    let metadata = crate::create_metadata(&root.join("metadata.sqlite"))
+        .map_err(|error| ImapError::Io(error.to_string()))?;
+    let known_uid_validity =
+        crate::imap_known_uid_validity(&metadata, &config.source_account, &config.mailbox)
+            .map_err(|error| ImapError::Io(error.to_string()))?;
+    let scan_state = crate::imap_scan_state(&metadata, &config.source_account, &config.mailbox)
+        .map_err(|error| ImapError::Io(error.to_string()))?;
+    let frontier_before = scan_state.map(|(_, frontier)| frontier).unwrap_or(0);
+
+    let mut writer = crate::ArchiveWriter::open(&root.join("archive"), 64 * 1024 * 1024)
+        .map_err(|error| ImapError::Io(error.to_string()))?;
+    let mut stats = ImapSyncStats {
+        frontier_before,
+        ..Default::default()
+    };
     let runtime = Builder::new_multi_thread()
         .enable_io()
         .enable_time()
         .build()
         .map_err(|error| ImapError::Io(format!("create Tokio runtime: {error}")))?;
-    let (uid_validity, fetched) = runtime.block_on(fetch_mailbox(config))?;
-    drop(runtime);
-
-    let metadata = crate::create_metadata(&root.join("metadata.sqlite"))
-        .map_err(|error| ImapError::Io(error.to_string()))?;
-    let existing_uid_validity: Option<u32> = metadata
-        .query_row(
-            "SELECT uid_validity FROM imap_messages WHERE source_account=?1 AND mailbox=?2 LIMIT 1",
-            rusqlite::params![config.source_account, config.mailbox],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .map_err(|error| ImapError::Io(error.to_string()))?
-        .map(|value: i64| value as u32);
-    if let Some(expected) = existing_uid_validity {
-        if expected != uid_validity {
-            return Err(ImapError::UidValidityChanged {
-                expected,
-                observed: uid_validity,
-            });
-        }
-    }
-
-    let mut writer = crate::ArchiveWriter::open(&root.join("archive"), 64 * 1024 * 1024)
-        .map_err(|error| ImapError::Io(error.to_string()))?;
-    let mut stats = ImapSyncStats {
-        examined: fetched.len() as u64,
-        uid_validity,
-        ..Default::default()
+    let fetch_start = if scan_state.is_some() {
+        frontier_before.saturating_add(1)
+    } else {
+        1
     };
-    for message in fetched {
-        if crate::imap_message_exists(
-            &metadata,
-            &config.source_account,
-            &config.mailbox,
-            uid_validity,
-            message.uid,
-        )
-        .map_err(|error| ImapError::Io(error.to_string()))?
-        {
-            continue;
-        }
-        let doc_id =
-            crate::next_doc_id(&metadata).map_err(|error| ImapError::Io(error.to_string()))? as u64;
-        let location = writer
-            .append_raw(doc_id, &message.raw)
+    let fetch_result = runtime.block_on(fetch_mailbox(
+        config,
+        known_uid_validity,
+        fetch_start,
+        config.limit,
+        |message| {
+            stats.raw_fetched += 1;
+            stats.network_bytes += message.raw.len() as u64;
+            if crate::imap_message_exists(
+                &metadata,
+                &config.source_account,
+                &config.mailbox,
+                message.uid_validity,
+                message.uid,
+            )
+            .map_err(|error| ImapError::Io(error.to_string()))?
+            {
+                return Ok(());
+            }
+            let doc_id = crate::next_doc_id(&metadata)
+                .map_err(|error| ImapError::Io(error.to_string()))? as u64;
+            let location = writer
+                .append_raw(doc_id, &message.raw)
+                .map_err(|error| ImapError::Io(error.to_string()))?;
+            crate::insert_imap_metadata(
+                &metadata,
+                &config.source_account,
+                &config.mailbox,
+                message.uid_validity,
+                message.uid,
+                &message.flags_json,
+                message.internal_date.as_deref(),
+                message.internal_date_ms,
+                message.rfc822_size,
+                doc_id as i64,
+                &location,
+            )
             .map_err(|error| ImapError::Io(error.to_string()))?;
-        crate::insert_imap_metadata(
-            &metadata,
-            &config.source_account,
-            &config.mailbox,
-            uid_validity,
-            message.uid,
-            &message.flags_json,
-            message.internal_date.as_deref(),
-            message.internal_date_ms,
-            message.rfc822_size,
-            doc_id as i64,
-            &location,
-        )
-        .map_err(|error| ImapError::Io(error.to_string()))?;
-        stats.new_messages += 1;
-        stats.network_bytes += message.raw.len() as u64;
-        stats.archive_bytes_added += location.frame_bytes;
-    }
+            stats.new_messages += 1;
+            stats.archive_bytes_added += location.frame_bytes;
+            Ok(())
+        },
+    ));
+    drop(runtime);
+    let fetch_result = fetch_result?;
+    stats.uid_validity = fetch_result.uid_validity;
+    stats.uid_next = fetch_result.uid_next;
+    stats.examined = fetch_result.examined;
     writer
         .sync()
         .map_err(|error| ImapError::Io(error.to_string()))?;
+    if let Some(scanned_through_uid) = fetch_result.scanned_through_uid {
+        crate::upsert_imap_scan_state(
+            &metadata,
+            &config.source_account,
+            &config.mailbox,
+            fetch_result.uid_validity,
+            scanned_through_uid,
+            fetch_result.uid_next,
+        )
+        .map_err(|error| ImapError::Io(error.to_string()))?;
+        stats.frontier_after = Some(scanned_through_uid);
+    } else {
+        stats.frontier_after = Some(frontier_before);
+    }
     drop(writer);
     drop(metadata);
 
@@ -161,7 +189,16 @@ pub fn sync_imap(root: &Path, config: &ImapConfig) -> Result<ImapSyncStats, Imap
     Ok(stats)
 }
 
-async fn fetch_mailbox(config: &ImapConfig) -> Result<(u32, Vec<FetchedMessage>), ImapError> {
+async fn fetch_mailbox<F>(
+    config: &ImapConfig,
+    expected_uid_validity: Option<u32>,
+    start_uid: u32,
+    limit: Option<u32>,
+    on_message: F,
+) -> Result<FetchRun, ImapError>
+where
+    F: FnMut(FetchedMessage) -> Result<(), ImapError>,
+{
     let stream = timeout(
         config.timeout,
         TcpStream::connect((config.host.as_str(), config.port)),
@@ -192,13 +229,25 @@ async fn fetch_mailbox(config: &ImapConfig) -> Result<(u32, Vec<FetchedMessage>)
         .await
         .map_err(|_| ImapError::Protocol("TLS handshake timeout".into()))?
         .map_err(|error| ImapError::Protocol(format!("TLS handshake failed: {error}")))?;
-    fetch_session(config, stream).await
+    fetch_session(
+        config,
+        stream,
+        expected_uid_validity,
+        start_uid,
+        limit,
+        on_message,
+    )
+    .await
 }
 
 async fn fetch_session<S>(
     config: &ImapConfig,
     stream: S,
-) -> Result<(u32, Vec<FetchedMessage>), ImapError>
+    expected_uid_validity: Option<u32>,
+    start_uid: u32,
+    limit: Option<u32>,
+    mut on_message: impl FnMut(FetchedMessage) -> Result<(), ImapError>,
+) -> Result<FetchRun, ImapError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Debug + 'static,
 {
@@ -222,11 +271,32 @@ where
     let uid_validity = mailbox
         .uid_validity
         .ok_or_else(|| ImapError::Protocol("EXAMINE returned no UIDVALIDITY".into()))?;
-    let sequence = config
-        .limit
-        .map(|limit| format!("1:{limit}"))
-        .unwrap_or_else(|| "1:*".into());
-    let messages = {
+    if let Some(expected) = expected_uid_validity {
+        if expected != uid_validity {
+            return Err(ImapError::UidValidityChanged {
+                expected,
+                observed: uid_validity,
+            });
+        }
+    }
+    let uid_next = mailbox
+        .uid_next
+        .ok_or_else(|| ImapError::Protocol("EXAMINE returned no UIDNEXT".into()))?;
+    let snapshot_last_uid = uid_next.saturating_sub(1);
+    let end_uid = limit
+        .map(|count| start_uid.saturating_add(count.saturating_sub(1)))
+        .unwrap_or(snapshot_last_uid)
+        .min(snapshot_last_uid);
+    let mut examined = 0;
+    let scanned_through_uid = if start_uid <= end_uid {
+        Some(end_uid)
+    } else if limit.is_none() {
+        Some(snapshot_last_uid)
+    } else {
+        None
+    };
+    if start_uid <= end_uid {
+        let sequence = format!("{start_uid}:{end_uid}");
         let mut fetched = timeout(
             config.timeout,
             session.uid_fetch(
@@ -237,24 +307,29 @@ where
         .await
         .map_err(|_| ImapError::Protocol("UID FETCH timeout".into()))?
         .map_err(|error| ImapError::Protocol(format!("UID FETCH failed: {error}")))?;
-        let mut messages = Vec::new();
         while let Some(fetch) = timeout(config.timeout, fetched.try_next())
             .await
             .map_err(|_| ImapError::Protocol("FETCH response timeout".into()))?
             .map_err(|error| ImapError::Protocol(format!("FETCH response failed: {error}")))?
         {
-            messages.push(fetch_to_owned(&fetch)?);
+            let message = fetch_to_owned(&fetch, uid_validity)?;
+            examined += 1;
+            on_message(message)?;
         }
-        messages
-    };
+    }
     timeout(config.timeout, session.logout())
         .await
         .map_err(|_| ImapError::Protocol("logout timeout".into()))?
         .map_err(|error| ImapError::Protocol(format!("logout failed: {error}")))?;
-    Ok((uid_validity, messages))
+    Ok(FetchRun {
+        uid_validity,
+        uid_next,
+        examined,
+        scanned_through_uid,
+    })
 }
 
-fn fetch_to_owned(fetch: &Fetch) -> Result<FetchedMessage, ImapError> {
+fn fetch_to_owned(fetch: &Fetch, uid_validity: u32) -> Result<FetchedMessage, ImapError> {
     let uid = fetch
         .uid
         .ok_or_else(|| ImapError::Protocol("FETCH response had no UID".into()))?;
@@ -264,6 +339,7 @@ fn fetch_to_owned(fetch: &Fetch) -> Result<FetchedMessage, ImapError> {
         .to_vec();
     let internal_date = fetch.internal_date();
     Ok(FetchedMessage {
+        uid_validity,
         uid,
         flags_json: serde_json::to_string(
             &fetch
@@ -322,6 +398,36 @@ mod tests {
             "imap:imap-test:INBOX:17:42"
         );
         drop(writer);
+        drop(connection);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn imap_scan_frontier_is_explicit_and_keyed_by_uidvalidity() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("memoria-imap-scan-test-{suffix}"));
+        let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
+        assert_eq!(
+            crate::imap_scan_state(&connection, "imap-test", "INBOX").unwrap(),
+            None
+        );
+        crate::upsert_imap_scan_state(&connection, "imap-test", "INBOX", 17, 12, 13).unwrap();
+        assert_eq!(
+            crate::imap_scan_state(&connection, "imap-test", "INBOX").unwrap(),
+            Some((17, 12))
+        );
+        assert_eq!(
+            crate::imap_known_uid_validity(&connection, "imap-test", "INBOX").unwrap(),
+            Some(17)
+        );
+        crate::upsert_imap_scan_state(&connection, "imap-test", "INBOX", 17, 15, 16).unwrap();
+        assert_eq!(
+            crate::imap_scan_state(&connection, "imap-test", "INBOX").unwrap(),
+            Some((17, 15))
+        );
         drop(connection);
         let _ = std::fs::remove_dir_all(root);
     }

@@ -62,12 +62,16 @@ fn main() {
         Ok(stats) => {
             let indexed = stats.index.as_ref().map(|value| value.indexed).unwrap_or(0);
             println!(
-                "examined={} new_messages={} network_bytes={} archive_bytes_added={} uidvalidity={} indexed={indexed}",
+                "examined={} raw_fetched={} new_messages={} network_bytes={} archive_bytes_added={} uidvalidity={} uidnext={} frontier_before={} frontier_after={:?} indexed={indexed}",
                 stats.examined,
+                stats.raw_fetched,
                 stats.new_messages,
                 stats.network_bytes,
                 stats.archive_bytes_added,
-                stats.uid_validity
+                stats.uid_validity,
+                stats.uid_next,
+                stats.frontier_before,
+                stats.frontier_after,
             );
         }
         Err(error) => {

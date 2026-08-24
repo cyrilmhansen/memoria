@@ -612,3 +612,17 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
 - Validé GreenMail Linux puis Windows natif : 12 nouveaux messages, second
   import à 0 nouveau, recherches Unicode/attachment et export EML byte-exact.
 - Rapport : `experiments/2026-08-22-mail-archive-imap-import.md`.
+
+## 2026-08-22 — Synchronisation IMAP incrémentale minimale
+
+- Ajouté `imap_scan_state` avec frontière explicite par source/mailbox/
+  UIDVALIDITY ; elle n'avance qu'après une campagne complète terminée.
+- `EXAMINE`/UIDNEXT borne désormais le FETCH aux UID nouveaux du snapshot ;
+  chaque tranche `--limit` réussie publie sa borne UID effectivement parcourue,
+  jamais le maximum des UID retournés.
+- Remplacé l'accumulation de tous les FETCH par un traitement progressif
+  message par message avant archivage/catalogue.
+- GreenMail Linux : 12 initiaux, 0 refetch inchangé, 3 nouveaux seuls ; le
+  changement UIDVALIDITY est refusé. Le runner Windows était injoignable pour
+  le replay incrémental de cette passe.
+- Rapport : `experiments/2026-08-22-mail-archive-imap-import.md`.

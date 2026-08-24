@@ -522,4 +522,12 @@ résultats d'expérience locale :
   peut laisser un RAW orphelin mais ne doit pas créer de référence catalogue
   vers une frame inexistante. Une transaction durable RAW+SQLite reste une
   question distincte.
+- **Fait vérifié :** la synchronisation incrémentale minimale conserve une
+  frontière `scanned_through_uid` dans `imap_scan_state`, par source/mailbox/
+  UIDVALIDITY. Après un `EXAMINE` avec UIDNEXT stable, seuls les UID jusqu'au
+  snapshot `UIDNEXT-1` sont demandés, ou jusqu'à la borne de la tranche
+  `--limit`. Une tranche limitée réussie avance la frontière jusqu'à sa borne,
+  tandis qu'une campagne interrompue ne l'avance pas. Les UID absents ne sont
+  pas utilisés pour calculer la frontière. Le parcours FETCH traite les
+  messages un par un.
 - Détails : `experiments/2026-08-22-mail-archive-imap-import.md`.
