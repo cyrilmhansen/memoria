@@ -1,0 +1,18 @@
+[package]
+name = "gmail-imap-xoauth2-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+async-imap = { version = "0.11.3", default-features = false, features = ["runtime-tokio"] }
+base64 = "0.22"
+futures = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
+rustls-pki-types = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
+tokio-rustls = "0.26"
+webpki-roots = "0.26"
