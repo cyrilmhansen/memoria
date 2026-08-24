@@ -44,6 +44,22 @@ Le binaire `imap-import` accepte explicitement :
 --timeout-ms N
 ```
 
+L’import accepte aussi plusieurs occurrences de `--mailbox`; `--all-mailboxes`
+sélectionne toutes les entrées retournées par `LIST` qui ne portent pas
+`\\Noselect`. Avant l’import, Memoria exécute `CAPABILITY` puis `LIST "" "*"`.
+Le nom protocolaire, le séparateur, les attributs bruts, les attributs
+SPECIAL-USE et le caractère sélectionnable sont conservés dans
+`imap_mailboxes`. Les noms sont utilisés tels que fournis par async-imap,
+sans supposer un séparateur `/`. Leur adéquation à un affichage Unicode n’est
+pas déduite de cette API.
+
+Chaque mailbox est ensuite importée indépendamment avec le même mécanisme
+`EXAMINE` / `UIDVALIDITY` / `UIDNEXT` / `scanned_through_uid`. Une erreur sur
+une mailbox est rapportée dans son résultat et ne modifie pas les frontières
+déjà publiées pour les autres. La clé logique reste
+`source_account + mailbox + UIDVALIDITY + UID`: deux occurrences du même RAW
+dans deux mailboxes ne sont ni fusionnées ni dédupliquées.
+
 Le mot de passe et la CA sont fournis hors archive et hors dépôt. Aucun secret
 n’est écrit dans les logs. Le port TLS implicite est utilisé ; STARTTLS,
 OAuth IMAP et la découverte de mailboxes restent hors périmètre.
@@ -78,6 +94,83 @@ explicite ; aucune correspondance spéculative n’est tentée.
 
 RFC 8474 OBJECTID, avec MAILBOXID/EMAILID/THREADID éventuels, reste une
 extension future optionnelle.
+
+## Mailboxes multiples
+
+Le modèle de provenance a été étendu sans changement de framing RAW ni du
+schéma de recherche. `imap_mailboxes` est une table de métadonnées observées
+par mailbox; `imap_scan_state` reste la frontière de parcours indépendante.
+Les rows de message de deux mailboxes restent deux occurrences, même lorsque
+leurs octets RAW sont identiques. Une future étude pourra mesurer une
+déduplication physique, mais elle ne doit pas modifier l’identité logique
+observée ici.
+
+La découverte et le filtrage sont exposés par le CLI, par exemple:
+
+```text
+imap-import ... --mailbox INBOX --mailbox Sent
+imap-import ... --all-mailboxes
+```
+
+Les résultats affichent les capacités, le nom serveur, le delimiter, les
+attributs et SPECIAL-USE. Le backend garde `EXAMINE` et `BODY.PEEK[]`; aucune
+commande distante d’écriture n’a été ajoutée.
+
+## Campagne multi-mailbox GreenMail
+
+Une campagne Linux a utilisé GreenMail standalone 2.1.12 avec une CA locale,
+un certificat serveur signé par cette CA et SAN `localhost`, `imap.test` et
+`127.0.0.1`. Le client Memoria a chargé la CA dans `RootCertStore` rustls;
+aucun verifier dangereux n’a été utilisé.
+
+Le serveur a reçu les mailboxes `INBOX`, `Sent`, `Archive`, `Projects`,
+`Projects.Alpha`, `Projects.Beta`, `Empty` et `Caf&AOk-`. GreenMail a annoncé
+un delimiter `.` et aucun attribut SPECIAL-USE. Ses capacités observées
+étaient `IMAP4rev1`, `UIDPLUS`, `IDLE`, `MOVE`, `SORT`, `QUOTA`, `LITERAL+`,
+`SASL-IR` et `XOAUTH2`; ni `IMAP4rev2`, ni `UTF8=ACCEPT`, ni `SPECIAL-USE`
+n’ont été observés.
+
+`Caf&AOk-` est le nom modified UTF-7 envoyé par le client de préparation et
+retourné par `LIST`. Memoria a réutilisé exactement cette valeur pour
+`EXAMINE`; l’ouverture de la mailbox vide a réussi. Cette expérience valide
+la conservation du nom protocolaire, pas encore sa présentation Unicode.
+Nom protocolaire, futur nom d’affichage, delimiter et SPECIAL-USE restent des
+concepts distincts.
+
+La campagne a d’abord créé `Projects`, puis a construit les enfants avec le
+delimiter effectivement retourné (`Projects.Alpha` et `Projects.Beta`).
+`LIST "" "*"` a retourné les trois noms et `LIST "" "Projects.%"` a retourné
+les deux enfants. `EXAMINE "Projects.Alpha"` et `EXAMINE "Projects.Beta"`
+ont réussi. GreenMail n’a pas ajouté `\\HasChildren` ou `\\HasNoChildren` dans
+ses attributs pour cette configuration. Un nom séparé `Projects/with-slash`
+était sélectionnable et confirme que `/` est ici un caractère ordinaire.
+
+Résultats de l’import produit pour cette campagne hiérarchique :
+
+```text
+premier passage : INBOX=1, Projects.Alpha=1,
+                  autres mailboxes sélectionnables vides
+second passage  : raw_fetched=0 et new_messages=0 pour chaque mailbox
+ajout Alpha     : Projects.Alpha raw_fetched=1, autres raw_fetched=0
+occurrences     : 3 (shared dans INBOX puis Alpha, alpha dans Alpha)
+```
+
+Les occurrences `shared` restent des lignes de provenance distinctes et des
+frames séparées; aucune fusion par hash, Message-ID ou sujet n’est effectuée.
+La campagne précédente de duplication avait mesuré 5 occurrences, 3 RAW
+distincts et 2 occurrences dupliquées; cette mesure concernait le cas de
+provenance, pas une hiérarchie `/`.
+La commande garde les frames RAW et l’export EML existant reste fondé sur ces
+octets de référence; l’égalité byte-for-byte de l’export est couverte par la
+primitive EML et ses tests dédiés, tandis que l’expérience multi-mailbox ne
+copie aucun fichier personnel dans le dépôt.
+
+GreenMail n’a pas annoncé SPECIAL-USE; l’interopérabilité de cette extension
+reste donc non mesurée au niveau serveur. Les tests unitaires conservent la
+distinction des attributs SPECIAL-USE.
+
+Le replay Windows de cette nouvelle logique reste pendante : N16PRO répondait
+encore sans établir la connexion SSH au moment de la campagne.
 
 La clé est aussi une contrainte `PRIMARY KEY` SQLite sur
 `imap_messages(source_account, mailbox, uid_validity, uid)` ; le contrôle

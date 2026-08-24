@@ -1,4 +1,4 @@
-use mail_archive_experiment::imap::{sync_imap, ImapConfig};
+use mail_archive_experiment::imap::{sync_imap_mailboxes, ImapConfig};
 use std::env;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -7,6 +7,13 @@ fn option(args: &[String], name: &str) -> Option<String> {
     args.windows(2)
         .find(|pair| pair[0] == name)
         .map(|pair| pair[1].clone())
+}
+
+fn options(args: &[String], name: &str) -> Vec<String> {
+    args.windows(2)
+        .filter(|pair| pair[0] == name)
+        .map(|pair| pair[1].clone())
+        .collect()
 }
 
 fn main() {
@@ -30,7 +37,8 @@ fn main() {
     let username = required("--username");
     let password = required("--password");
     let ca_cert = PathBuf::from(required("--ca-cert"));
-    let mailbox = option(&args, "--mailbox").unwrap_or_else(|| "INBOX".into());
+    let mailboxes = options(&args, "--mailbox");
+    let mailbox = mailboxes.first().cloned().unwrap_or_else(|| "INBOX".into());
     let source_account =
         option(&args, "--source").unwrap_or_else(|| format!("imap:{username}@{host}:{port}"));
     let limit = option(&args, "--limit").map(|value| {
@@ -54,25 +62,57 @@ fn main() {
         password,
         ca_cert,
         mailbox,
+        mailboxes,
+        all_mailboxes: args.iter().any(|arg| arg == "--all-mailboxes"),
         source_account,
         limit,
         timeout: Duration::from_millis(timeout_ms),
     };
-    match sync_imap(&archive, &config) {
-        Ok(stats) => {
-            let indexed = stats.index.as_ref().map(|value| value.indexed).unwrap_or(0);
-            println!(
-                "examined={} raw_fetched={} new_messages={} network_bytes={} archive_bytes_added={} uidvalidity={} uidnext={} frontier_before={} frontier_after={:?} indexed={indexed}",
-                stats.examined,
-                stats.raw_fetched,
-                stats.new_messages,
-                stats.network_bytes,
-                stats.archive_bytes_added,
-                stats.uid_validity,
-                stats.uid_next,
-                stats.frontier_before,
-                stats.frontier_after,
-            );
+    match sync_imap_mailboxes(&archive, &config) {
+        Ok(summary) => {
+            println!("capabilities={:?}", summary.discovery.capabilities);
+            for mailbox in &summary.discovery.mailboxes {
+                println!(
+                    "mailbox={:?} delimiter={:?} selectable={} attributes={:?} special_use={:?}",
+                    mailbox.name,
+                    mailbox.delimiter,
+                    mailbox.selectable,
+                    mailbox.attributes,
+                    mailbox.special_use
+                );
+            }
+            let mut failed = false;
+            for result in summary.results {
+                match result.stats {
+                    Some(stats) => {
+                        let indexed = stats.index.as_ref().map(|value| value.indexed).unwrap_or(0);
+                        println!(
+                            "selected_mailbox={:?} examined={} raw_fetched={} new_messages={} network_bytes={} archive_bytes_added={} uidvalidity={} uidnext={} frontier_before={} frontier_after={:?} indexed={indexed}",
+                            result.mailbox,
+                            stats.examined,
+                            stats.raw_fetched,
+                            stats.new_messages,
+                            stats.network_bytes,
+                            stats.archive_bytes_added,
+                            stats.uid_validity,
+                            stats.uid_next,
+                            stats.frontier_before,
+                            stats.frontier_after,
+                        );
+                    }
+                    None => {
+                        failed = true;
+                        eprintln!(
+                            "mailbox={:?} error={}",
+                            result.mailbox,
+                            result.error.unwrap_or_default()
+                        )
+                    }
+                }
+            }
+            if failed {
+                std::process::exit(1);
+            }
         }
         Err(error) => {
             eprintln!("error={error}");

@@ -531,3 +531,17 @@ résultats d'expérience locale :
   pas utilisés pour calculer la frontière. Le parcours FETCH traite les
   messages un par un.
 - Détails : `experiments/2026-08-22-mail-archive-imap-import.md`.
+## IMAP multi-mailbox
+
+- `LIST` expose les noms protocolaire, delimiter, attributs et SPECIAL-USE sans
+  supposer de séparateur ou de nom d’affichage; ces métadonnées sont conservées
+  dans `imap_mailboxes` comme provenance serveur. Une campagne GreenMail a
+  confirmé un nom modified UTF-7 (`Caf&AOk-`) réutilisable par EXAMINE, mais pas
+  sa présentation Unicode.
+- `imap_scan_state` reste indépendant pour chaque source/mailbox/UIDVALIDITY.
+  Les occurrences d’un même RAW dans plusieurs mailboxes ne sont pas fusionnées;
+  l’identité logique reste mailbox + UIDVALIDITY + UID.
+- Le CLI accepte plusieurs `--mailbox` et `--all-mailboxes`; GreenMail 2.1.12
+  a validé l’import indépendant, la relance sans refetch et l’ajout limité à
+  une mailbox. SPECIAL-USE n’était pas annoncé par ce serveur; le replay
+  Windows reste à effectuer.

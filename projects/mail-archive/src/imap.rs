@@ -1,5 +1,5 @@
 use crate::GmailIndexStats;
-use async_imap::types::Fetch;
+use async_imap::types::{Fetch, NameAttribute};
 use futures::TryStreamExt;
 use rustls::pki_types::{pem::PemObject, CertificateDer, ServerName};
 use std::fmt::Debug;
@@ -21,9 +21,39 @@ pub struct ImapConfig {
     pub password: String,
     pub ca_cert: PathBuf,
     pub mailbox: String,
+    pub mailboxes: Vec<String>,
+    pub all_mailboxes: bool,
     pub source_account: String,
     pub limit: Option<u32>,
     pub timeout: Duration,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImapMailbox {
+    pub name: String,
+    pub delimiter: Option<String>,
+    pub attributes: Vec<String>,
+    pub special_use: Vec<String>,
+    pub selectable: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ImapDiscovery {
+    pub capabilities: Vec<String>,
+    pub mailboxes: Vec<ImapMailbox>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ImapMailboxResult {
+    pub mailbox: String,
+    pub stats: Option<ImapSyncStats>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ImapMultiSyncStats {
+    pub discovery: ImapDiscovery,
+    pub results: Vec<ImapMailboxResult>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -189,6 +219,172 @@ pub fn sync_imap(root: &Path, config: &ImapConfig) -> Result<ImapSyncStats, Imap
     Ok(stats)
 }
 
+pub fn sync_imap_mailboxes(
+    root: &Path,
+    config: &ImapConfig,
+) -> Result<ImapMultiSyncStats, ImapError> {
+    let discovery = discover_mailboxes(config)?;
+    let metadata = crate::create_metadata(&root.join("metadata.sqlite"))
+        .map_err(|error| ImapError::Io(error.to_string()))?;
+    for mailbox in &discovery.mailboxes {
+        crate::upsert_imap_mailbox(
+            &metadata,
+            &config.source_account,
+            &mailbox.name,
+            mailbox.delimiter.as_deref(),
+            &serde_json::to_string(&mailbox.attributes)
+                .map_err(|error| ImapError::Io(error.to_string()))?,
+            &serde_json::to_string(&mailbox.special_use)
+                .map_err(|error| ImapError::Io(error.to_string()))?,
+            mailbox.selectable,
+        )
+        .map_err(|error| ImapError::Io(error.to_string()))?;
+    }
+    drop(metadata);
+    let selected = if config.all_mailboxes {
+        discovery
+            .mailboxes
+            .iter()
+            .filter(|mailbox| mailbox.selectable)
+            .map(|mailbox| mailbox.name.clone())
+            .collect::<Vec<_>>()
+    } else if !config.mailboxes.is_empty() {
+        config.mailboxes.clone()
+    } else {
+        vec![config.mailbox.clone()]
+    };
+    if selected.is_empty() {
+        return Err(ImapError::Config("no selectable mailbox selected".into()));
+    }
+    let known_names = discovery
+        .mailboxes
+        .iter()
+        .map(|mailbox| mailbox.name.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut results = Vec::with_capacity(selected.len());
+    for mailbox in selected {
+        let mut mailbox_config = config.clone();
+        mailbox_config.mailbox = mailbox.clone();
+        mailbox_config.mailboxes.clear();
+        mailbox_config.all_mailboxes = false;
+        let result = if !known_names.contains(mailbox.as_str()) {
+            Err(ImapError::Config(format!(
+                "mailbox not returned by LIST: {mailbox}"
+            )))
+        } else if discovery
+            .mailboxes
+            .iter()
+            .find(|entry| entry.name == mailbox)
+            .is_some_and(|entry| !entry.selectable)
+        {
+            Err(ImapError::Config(format!(
+                "mailbox is not selectable: {mailbox}"
+            )))
+        } else {
+            sync_imap(root, &mailbox_config)
+        };
+        match result {
+            Ok(stats) => results.push(ImapMailboxResult {
+                mailbox,
+                stats: Some(stats),
+                error: None,
+            }),
+            Err(error) => results.push(ImapMailboxResult {
+                mailbox,
+                stats: None,
+                error: Some(error.to_string()),
+            }),
+        }
+    }
+    Ok(ImapMultiSyncStats { discovery, results })
+}
+
+pub fn discover_mailboxes(config: &ImapConfig) -> Result<ImapDiscovery, ImapError> {
+    let runtime = Builder::new_multi_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|error| ImapError::Io(format!("create Tokio runtime: {error}")))?;
+    runtime.block_on(async {
+        let stream = tls_stream(config).await?;
+        let mut client = async_imap::Client::new(stream);
+        timeout(config.timeout, client.read_response())
+            .await
+            .map_err(|_| ImapError::Protocol("greeting timeout".into()))?
+            .map_err(|error| ImapError::Protocol(format!("greeting failed: {error}")))?
+            .ok_or_else(|| ImapError::Protocol("server closed before greeting".into()))?;
+        let (mut session, _) = timeout(
+            config.timeout,
+            client.login_with_capabilities(&config.username, &config.password),
+        )
+        .await
+        .map_err(|_| ImapError::Protocol("login timeout".into()))?
+        .map_err(|(error, _)| ImapError::Protocol(format!("login failed: {error}")))?;
+        let capabilities = timeout(config.timeout, session.capabilities())
+            .await
+            .map_err(|_| ImapError::Protocol("CAPABILITY timeout".into()))?
+            .map_err(|error| ImapError::Protocol(format!("CAPABILITY failed: {error}")))?
+            .iter()
+            .map(|capability| format!("{capability:?}"))
+            .collect::<Vec<_>>();
+        let mut mailboxes = Vec::new();
+        {
+            let mut names = timeout(config.timeout, session.list(None, Some("*")))
+                .await
+                .map_err(|_| ImapError::Protocol("LIST timeout".into()))?
+                .map_err(|error| ImapError::Protocol(format!("LIST failed: {error}")))?;
+            while let Some(name) = timeout(config.timeout, names.try_next())
+                .await
+                .map_err(|_| ImapError::Protocol("LIST response timeout".into()))?
+                .map_err(|error| ImapError::Protocol(format!("LIST response failed: {error}")))?
+            {
+                let attributes = name
+                    .attributes()
+                    .iter()
+                    .map(|attribute| format!("{attribute:?}"))
+                    .collect::<Vec<_>>();
+                let special_use = name
+                    .attributes()
+                    .iter()
+                    .filter_map(special_use_name)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                mailboxes.push(ImapMailbox {
+                    name: name.name().to_owned(),
+                    delimiter: name.delimiter().map(str::to_owned),
+                    selectable: !name
+                        .attributes()
+                        .iter()
+                        .any(|attribute| matches!(attribute, NameAttribute::NoSelect)),
+                    attributes,
+                    special_use,
+                });
+            }
+        }
+        timeout(config.timeout, session.logout())
+            .await
+            .map_err(|_| ImapError::Protocol("logout timeout".into()))?
+            .map_err(|error| ImapError::Protocol(format!("logout failed: {error}")))?;
+        Ok(ImapDiscovery {
+            capabilities,
+            mailboxes,
+        })
+    })
+}
+
+fn special_use_name(attribute: &NameAttribute<'_>) -> Option<&'static str> {
+    match attribute {
+        NameAttribute::All => Some("\\All"),
+        NameAttribute::Archive => Some("\\Archive"),
+        NameAttribute::Drafts => Some("\\Drafts"),
+        NameAttribute::Flagged => Some("\\Flagged"),
+        NameAttribute::Junk => Some("\\Junk"),
+        NameAttribute::Sent => Some("\\Sent"),
+        NameAttribute::Trash => Some("\\Trash"),
+        _ => None,
+    }
+}
+
 async fn fetch_mailbox<F>(
     config: &ImapConfig,
     expected_uid_validity: Option<u32>,
@@ -199,6 +395,21 @@ async fn fetch_mailbox<F>(
 where
     F: FnMut(FetchedMessage) -> Result<(), ImapError>,
 {
+    let stream = tls_stream(config).await?;
+    fetch_session(
+        config,
+        stream,
+        expected_uid_validity,
+        start_uid,
+        limit,
+        on_message,
+    )
+    .await
+}
+
+async fn tls_stream(
+    config: &ImapConfig,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, ImapError> {
     let stream = timeout(
         config.timeout,
         TcpStream::connect((config.host.as_str(), config.port)),
@@ -209,7 +420,6 @@ where
     stream
         .set_nodelay(true)
         .map_err(|error| ImapError::Io(format!("set TCP options: {error}")))?;
-
     let ca = CertificateDer::from_pem_file(&config.ca_cert)
         .map_err(|error| ImapError::Config(format!("read CA certificate: {error}")))?;
     let mut roots = rustls::RootCertStore::empty();
@@ -225,19 +435,10 @@ where
     let connector = TlsConnector::from(Arc::new(tls_config));
     let server_name = ServerName::try_from(config.server_name.clone())
         .map_err(|error| ImapError::Config(format!("invalid TLS server name: {error}")))?;
-    let stream = timeout(config.timeout, connector.connect(server_name, stream))
+    timeout(config.timeout, connector.connect(server_name, stream))
         .await
         .map_err(|_| ImapError::Protocol("TLS handshake timeout".into()))?
-        .map_err(|error| ImapError::Protocol(format!("TLS handshake failed: {error}")))?;
-    fetch_session(
-        config,
-        stream,
-        expected_uid_validity,
-        start_uid,
-        limit,
-        on_message,
-    )
-    .await
+        .map_err(|error| ImapError::Protocol(format!("TLS handshake failed: {error}")))
 }
 
 async fn fetch_session<S>(
@@ -357,6 +558,7 @@ fn fetch_to_owned(fetch: &Fetch, uid_validity: u32) -> Result<FetchedMessage, Im
 
 #[cfg(test)]
 mod tests {
+    use super::{special_use_name, NameAttribute};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -430,5 +632,15 @@ mod tests {
         );
         drop(connection);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn list_attributes_keep_special_use_separate_from_mailbox_name() {
+        assert_eq!(special_use_name(&NameAttribute::Sent), Some("\\Sent"));
+        assert_eq!(special_use_name(&NameAttribute::NoSelect), None);
+        assert_eq!(
+            special_use_name(&NameAttribute::Extension("\\HasChildren".into())),
+            None
+        );
     }
 }

@@ -626,3 +626,15 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
   changement UIDVALIDITY est refusé. Le runner Windows était injoignable pour
   le replay incrémental de cette passe.
 - Rapport : `experiments/2026-08-22-mail-archive-imap-import.md`.
+## 2026-08-24 — Import IMAP multi-mailbox
+
+- Ajouté la découverte `CAPABILITY`/`LIST`, avec delimiter, attributs et
+  SPECIAL-USE conservés séparément dans `imap_mailboxes`.
+- Étendu `imap-import` à plusieurs `--mailbox` et `--all-mailboxes`, sans
+  fusion d’occurrences et avec frontières incrémentales indépendantes.
+- Validé sous Linux avec GreenMail 2.1.12 et une CA dédiée : hiérarchie
+  construite avec le delimiter découvert `.`, `Projects.Alpha`/`.Beta`,
+  relance à zéro et ajout limité à `Projects.Alpha`.
+- LIST a retourné le nom protocolaire modified UTF-7 `Caf&AOk-`, delimiter `.`,
+  sans SPECIAL-USE ni capacité IMAP4rev2/UTF8-ACCEPT. Le replay Windows reste
+  à effectuer, N16PRO n’ayant pas accepté la connexion SSH pendant cette passe.
