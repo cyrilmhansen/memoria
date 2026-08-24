@@ -655,7 +655,7 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
 
 ## 2026-08-24 — Corpus expérimental MDN/DSN
 
-- Durci `experiments/mdn-dsn-corpus-probe/` : 40 messages MIME synthétiques,
+- Durci `experiments/mdn-dsn-corpus-probe/` : 42 messages MIME synthétiques,
   oracles golden générés par spécification mais indépendants de mailparse,
   et mutations qui doivent échouer avec l’oracle inchangé.
 - Vérifié avec `mailparse 0.16.1` la représentation effective des rapports

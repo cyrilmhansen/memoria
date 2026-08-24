@@ -1264,6 +1264,16 @@ mod tests {
     }
 
     #[test]
+    fn canonical_eml_fixture_preserves_crlf_bytes() {
+        const FIXTURE: &[u8] = include_bytes!("../fixtures/mdn-01-displayed-auto-full.eml");
+        assert!(FIXTURE.windows(2).any(|pair| pair == b"\r\n"));
+        assert!(FIXTURE
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| *byte != b'\n' || (index > 0 && FIXTURE[index - 1] == b'\r')));
+    }
+
+    #[test]
     fn mdn_required_fields_and_original_id_rule_are_explicit() {
         for spec in all_specs()
             .into_iter()
