@@ -19,7 +19,6 @@ cargo run -p mail-archive-experiment --bin mail-archive-experiment -- generate -
 cargo run -p mail-archive-experiment --bin mail-archive-experiment -- generate --profile personal --messages 10000 --seed 42 --out /tmp/mail-archive-personal
 cargo run -p mail-archive-experiment --bin mail-archive-experiment -- generate --profile heavy --messages 5000 --seed 42 --out /tmp/mail-archive-heavy
 cargo run -p mail-archive-experiment --bin mail-archive-experiment -- benchmark --messages 100000 --seed 42 --attachment-rate 0 --queries 2 --segment-bytes 67108864 --out /tmp/mail-archive-bench
-cargo run -p mail-archive-experiment --bin mail-archive-experiment -- recover-demo --messages 10 --out /tmp/mail-archive-recovery
 cargo run -p mail-archive-experiment --bin mail-archive-experiment -- cas-benchmark --profile personal --messages 10000 --seed 42 --out /tmp/mail-archive-cas
 cargo test -p mail-archive-experiment
 cargo run -p mail-archive-experiment --bin mail-archive-experiment -- gmail-report --archive /chemin/archive
@@ -157,11 +156,9 @@ active les mesures gzip/zstd, coûteuses sur les gros profils.
 
 - L’IMAP readonly multi-mailbox est disponible via le CLI expérimental, pas
   dans le parcours UI produit.
-- Le cas démontré et sûr est une queue de segment incomplète après les
-  dernières frames valides. `recover_segments` s’arrête actuellement à la
-  première frame invalide et tronque le suffixe du segment ; une corruption
-  centrale peut donc supprimer des frames valides postérieures et reste une
-  dette Tier A.
+- Une queue de segment incomplète peut être inventoriée en lecture seule par
+  A2.1. Aucune opération de troncature physique n’est exposée ; la réparation
+  destructive est différée jusqu’au chantier crash-consistency/publication.
 - L’export EML individuel et batch est disponible et copie les octets RAW ; la
   restauration complète et la migration vers un fournisseur ne sont pas
   implémentées.

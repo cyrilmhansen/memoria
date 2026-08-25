@@ -1529,52 +1529,6 @@ impl ArchiveWriter {
     }
 }
 
-pub fn recover_segments(root: &Path) -> io::Result<(u64, u64)> {
-    let mut recovered = 0;
-    let mut truncated = 0;
-    let mut paths: Vec<_> = fs::read_dir(root)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("arc"))
-        .collect();
-    paths.sort();
-    for path in paths {
-        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
-        let mut valid_end = 0u64;
-        loop {
-            let mut header = [0u8; 32];
-            file.seek(SeekFrom::Start(valid_end))?;
-            match file.read_exact(&mut header) {
-                Ok(()) => {}
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(error) => return Err(error),
-            }
-            if &header[..8] != FRAME_MAGIC {
-                break;
-            }
-            let id = u64::from_le_bytes(header[8..16].try_into().unwrap());
-            let len = u64::from_le_bytes(header[16..24].try_into().unwrap());
-            let checksum = u64::from_le_bytes(header[24..32].try_into().unwrap());
-            if len > 512 * 1024 * 1024 {
-                break;
-            }
-            let mut body = vec![0u8; len as usize];
-            if file.read_exact(&mut body).is_err() || fnv64(&body) != checksum {
-                break;
-            }
-            let _ = id;
-            valid_end += 32 + len;
-            recovered += 1;
-        }
-        let actual = file.metadata()?.len();
-        if valid_end < actual {
-            file.set_len(valid_end)?;
-            truncated += actual - valid_end;
-        }
-    }
-    Ok((recovered, truncated))
-}
-
 fn archive_segment_path(root: &Path, segment_name: &str) -> io::Result<PathBuf> {
     let segment = Path::new(segment_name);
     if segment.is_absolute()
@@ -4155,6 +4109,38 @@ mod tests {
     }
 
     #[test]
+    fn inventory_reads_past_an_unpublished_tail_without_modifying_inputs() {
+        let (root, _, _) = inventory_fixture("read-only-tail");
+        let segment_path = root.join("archive/segment-000000.arc");
+        let sqlite_paths = [
+            root.join("metadata.sqlite"),
+            root.join("metadata.sqlite-wal"),
+            root.join("metadata.sqlite-shm"),
+        ];
+        let mut file = OpenOptions::new().append(true).open(&segment_path).unwrap();
+        file.write_all(&[0u8; 9]).unwrap();
+        drop(file);
+        let before_segment = fs::read(&segment_path).unwrap();
+        let before_sqlite = sqlite_paths
+            .iter()
+            .map(|path| fs::read(path).ok())
+            .collect::<Vec<_>>();
+
+        let result = inventory_records(&root).unwrap();
+        assert_eq!(result.len(), 3);
+        assert!(result
+            .iter()
+            .all(|record| matches!(record.status, RecordInventoryStatus::AvailableValidated)));
+        assert_eq!(fs::read(&segment_path).unwrap(), before_segment);
+        let after_sqlite = sqlite_paths
+            .iter()
+            .map(|path| fs::read(path).ok())
+            .collect::<Vec<_>>();
+        assert_eq!(after_sqlite, before_sqlite);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn gmail_index_updates_incrementally_after_archive_append() {
         let root =
             std::env::temp_dir().join(format!("mail-index-incremental-{}", std::process::id()));
@@ -4840,34 +4826,5 @@ mod tests {
                 })
                 .unwrap();
         }
-    }
-
-    #[test]
-    fn recovery_truncates_an_incomplete_tail() {
-        let root =
-            std::env::temp_dir().join(format!("mail-archive-recovery-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let mut writer = ArchiveWriter::open(&root, 4096).unwrap();
-        let config = CorpusConfig {
-            messages: 1,
-            seed: 11,
-            profile: CorpusProfile::Light,
-            attachment_rate: 0,
-            duplicate_rate: 0,
-            max_attachment_bytes: 4096,
-            measure_compression: false,
-        };
-        writer.append(&generate_message(config, 0)).unwrap();
-        writer.sync().unwrap();
-        drop(writer);
-        let path = root.join("segment-000000.arc");
-        let length = fs::metadata(&path).unwrap().len();
-        let file = OpenOptions::new().write(true).open(&path).unwrap();
-        file.set_len(length + 9).unwrap();
-        drop(file);
-        let (frames, truncated) = recover_segments(&root).unwrap();
-        assert_eq!(frames, 1);
-        assert_eq!(truncated, 9);
-        let _ = fs::remove_dir_all(&root);
     }
 }

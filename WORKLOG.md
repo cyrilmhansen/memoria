@@ -755,3 +755,16 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
 - Contrôles : 68 des 69 tests du crate Memoria passent; le seul échec est le
   test HTML préexistant qui écrit dans `/var/tmp` en lecture seule.
   `cargo check --workspace`, Clippy, fmt et `git diff --check` passent.
+
+## 2026-08-26 — Checkpoint Tier A2.3 : ancien recovery destructif hors service
+
+- `recover_segments`, la commande `recover-demo` et le test garantissant la
+  troncature automatique ont été retirés des surfaces actives.
+- A2.1 reste le diagnostic read-only et A2.2 la reconstruction non destructive
+  des index dérivés. Aucun scanner global au magic et aucune nouvelle fonction
+  de troncature n’ont été ajoutés.
+- Le test d’inventaire avec queue incomplète vérifie que les frames cataloguées
+  restent disponibles et que les segments, `metadata.sqlite`, `metadata.sqlite-wal`
+  et `metadata.sqlite-shm` restent byte-à-byte inchangés lorsqu’ils existent.
+- La réparation physique est différée jusqu’au chantier
+  crash-consistency/publication.

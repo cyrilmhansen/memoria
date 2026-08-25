@@ -55,7 +55,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "gmail-report" => gmail_report(&args, &out)?,
         "gmail-index" => gmail_index(&args, &out)?,
         "search" => search(&args, &out)?,
-        "recover-demo" => recover_demo(&out, config)?,
         "help" | "--help" | "-h" => help(),
         other => return Err(format!("commande inconnue: {other}").into()),
     }
@@ -420,29 +419,6 @@ fn benchmark(
     Ok(())
 }
 
-fn recover_demo(out: &PathBuf, config: CorpusConfig) -> Result<(), Box<dyn std::error::Error>> {
-    if out.exists() {
-        fs::remove_dir_all(out)?;
-    }
-    fs::create_dir_all(out)?;
-    let (stats, _) = build_archive(
-        out,
-        CorpusConfig {
-            messages: config.messages.max(3),
-            ..config
-        },
-        4096,
-    )?;
-    let path = out.join("archive/segment-000000.arc");
-    let original = fs::metadata(&path)?.len();
-    let file = fs::OpenOptions::new().append(true).open(&path)?;
-    file.set_len(original + 17)?;
-    drop(file);
-    let (recovered, truncated) = recover_segments(&out.join("archive"))?;
-    println!("command=recover-demo\nmessages={}\nrecovered_frames={}\ntruncated_bytes={}\narchive_tail_recovered={}", stats.messages, recovered, truncated, truncated == 17);
-    Ok(())
-}
-
 fn help() {
-    println!("mail-archive-experiment\n\ncommands: generate | benchmark | cas-benchmark | gmail-sync | gmail-report | gmail-index | search | recover-demo\noptions: --messages N --seed N --profile light|personal|heavy --queries N --segment-bytes N --attachment-rate P --duplicate-rate P --max-attachment-bytes N --compression --out PATH\ngmail-sync: --archive PATH --credentials PATH --token-dir PATH --account KEY [--max-messages N] [--query GMAIL_QUERY]\ngmail-report: --archive PATH (offline aggregate MIME/checksum report)\ngmail-index: --archive PATH (offline Tantivy build and aggregate workload)\nsearch: --archive PATH QUERY (local Tantivy search)\nGmail sync requests only gmail.readonly and never writes to Gmail.");
+    println!("mail-archive-experiment\n\ncommands: generate | benchmark | cas-benchmark | gmail-sync | gmail-report | gmail-index | search\noptions: --messages N --seed N --profile light|personal|heavy --queries N --segment-bytes N --attachment-rate P --duplicate-rate P --max-attachment-bytes N --compression --out PATH\ngmail-sync: --archive PATH --credentials PATH --token-dir PATH --account KEY [--max-messages N] [--query GMAIL_QUERY]\ngmail-report: --archive PATH (offline aggregate MIME/checksum report)\ngmail-index: --archive PATH (offline Tantivy build and aggregate workload)\nsearch: --archive PATH QUERY (local Tantivy search)\nGmail sync requests only gmail.readonly and never writes to Gmail.");
 }

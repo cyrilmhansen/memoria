@@ -202,15 +202,14 @@ IFilter through an isolated helper. Word COM Automation is not a Memoria
 dependency.
 Extracted text is never stored as a second authoritative attachment copy.
 
-## Storage and recovery model
+## Storage and reconstruction model
 
 The RAW archive is authoritative and append-only. Tantivy and rendered/search
 views are derived. SQLite is a mixed-authority catalogue, as described above:
 
-- the demonstrated safe case is an incomplete tail after the last valid frame;
-  `recover_segments` currently stops at the first invalid frame and truncates
-  the segment suffix, so central corruption can discard valid later frames and
-  remains a Tier A debt;
+- A2.1 inventories RAW/catalogue records read-only and A2.2 reconstructs
+  derived Tantivy state without truncating RAW segments; an incomplete tail is
+  reported without modifying the archive;
 - a missing or incompatible Tantivy index can be reconstructed from the RAW
   archive and catalogue;
 - Gmail source deletion changes local source metadata but does not erase the
@@ -218,11 +217,12 @@ views are derived. SQLite is a mixed-authority catalogue, as described above:
 - attachment parsing, HTML rendering and previews can fail independently
   without changing the archived bytes.
 
-These are the recovery capabilities currently implemented and exercised. They
+These are the diagnostic and reconstruction capabilities currently implemented
+and exercised. They
 do not claim all Tier A guarantees defined in
 [`ASSURANCE.md`](ASSURANCE.md), including complete crash-consistency,
-central-corruption recovery, partial-archive operation or a multi-writer
-contract.
+physical repair, central-corruption recovery, complete product operation from
+an arbitrarily damaged partial archive, or a multi-writer contract.
 
 The archive is intentionally not a mirror that destructively follows Gmail.
 Content-addressed attachment storage was evaluated separately and is not

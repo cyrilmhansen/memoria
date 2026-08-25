@@ -658,3 +658,16 @@ résultats d'expérience locale :
 - **Limite :** A2.2 ne répare ni RAW ni catalogue et ne fournit pas de
   transaction atomique entre les deux stockages dérivés; il garantit leur
   cohérence logique après une exécution réussie de l’indexeur.
+
+## 2026-08-26 — Tier A2.3 : ancien recovery destructif hors service
+
+- **Fait vérifié :** `recover_segments` et la commande expérimentale
+  `recover-demo` ont été retirés de l’API et du CLI actifs. Aucun chemin
+  produit ne tronque désormais automatiquement les segments RAW.
+- **Décision de projet :** A2.1 reste le diagnostic read-only et A2.2 la
+  reconstruction non destructive des index dérivés. Une réparation physique
+  destructive est volontairement différée jusqu’au chantier
+  crash-consistency/publication.
+- **Fait vérifié :** une queue incomplète peut être inventoriée sans modifier
+  les octets des segments ni de `metadata.sqlite` (et de ses fichiers WAL/SHM
+  lorsqu’ils existent).
