@@ -1,9 +1,14 @@
-# mail-archive — expérimentation de stockage et recherche
+# mail-archive — implémentation actuelle de Memoria
 
-Ce crate est un prototype jetable pour mesurer une architecture d’archive
-locale. Il ne contient ni client Gmail métier complet, ni IMAP, ni restauration
-vers un fournisseur. Il contient une UI de recherche/consultation et un
-connecteur Gmail expérimental strictement en lecture seule.
+Ce crate contient l’implémentation actuelle de Memoria : archive locale RAW,
+catalogue SQLite mixte, index Tantivy dérivé, UI de recherche/consultation et
+connecteur Gmail readonly. Il reste en développement et n’est pas encore une
+release stabilisée.
+
+L’import IMAP readonly multi-mailbox existe comme capacité CLI/expérimentale ;
+il n’est pas intégré au parcours UI produit. L’export EML individuel et batch
+est disponible et byte-exact ; la restauration complète ou la migration vers
+un fournisseur ne le sont pas.
 
 ## Exécution
 
@@ -28,7 +33,7 @@ cargo run -p mail-archive-experiment --bin mail-archive-app -- --archive /chemin
 Le connecteur utilise exclusivement le scope
 `https://www.googleapis.com/auth/gmail.readonly`. Il appelle `list`, `get` en
 `format=RAW` et `history`; aucune opération Gmail d’écriture n’est présente
-dans le prototype. Les bytes RAW décodés de base64url sont la représentation
+dans le connecteur. Les bytes RAW décodés de base64url sont la représentation
 faisant autorité, tandis que les IDs Gmail, thread, labels, dates et history IDs
 restent dans le catalogue SQLite.
 
@@ -42,7 +47,7 @@ cargo run -p mail-archive-experiment --bin mail-archive-experiment -- gmail-sync
 
 `--query` accepte une requête Gmail pour borner une expérience. Une clé opaque
 est recommandée pour `--account`. La synchronisation incrémentale utilise le
-`historyId`; si Gmail ne conserve plus cet historique, le prototype repart en
+`historyId`; si Gmail ne conserve plus cet historique, le connecteur repart en
 full sync sans effacer l’archive. Une full sync complète marque les messages
 absents comme supprimés côté source, mais ne supprime jamais leurs frames.
 
@@ -107,10 +112,9 @@ dans un worker. Les RAW et le catalogue sont validés avant que l’interface
 n’affiche l’index comme à jour. Une erreur d’indexation ne supprime pas les
 RAW ; elle est affichée séparément.
 
-Le prototype ne fournit pas encore de client OAuth Google distribué par le
-projet : le développeur doit créer un client **Desktop app** dans Google Cloud
-et sélectionner son fichier JSON dans Memoria. Credentials et tokens restent
-hors de l’archive et hors Git.
+Le projet ne fournit pas de client OAuth Google distribué : le développeur doit
+créer un client **Desktop app** dans Google Cloud et sélectionner son fichier
+JSON dans Memoria. Credentials et tokens restent hors de l’archive et hors Git.
 
 Le chemin de l’archive vient de `--archive` ou de `MAIL_ARCHIVE_PATH`. La
 commande `--benchmark` mesure seulement le contrôleur local (ouverture,
@@ -151,6 +155,16 @@ active les mesures gzip/zstd, coûteuses sur les gros profils.
 
 ## Limites actuelles
 
+- L’IMAP readonly multi-mailbox est disponible via le CLI expérimental, pas
+  dans le parcours UI produit.
+- Le cas démontré et sûr est une queue de segment incomplète après les
+  dernières frames valides. `recover_segments` s’arrête actuellement à la
+  première frame invalide et tronque le suffixe du segment ; une corruption
+  centrale peut donc supprimer des frames valides postérieures et reste une
+  dette Tier A.
+- L’export EML individuel et batch est disponible et copie les octets RAW ; la
+  restauration complète et la migration vers un fournisseur ne sont pas
+  implémentées.
 - Le benchmark compare les mêmes champs recherchables et stocke aussi les
   champs textuels côté Tantivy ; SQLite conserve en plus sa table de contenu
   FTS5 et ses attributs structurés. Les tailles ne sont donc comparables

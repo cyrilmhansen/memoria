@@ -33,9 +33,12 @@ Memoria desktop UI / Slint
       └── system browser for sanitized HTML
 ```
 
-The goal is durable local archiving and fast local search, with future support
-for faithful export or migration. Gmail is never treated as a writable target
-by the current connector.
+The goal is durable local archiving and fast local search. The RAW archive is
+the byte authority; the SQLite catalogue has mixed authority, while search
+indexes and rendered views are derived. Individual and batch
+byte-exact EML export are available; complete restoration or provider migration
+remain future work. Gmail is never treated as a writable target by the current
+connector.
 
 ## Current features
 
@@ -56,10 +59,14 @@ by the current connector.
 - Read messages in an integrated text reader and inspect their metadata.
 - List attachments on demand from the archived MIME, then open them with the
   associated desktop application or save them through a native dialog.
+- Export an individual message or the displayed search results as byte-exact
+  EML files.
 - Request image and PDF previews through desktop thumbnail services when
   available.
 - Use French or English UI text according to the system locale, with Slint
   accessibility and keyboard navigation enabled.
+- Import IMAP readonly mailboxes, including multiple mailboxes, through the
+  experimental CLI; this is not integrated into the product UI workflow.
 
 ## Architecture
 
@@ -69,8 +76,10 @@ line tools; it does not start a CLI subprocess.
 
 - The archive is append-only and segmented. Each validated frame contains the
   original message bytes.
-- SQLite stores message locations and Gmail/source metadata needed for lookup,
-  reconciliation and source state.
+- SQLite is a mixed-authority catalogue: it stores Tier A coordinates,
+  identities and provenance needed for lookup and reconciliation, alongside
+  mutable source state and derived navigation metadata. It is not itself the
+  byte authority and is not wholly disposable in the current design.
 - Tantivy stores a derived, reconstructible search index. Its schema may evolve
   independently from the RAW archive.
 - MIME parsing, text extraction, attachment listing and HTML rendering are
@@ -195,17 +204,25 @@ Extracted text is never stored as a second authoritative attachment copy.
 
 ## Storage and recovery model
 
-The RAW archive is authoritative and append-only. SQLite and Tantivy are
-derived navigation/search structures:
+The RAW archive is authoritative and append-only. Tantivy and rendered/search
+views are derived. SQLite is a mixed-authority catalogue, as described above:
 
-- a damaged or incomplete segment tail can be detected and recovered according
-  to the archive frame checks and recovery code;
+- the demonstrated safe case is an incomplete tail after the last valid frame;
+  `recover_segments` currently stops at the first invalid frame and truncates
+  the segment suffix, so central corruption can discard valid later frames and
+  remains a Tier A debt;
 - a missing or incompatible Tantivy index can be reconstructed from the RAW
   archive and catalogue;
 - Gmail source deletion changes local source metadata but does not erase the
   archived RAW message;
 - attachment parsing, HTML rendering and previews can fail independently
   without changing the archived bytes.
+
+These are the recovery capabilities currently implemented and exercised. They
+do not claim all Tier A guarantees defined in
+[`ASSURANCE.md`](ASSURANCE.md), including complete crash-consistency,
+central-corruption recovery, partial-archive operation or a multi-writer
+contract.
 
 The archive is intentionally not a mirror that destructively follows Gmail.
 Content-addressed attachment storage was evaluated separately and is not
@@ -269,7 +286,7 @@ The next product questions are deliberately limited to durable archive use:
   DOCX support, starting with formats justified by the real corpus;
 - consider automatic/background synchronization after the manual workflow is
   stable;
-- support faithful export/restoration and Gmail-to-Gmail migration workflows;
+- support complete restoration and Gmail-to-Gmail migration workflows;
 - validate and package the native Windows desktop workflow;
 - support multiple Gmail accounts in the product UI;
 - add additional local sources such as MBOX when their requirements are known;
@@ -279,9 +296,11 @@ These are future directions, not current promises.
 
 ## Current limitations
 
-- Gmail is the primary supported source today; other providers are not
-  implemented.
-- There is no complete restoration or write-back workflow to Gmail.
+- Gmail is the primary source integrated into the product UI today. IMAP
+  readonly multi-mailbox import exists as an experimental CLI capability, but
+  other providers are not integrated into the UI workflow.
+- There is no complete restoration or write-back workflow to Gmail; individual
+  and batch byte-exact EML export are already available.
 - Attachment text indexing currently covers text/* parts, PDF where the
   platform provider is available, and DOCX through the registered Windows
   IFilter. Linux DOCX and other Office formats are not indexed; there is no

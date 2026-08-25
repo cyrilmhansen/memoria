@@ -6,8 +6,14 @@ framework partagé.
 
 ## Avant de travailler
 
-- Lire `KNOWLEDGE.md` avant tout travail.
-- Lire `ASSURANCE.md` : il définit les tiers A/B/C, les frontières d’autorité et les exigences de conservation.
+- Pour un cold-start normal, lire dans cet ordre `AGENTS.md`, `README.md`,
+  `ASSURANCE.md`, puis `KNOWLEDGE.md`.
+- `README.md` décrit l’état produit actuel ; `ASSURANCE.md` définit les tiers
+  A/B/C, les frontières d’autorité et les exigences de conservation ;
+  `KNOWLEDGE.md` contient les conclusions techniques durables.
+- Consulter `WORKLOG.md` seulement lorsqu’un historique précis, une décision
+  ancienne ou la chronologie d’une expérience est nécessaire. Ce n’est pas un
+  prérequis de lecture intégrale avant chaque travail.
 - Consulter les notes pertinentes dans `experiments/` avant de rechercher à
   nouveau une solution.
 - Privilégier l'expérience minimale qui permet de trancher une incertitude.
