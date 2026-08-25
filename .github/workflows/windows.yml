@@ -12,6 +12,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo check --workspace
+      - name: Clippy baseline with warnings denied
+        run: cargo clippy -p mail-archive-experiment --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
       - name: Build CI profile
         run: cargo build --profile ci -p mail-archive-experiment --bin mail-archive-app
