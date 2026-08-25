@@ -1,0 +1,1 @@
+{"remote_resources":[{"kind":"image","source":"img-src","url":"https://img.example.invalid/style.png","scheme":"https","host":"img.example.invalid","declared_width":1,"declared_height":2,"hidden":false,"signals":["tiny-dimensions"]}],"local_references":[],"links":[]}

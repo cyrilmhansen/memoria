@@ -683,3 +683,11 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
   directs pour MIME non parsable et multipart/report incohérent.
 - Les MIME non parsables retournent désormais `Unparseable` sans classification
   textuelle ; aucune fonctionnalité produit connexe n’a été modifiée.
+
+## 2026-08-25 — Corpus HTML remote-resource evidence
+
+- Créé `experiments/html-remote-evidence-probe/` avec 30 fixtures HTML et
+  30 golden JSON, entièrement offline.
+- Observé séparément les URLs distantes, références locales, liens et signaux
+  explicables ; aucun jugement de tracking ni modification Memoria.
+- Rapport : `experiments/2026-08-25-html-remote-evidence-corpus.md`.

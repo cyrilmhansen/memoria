@@ -1,0 +1,15 @@
+[package]
+name = "html-remote-evidence-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+ammonia = "4.1.4"
+html5ever = "0.39"
+markup5ever = "0.39"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2.5"

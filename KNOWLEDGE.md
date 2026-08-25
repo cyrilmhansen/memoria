@@ -563,6 +563,17 @@ résultats d'expérience locale :
   `class.subject.detail` sans imposer un catalogue IANA ; les MIME complets
   non parsables sont `Unparseable` plutôt que devinés MDN/DSN. Le corpus compte
   désormais 44 fixtures.
+
+## 2026-08-25 — HTML remote-resource evidence probe
+
+- **Fait vérifié :** l’analyse des ressources distantes doit partir du HTML
+  MIME original, avant réécriture CID et `ammonia`; `ammonia` retire le contenu
+  actif mais peut conserver une URL d’image distante, tandis que la CSP
+  actuelle bloque son chargement automatique.
+- **Décision expérimentale :** séparer les observations déterministes (URL,
+  élément, dimensions, visibilité inline, query) des signaux heuristiques ; ne
+  jamais produire une conclusion `is_tracker` dans cette couche.
+- Détails : `experiments/2026-08-25-html-remote-evidence-corpus.md`.
 ## IMAP multi-mailbox
 
 - `LIST` expose les noms protocolaire, delimiter, attributs et SPECIAL-USE sans
