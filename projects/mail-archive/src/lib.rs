@@ -1661,11 +1661,7 @@ pub fn inventory_records(root: &Path) -> io::Result<Vec<RecordInventory>> {
             Err(error) => {
                 inventory.push(inventory_inconsistent(
                     doc_id,
-                    Some(ArchiveLocation {
-                        segment,
-                        offset: 0,
-                        frame_bytes: 0,
-                    }),
+                    None,
                     format!("catalog offset is invalid: {error}"),
                 ));
                 continue;
@@ -1676,26 +1672,41 @@ pub fn inventory_records(root: &Path) -> io::Result<Vec<RecordInventory>> {
             Err(error) => {
                 inventory.push(inventory_inconsistent(
                     doc_id,
-                    Some(ArchiveLocation {
-                        segment,
-                        offset: 0,
-                        frame_bytes: 0,
-                    }),
+                    None,
                     format!("catalog frame length is invalid: {error}"),
+                ));
+                continue;
+            }
+        };
+        if offset < 0 || frame_bytes < 0 {
+            inventory.push(inventory_inconsistent(
+                doc_id,
+                None,
+                "negative catalogue archive coordinate",
+            ));
+            continue;
+        }
+        let (offset, frame_bytes) = match (u64::try_from(offset), u64::try_from(frame_bytes)) {
+            (Ok(offset), Ok(frame_bytes)) => (offset, frame_bytes),
+            _ => {
+                inventory.push(inventory_inconsistent(
+                    doc_id,
+                    None,
+                    "catalogue archive coordinate does not fit in an archive coordinate",
                 ));
                 continue;
             }
         };
         let location = ArchiveLocation {
             segment,
-            offset: u64::try_from(offset).unwrap_or(0),
-            frame_bytes: u64::try_from(frame_bytes).unwrap_or(0),
+            offset,
+            frame_bytes,
         };
-        if doc_id < 0 || offset < 0 || frame_bytes < 0 {
+        if doc_id < 0 {
             inventory.push(inventory_inconsistent(
                 doc_id,
                 Some(location),
-                "negative catalogue record or archive coordinate",
+                "negative catalogue record id",
             ));
             continue;
         }
@@ -3564,7 +3575,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "atlas-raw-read-{label}-{}-{nonce}",
+            "memoria-raw-read-{label}-{}-{nonce}",
             std::process::id()
         ))
     }
@@ -4005,6 +4016,7 @@ mod tests {
             RecordInventoryStatus::Inconsistent { .. }
         ));
         assert_eq!(result[1].doc_id, 1);
+        assert!(result[1].location.is_none());
         assert!(matches!(
             result[2].status,
             RecordInventoryStatus::AvailableValidated
@@ -4016,6 +4028,7 @@ mod tests {
         drop(catalog);
         let result = inventory_records(&root).unwrap();
         assert_eq!(result[1].doc_id, 1);
+        assert!(result[1].location.is_none());
         assert!(matches!(
             result[1].status,
             RecordInventoryStatus::Inconsistent { .. }
