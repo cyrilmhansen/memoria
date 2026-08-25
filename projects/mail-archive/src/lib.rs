@@ -290,6 +290,9 @@ pub struct GmailIndexStats {
     pub skipped: u64,
     pub removed: u64,
     pub parse_failures: u64,
+    pub raw_unavailable: u64,
+    pub raw_inconsistent: u64,
+    pub partial: bool,
     pub read_us: u128,
     pub parse_us: u128,
     pub index_us: u128,
@@ -2792,8 +2795,36 @@ fn search_filter_values(value: &str) -> Vec<String> {
     values
 }
 
+fn delete_indexed_doc(
+    writer: &mut IndexWriter,
+    fields: TantivyFields,
+    state_transaction: &rusqlite::Transaction<'_>,
+    doc_id: u64,
+) -> io::Result<()> {
+    writer.delete_term(Term::from_field_u64(fields.doc_id, doc_id));
+    state_transaction
+        .execute("DELETE FROM indexed_docs WHERE doc_id=?1", [doc_id as i64])
+        .map_err(sqlite_io)?;
+    Ok(())
+}
+
 pub fn index_gmail_archive(root: &Path) -> io::Result<GmailIndexStats> {
-    index_gmail_archive_with_observer_and_config(root, |_| {}, GmailIndexWriterConfig::default())
+    index_gmail_archive_with_mode_and_observer_and_config(
+        root,
+        |_| {},
+        GmailIndexWriterConfig::default(),
+        GmailIndexMode::Incremental,
+    )
+}
+
+/// Revalidate every present RAW record before rebuilding the derived index.
+pub fn rebuild_gmail_archive(root: &Path) -> io::Result<GmailIndexStats> {
+    index_gmail_archive_with_mode_and_observer_and_config(
+        root,
+        |_| {},
+        GmailIndexWriterConfig::default(),
+        GmailIndexMode::Rebuild,
+    )
 }
 
 /// Indexe l'archive et signale des phases de diagnostic au code expérimental.
@@ -2802,19 +2833,59 @@ pub fn index_gmail_archive_with_observer<F>(root: &Path, observe: F) -> io::Resu
 where
     F: FnMut(&str),
 {
-    index_gmail_archive_with_observer_and_config(root, observe, GmailIndexWriterConfig::default())
+    index_gmail_archive_with_mode_and_observer_and_config(
+        root,
+        observe,
+        GmailIndexWriterConfig::default(),
+        GmailIndexMode::Incremental,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GmailIndexMode {
+    Incremental,
+    Rebuild,
 }
 
 pub fn index_gmail_archive_with_observer_and_config<F>(
     root: &Path,
+    observe: F,
+    writer_config: GmailIndexWriterConfig,
+) -> io::Result<GmailIndexStats>
+where
+    F: FnMut(&str),
+{
+    index_gmail_archive_with_mode_and_observer_and_config(
+        root,
+        observe,
+        writer_config,
+        GmailIndexMode::Incremental,
+    )
+}
+
+fn index_gmail_archive_with_mode_and_observer_and_config<F>(
+    root: &Path,
     mut observe: F,
     writer_config: GmailIndexWriterConfig,
+    mode: GmailIndexMode,
 ) -> io::Result<GmailIndexStats>
 where
     F: FnMut(&str),
 {
     let open_started = Instant::now();
     let (index, fields) = open_or_create_gmail_tantivy(root).map_err(io::Error::other)?;
+    let inventory_by_id: HashMap<u64, RecordInventoryStatus> = if mode == GmailIndexMode::Rebuild {
+        inventory_records(root)?
+            .into_iter()
+            .filter_map(|record| {
+                u64::try_from(record.doc_id)
+                    .ok()
+                    .map(|id| (id, record.status))
+            })
+            .collect()
+    } else {
+        HashMap::new()
+    };
     let mut stats = GmailIndexStats {
         open_us: open_started.elapsed().as_micros(),
         ..Default::default()
@@ -2885,36 +2956,67 @@ where
         let unchanged = known.get(&row.doc_id).is_some_and(|old| {
             (old.1.as_str(), old.2, old.3, old.4.as_str(), old.5.as_str()) == fingerprint
         });
-        if unchanged {
-            stats.skipped += 1;
-            return Ok(());
-        }
-        writer.delete_term(Term::from_field_u64(fields.doc_id, row.doc_id));
         if row.source_state != "present" {
-            state_transaction
-                .execute(
-                    "DELETE FROM indexed_docs WHERE doc_id=?1",
-                    [row.doc_id as i64],
-                )
-                .map_err(sqlite_io)?;
+            if unchanged {
+                stats.skipped += 1;
+                return Ok(());
+            }
+            delete_indexed_doc(&mut writer, fields, &state_transaction, row.doc_id)?;
             stats.removed += 1;
             changed = true;
             return Ok(());
         }
+        if mode == GmailIndexMode::Incremental && unchanged {
+            stats.skipped += 1;
+            return Ok(());
+        }
+        if mode == GmailIndexMode::Rebuild {
+            match inventory_by_id.get(&row.doc_id) {
+                Some(RecordInventoryStatus::AvailableValidated) => {}
+                Some(RecordInventoryStatus::PhysicallyMissing) => {
+                    delete_indexed_doc(&mut writer, fields, &state_transaction, row.doc_id)?;
+                    stats.raw_unavailable += 1;
+                    stats.removed += 1;
+                    changed = true;
+                    return Ok(());
+                }
+                Some(RecordInventoryStatus::Inconsistent { .. }) | None => {
+                    delete_indexed_doc(&mut writer, fields, &state_transaction, row.doc_id)?;
+                    stats.raw_inconsistent += 1;
+                    stats.removed += 1;
+                    changed = true;
+                    return Ok(());
+                }
+            }
+        }
+        writer.delete_term(Term::from_field_u64(fields.doc_id, row.doc_id));
         let read_started = Instant::now();
-        let (record_id, raw) = read_record(&root.join("archive"), &row.location)?;
+        let (record_id, raw) = match read_record(&root.join("archive"), &row.location) {
+            Ok(value) => value,
+            Err(_) => {
+                delete_indexed_doc(&mut writer, fields, &state_transaction, row.doc_id)?;
+                stats.raw_inconsistent += 1;
+                stats.removed += 1;
+                changed = true;
+                return Ok(());
+            }
+        };
         stats.read_us += read_started.elapsed().as_micros();
         if record_id != row.doc_id {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "catalog/archive id mismatch",
-            ));
+            delete_indexed_doc(&mut writer, fields, &state_transaction, row.doc_id)?;
+            stats.raw_inconsistent += 1;
+            stats.removed += 1;
+            changed = true;
+            return Ok(());
         }
         let parse_started = Instant::now();
         let parsed = match parse_gmail_message(&raw, labels_for_index(&row.labels)) {
             Ok(parsed) => parsed,
             Err(_) => {
                 stats.parse_failures += 1;
+                delete_indexed_doc(&mut writer, fields, &state_transaction, row.doc_id)?;
+                stats.removed += 1;
+                changed = true;
                 return Ok(());
             }
         };
@@ -2980,10 +3082,7 @@ where
     if track_current {
         for doc_id in known.keys() {
             if !current.contains(doc_id) {
-                writer.delete_term(Term::from_field_u64(fields.doc_id, *doc_id));
-                state_transaction
-                    .execute("DELETE FROM indexed_docs WHERE doc_id=?1", [*doc_id as i64])
-                    .map_err(sqlite_io)?;
+                delete_indexed_doc(&mut writer, fields, &state_transaction, *doc_id)?;
                 stats.removed += 1;
                 changed = true;
             }
@@ -3010,6 +3109,8 @@ where
         .unwrap_or(0);
     stats.index_us = index_started.elapsed().as_micros();
     stats.index_bytes = directory_bytes(gmail_index_dir(root))?;
+    stats.partial =
+        stats.raw_unavailable > 0 || stats.raw_inconsistent > 0 || stats.parse_failures > 0;
     Ok(stats)
 }
 
@@ -4117,6 +4218,203 @@ mod tests {
             1
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    fn gmail_inventory_fixture(label: &str) -> (PathBuf, Vec<ArchiveLocation>) {
+        let root = std::env::temp_dir().join(format!(
+            "atlas-gmail-index-a2-{label}-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let catalog = create_metadata(&root.join("metadata.sqlite")).unwrap();
+        let mut writer = ArchiveWriter::open(&root.join("archive"), 64 * 1024).unwrap();
+        let mut locations = Vec::new();
+        for (id, term) in ["a2-alpha", "a2-beta", "a2-gamma"].into_iter().enumerate() {
+            let raw = format!(
+                "From: fixture@example.test\r\nTo: reader@example.test\r\nSubject: {term}\r\n\r\n{term}"
+            )
+            .into_bytes();
+            let location = writer.append_raw(id as u64, &raw).unwrap();
+            insert_gmail_metadata(
+                &catalog,
+                "fixture-account",
+                &format!("gmail-a2-{id}"),
+                id as i64,
+                &format!("thread-{id}"),
+                "[\"INBOX\"]",
+                Some(id as i64),
+                Some(&format!("{id}")),
+                &location,
+            )
+            .unwrap();
+            locations.push(location);
+        }
+        writer.sync().unwrap();
+        drop(catalog);
+        drop(writer);
+        (root, locations)
+    }
+
+    fn indexed_doc_ids(root: &Path) -> Vec<u64> {
+        let state = Connection::open(gmail_index_state_path(root)).unwrap();
+        let mut statement = state
+            .prepare("SELECT doc_id FROM indexed_docs ORDER BY doc_id")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .map(|row| row.unwrap() as u64)
+            .collect()
+    }
+
+    fn indexed_search_ids(root: &Path, term: &str) -> Vec<u64> {
+        GmailSearchIndex::open(root)
+            .unwrap()
+            .search(term, 10)
+            .unwrap()
+            .into_iter()
+            .map(|result| result.doc_id)
+            .collect()
+    }
+
+    #[test]
+    fn gmail_index_revalidates_central_corruption_and_recovers_after_repair() {
+        let (root, locations) = gmail_inventory_fixture("central-corruption");
+        let stats = index_gmail_archive(&root).unwrap();
+        assert_eq!(stats.indexed, 3);
+        assert!(!stats.partial);
+        assert_eq!(indexed_doc_ids(&root), vec![0, 1, 2]);
+
+        let segment_path = root.join("archive").join(&locations[1].segment);
+        let before = fs::read(&segment_path).unwrap();
+        let mut corrupted = before.clone();
+        corrupted[locations[1].offset as usize + 32] ^= 1;
+        fs::write(&segment_path, &corrupted).unwrap();
+        let stats = rebuild_gmail_archive(&root).unwrap();
+        assert_eq!(stats.raw_inconsistent, 1);
+        assert_eq!(stats.raw_unavailable, 0);
+        assert!(stats.partial);
+        assert_eq!(indexed_doc_ids(&root), vec![0, 2]);
+        assert_eq!(indexed_search_ids(&root, "a2-alpha"), vec![0]);
+        assert!(indexed_search_ids(&root, "a2-beta").is_empty());
+        assert_eq!(indexed_search_ids(&root, "a2-gamma"), vec![2]);
+
+        fs::write(&segment_path, before).unwrap();
+        let stats = rebuild_gmail_archive(&root).unwrap();
+        assert_eq!(stats.indexed, 3);
+        assert!(!stats.partial);
+        assert_eq!(indexed_doc_ids(&root), vec![0, 1, 2]);
+        assert_eq!(indexed_search_ids(&root, "a2-beta"), vec![1]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gmail_index_incremental_fast_path_defers_post_index_corruption_to_rebuild() {
+        let (root, locations) = gmail_inventory_fixture("incremental-fast-path");
+        index_gmail_archive(&root).unwrap();
+        let stats = index_gmail_archive(&root).unwrap();
+        assert_eq!(stats.skipped, 3);
+        assert_eq!(stats.indexed, 0);
+        assert!(!stats.partial);
+
+        let segment_path = root.join("archive").join(&locations[1].segment);
+        let before = fs::read(&segment_path).unwrap();
+        let mut corrupted = before.clone();
+        corrupted[locations[1].offset as usize + 32] ^= 1;
+        fs::write(&segment_path, corrupted).unwrap();
+        let stats = index_gmail_archive(&root).unwrap();
+        assert_eq!(stats.skipped, 3);
+        assert_eq!(stats.raw_inconsistent, 0);
+        assert!(!stats.partial);
+        assert_eq!(indexed_search_ids(&root, "a2-beta"), vec![1]);
+
+        let stats = rebuild_gmail_archive(&root).unwrap();
+        assert_eq!(stats.raw_inconsistent, 1);
+        assert!(stats.partial);
+        assert_eq!(indexed_doc_ids(&root), vec![0, 2]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gmail_index_is_partial_for_one_missing_segment_and_recovers_after_restore() {
+        let (root, locations) = gmail_inventory_fixture("missing-segment");
+        index_gmail_archive(&root).unwrap();
+        let original_segment = root.join("archive").join(&locations[1].segment);
+        let missing_segment = "segment-000001.arc";
+        fs::copy(
+            &original_segment,
+            root.join("archive").join(missing_segment),
+        )
+        .unwrap();
+        let catalog = Connection::open(root.join("metadata.sqlite")).unwrap();
+        catalog
+            .execute(
+                "UPDATE messages SET segment=?1, archive_offset=0 WHERE doc_id=1",
+                params![missing_segment],
+            )
+            .unwrap();
+        drop(catalog);
+        fs::remove_file(root.join("archive").join(missing_segment)).unwrap();
+
+        let stats = rebuild_gmail_archive(&root).unwrap();
+        assert_eq!(stats.raw_unavailable, 1);
+        assert!(stats.partial);
+        assert_eq!(indexed_doc_ids(&root), vec![0, 2]);
+        assert_eq!(indexed_search_ids(&root, "a2-alpha"), vec![0]);
+        assert_eq!(indexed_search_ids(&root, "a2-gamma"), vec![2]);
+
+        let catalog = Connection::open(root.join("metadata.sqlite")).unwrap();
+        catalog
+            .execute(
+                "UPDATE messages SET segment=?1, archive_offset=?2, frame_bytes=?3 WHERE doc_id=1",
+                params![
+                    locations[1].segment,
+                    locations[1].offset as i64,
+                    locations[1].frame_bytes as i64
+                ],
+            )
+            .unwrap();
+        drop(catalog);
+        let stats = rebuild_gmail_archive(&root).unwrap();
+        assert_eq!(stats.indexed, 3);
+        assert!(!stats.partial);
+        assert_eq!(indexed_doc_ids(&root), vec![0, 1, 2]);
+        assert_eq!(indexed_search_ids(&root, "a2-beta"), vec![1]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gmail_index_parse_failure_removes_tantivy_and_state_together() {
+        let (root, _locations) = gmail_inventory_fixture("parse-failure");
+        index_gmail_archive(&root).unwrap();
+        let mut writer = ArchiveWriter::open(&root.join("archive"), 64 * 1024).unwrap();
+        let malformed = b"Content-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n\r\n%%%";
+        let malformed_location = writer.append_raw(1, malformed).unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+        let catalog = Connection::open(root.join("metadata.sqlite")).unwrap();
+        catalog
+            .execute(
+                "UPDATE messages SET segment=?1, archive_offset=?2, frame_bytes=?3 WHERE doc_id=1",
+                params![
+                    malformed_location.segment,
+                    malformed_location.offset as i64,
+                    malformed_location.frame_bytes as i64
+                ],
+            )
+            .unwrap();
+        drop(catalog);
+
+        let stats = index_gmail_archive(&root).unwrap();
+        assert_eq!(stats.parse_failures, 1);
+        assert_eq!(stats.raw_unavailable, 0);
+        assert_eq!(stats.raw_inconsistent, 0);
+        assert!(stats.partial);
+        assert_eq!(indexed_doc_ids(&root), vec![0, 2]);
+        assert!(indexed_search_ids(&root, "a2-beta").is_empty());
+        assert_eq!(indexed_search_ids(&root, "a2-gamma"), vec![2]);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

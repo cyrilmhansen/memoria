@@ -641,3 +641,20 @@ résultats d'expérience locale :
 - **Limite :** A2.1 inventorie et signale; il ne répare pas une archive, ne
   reconstruit pas le catalogue et ne résout pas l’attribution d’une
   incohérence.
+
+## 2026-08-25 — Tier A2.2 : indexation Tantivy d’une archive partielle
+
+- **Fait vérifié :** `rebuild_gmail_archive` revalide chaque RAW `present` via
+  `inventory_records`, même lorsque `indexed_docs` décrit une entrée inchangée.
+  Le chemin normal `index_gmail_archive`, appelé après les synchronisations
+  Gmail/IMAP, conserve le fast-path des fingerprints inchangés.
+- **Fait vérifié :** une frame manquante ou incohérente est supprimée de
+  Tantivy et de `indexed_docs` pour ce seul record; les records suivants sont
+  encore indexés. Un échec de parsing applique la même suppression cohérente.
+- **Fait vérifié :** `GmailIndexStats` distingue `raw_unavailable`,
+  `raw_inconsistent` et `parse_failures`; `partial` est vrai dès qu’un record
+  `present` n’a pas pu être indexé. Une archive saine testée produit
+  `partial=false`.
+- **Limite :** A2.2 ne répare ni RAW ni catalogue et ne fournit pas de
+  transaction atomique entre les deux stockages dérivés; il garantit leur
+  cohérence logique après une exécution réussie de l’indexeur.

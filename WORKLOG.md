@@ -737,3 +737,21 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
   `metadata.sqlite-shm` avant/après l’inventaire.
 - Commande de reproduction ciblée :
   `cargo test -p mail-archive-experiment inventory_ -- --nocapture`.
+
+## 2026-08-25 — Implémentation A2.2 : indexation Tantivy partielle
+
+- Le chemin incrémental `index_gmail_archive`, appelé après les
+  synchronisations Gmail/IMAP, conserve le fast-path pour les fingerprints
+  inchangés. `rebuild_gmail_archive` revalide tous les RAW `present` via
+  `inventory_records`; les corruptions postérieures à l’indexation sont ainsi
+  détectées explicitement en mode rebuild.
+- Les suppressions Tantivy et `indexed_docs` passent par le même chemin local
+  pour les RAW indisponibles/incohérents, les mismatches d’ID, les records
+  supprimés et les erreurs de parsing.
+- Statistiques ajoutées : RAW indisponible, RAW incohérent et index partiel.
+- Tests ajoutés : corruption centrale avec voisins recherchables,
+  segment manquant, restauration/réindexation et échec de parsing avec
+  cohérence exacte de Tantivy et `indexed_docs`.
+- Contrôles : 68 des 69 tests du crate Memoria passent; le seul échec est le
+  test HTML préexistant qui écrit dans `/var/tmp` en lecture seule.
+  `cargo check --workspace`, Clippy, fmt et `git diff --check` passent.
