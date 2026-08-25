@@ -655,7 +655,7 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
 
 ## 2026-08-24 — Corpus expérimental MDN/DSN
 
-- Durci `experiments/mdn-dsn-corpus-probe/` : 42 messages MIME synthétiques,
+- Durci `experiments/mdn-dsn-corpus-probe/` : 44 messages MIME synthétiques,
   oracles golden générés par spécification mais indépendants de mailparse,
   et mutations qui doivent échouer avec l’oracle inchangé.
 - Vérifié avec `mailparse 0.16.1` la représentation effective des rapports
@@ -672,5 +672,14 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
 
 - Ajouté `delivery_report::analyze_delivery_report` dans le crate
   `mail-archive-experiment`, sans changement de stockage ou d’index.
-- Les tests produit lisent directement les 42 `.eml` et `.expected.json` du
+- Les tests produit lisent directement les 44 `.eml` et `.expected.json` du
   corpus commité et valident Ordinary, MDN, DSN, Malformed et Unsupported.
+
+## 2026-08-25 — Hardening parser MDN/DSN
+
+- Étendu la syntaxe Status DSN, l’OWS/modifiers de Disposition MDN et
+  l’unfolding des champs pliés.
+- Ajouté deux golden fixtures ciblées, portant le corpus à 44, et des tests
+  directs pour MIME non parsable et multipart/report incohérent.
+- Les MIME non parsables retournent désormais `Unparseable` sans classification
+  textuelle ; aucune fonctionnalité produit connexe n’a été modifiée.

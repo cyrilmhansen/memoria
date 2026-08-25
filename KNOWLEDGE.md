@@ -538,8 +538,8 @@ résultats d'expérience locale :
   `multipart/report` et ses sous-parties, mais ne fournit pas de modèle
   sémantique MDN/DSN : les champs et groupes destinataires doivent être
   interprétés par une couche dédiée au-dessus de `ParsedMail`.
-- **Décision expérimentale :** conserver un corpus synthétique de 42 fixtures
-  (14 MDN, 13 DSN, 11 négatifs, 4 RFC 6533 prospectives) ; les oracles sont
+- **Décision expérimentale :** conserver un corpus synthétique de 44 fixtures
+  (15 MDN, 14 DSN, 11 négatifs, 4 RFC 6533 prospectives) ; les oracles sont
   indépendants du modèle mailparse mais générés depuis les mêmes spécifications
   déterministes que les `.eml`. Les tests de mutation vérifient leur pouvoir
   discriminant. Les messages textuellement similaires sans structure MIME
@@ -553,12 +553,16 @@ résultats d'expérience locale :
 ## 2026-08-25 — Parser produit MDN/DSN initial
 
 - **Fait vérifié :** `delivery_report::analyze_delivery_report` analyse les
-  MDN/DSN classiques démontrés par les 42 golden fixtures, conserve séparés
+  MDN/DSN classiques démontrés par les 44 golden fixtures, conserve séparés
   les champs DSN per-message/per-destinataire, et classe les quatre types
   RFC 6533 comme `Unsupported`.
 - **Décision :** cette API reste une analyse isolée du RAW ; elle ne corrèle
   pas de message, ne modifie ni catalogue ni index, et ne traite pas
   l’authenticité DKIM/SPF.
+- **Fait vérifié :** les statuts DSN valident la syntaxe extensible
+  `class.subject.detail` sans imposer un catalogue IANA ; les MIME complets
+  non parsables sont `Unparseable` plutôt que devinés MDN/DSN. Le corpus compte
+  désormais 44 fixtures.
 ## IMAP multi-mailbox
 
 - `LIST` expose les noms protocolaire, delimiter, attributs et SPECIAL-USE sans

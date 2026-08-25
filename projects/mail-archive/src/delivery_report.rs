@@ -19,6 +19,9 @@ pub enum DeliveryReportAnalysis {
         kind: DeliveryReportKind,
         reason: String,
     },
+    Unparseable {
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -77,6 +80,7 @@ impl Fields {
         let mut fields: Vec<(String, String)> = Vec::new();
         for line in body.replace("\r\n", "\n").lines() {
             if (line.starts_with(' ') || line.starts_with('\t')) && !fields.is_empty() {
+                fields.last_mut().unwrap().1.push(' ');
                 fields.last_mut().unwrap().1.push_str(line.trim());
             } else if let Some((name, value)) = line.split_once(':') {
                 fields.push((name.trim().to_ascii_lowercase(), value.trim().to_string()));
@@ -97,10 +101,9 @@ pub fn analyze_delivery_report(raw: &[u8]) -> DeliveryReportAnalysis {
     let parsed = match parse_mail(raw) {
         Ok(parsed) => parsed,
         Err(error) => {
-            return DeliveryReportAnalysis::Malformed {
-                kind: kind_from_bytes(raw).unwrap_or(DeliveryReportKind::Dsn),
+            return DeliveryReportAnalysis::Unparseable {
                 reason: format!("MIME parse failed: {error}"),
-            }
+            };
         }
     };
 
@@ -171,7 +174,10 @@ pub fn analyze_delivery_report(raw: &[u8]) -> DeliveryReportAnalysis {
             kind_from_report_type(report_type.as_deref()).unwrap_or(DeliveryReportKind::Dsn),
             "RFC 6533 global report type is not implemented",
         ),
-        _ => DeliveryReportAnalysis::Ordinary,
+        _ => malformed(
+            kind_from_report_type(report_type.as_deref()).unwrap_or(DeliveryReportKind::Dsn),
+            "multipart/report has an unexpected structured report part",
+        ),
     }
 }
 
@@ -309,14 +315,16 @@ fn parse_disposition(value: &str) -> Option<MdnDisposition> {
     let mut sections = value.split(';').map(str::trim);
     let action = sections.next()?.to_ascii_lowercase();
     let disposition = sections.next()?.to_ascii_lowercase();
-    let (action_mode, sending_mode) = action.split_once('/')?;
+    let (action_mode, sending_mode) = action
+        .split_once('/')
+        .map(|(mode, sending)| (mode.trim(), sending.trim()))?;
     if !matches!(action_mode, "automatic-action" | "manual-action")
         || !matches!(sending_mode, "mdn-sent-automatically" | "mdn-sent-manually")
     {
         return None;
     }
     let mut disposition_parts = disposition.split('/');
-    let disposition_type = disposition_parts.next()?.to_string();
+    let disposition_type = disposition_parts.next()?.trim().to_string();
     if !matches!(
         disposition_type.as_str(),
         "displayed" | "deleted" | "processed" | "dispatched"
@@ -327,7 +335,12 @@ fn parse_disposition(value: &str) -> Option<MdnDisposition> {
         action_mode: action_mode.to_string(),
         sending_mode: sending_mode.to_string(),
         disposition_type,
-        modifiers: disposition_parts.map(str::to_string).collect(),
+        modifiers: disposition_parts
+            .flat_map(|part| part.split(','))
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(str::to_string)
+            .collect(),
     })
 }
 
@@ -340,12 +353,20 @@ fn strip_service_prefix(value: String) -> String {
 
 fn reasonable_status(value: &str) -> bool {
     let mut parts = value.split('.');
-    match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(class), Some(subject), Some(detail), None) => [class, subject, detail]
-            .into_iter()
-            .all(|part| part.len() == 1 && part.as_bytes()[0].is_ascii_digit()),
-        _ => false,
-    }
+    let (Some(class), Some(subject), Some(detail), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    matches!(class, "2" | "4" | "5")
+        && valid_status_component(subject)
+        && valid_status_component(detail)
+}
+
+fn valid_status_component(value: &str) -> bool {
+    (1..=3).contains(&value.len())
+        && value.as_bytes().iter().all(u8::is_ascii_digit)
+        && (value.len() == 1 || !value.starts_with('0'))
 }
 
 fn has_subpart_type(parsed: &ParsedMail<'_>, mime: &str) -> bool {
@@ -360,17 +381,6 @@ fn kind_from_report_type(value: Option<&str>) -> Option<DeliveryReportKind> {
         Some("disposition-notification") => Some(DeliveryReportKind::Mdn),
         Some("delivery-status") => Some(DeliveryReportKind::Dsn),
         _ => None,
-    }
-}
-
-fn kind_from_bytes(raw: &[u8]) -> Option<DeliveryReportKind> {
-    let lower = String::from_utf8_lossy(raw).to_ascii_lowercase();
-    if lower.contains("disposition-notification") {
-        Some(DeliveryReportKind::Mdn)
-    } else if lower.contains("delivery-status") {
-        Some(DeliveryReportKind::Dsn)
-    } else {
-        None
     }
 }
 
@@ -556,6 +566,103 @@ mod tests {
             b"Subject: Delivery Status Notification\r\n\r\nUndelivered mail and Read receipt.\r\n",
         );
         assert_eq!(result, DeliveryReportAnalysis::Ordinary);
+    }
+
+    fn dsn_with_status(status: &str) -> Vec<u8> {
+        format!(
+            "Content-Type: multipart/report; report-type=delivery-status; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nsummary\r\n--b\r\nContent-Type: message/delivery-status\r\n\r\nReporting-MTA: dns; mta.example.invalid\r\n\r\nFinal-Recipient: rfc822; recipient@example.invalid\r\nAction: failed\r\nStatus: {status}\r\n\r\n--b--\r\n"
+        )
+        .into_bytes()
+    }
+
+    fn mdn_with_disposition(disposition: &str) -> Vec<u8> {
+        format!(
+            "Content-Type: multipart/report; report-type=disposition-notification; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nsummary\r\n--b\r\nContent-Type: message/disposition-notification\r\n\r\nFinal-Recipient: rfc822; recipient@example.invalid\r\nDisposition: {disposition}\r\n\r\n--b--\r\n"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn status_syntax_accepts_extensible_three_part_codes() {
+        for status in ["5.7.26", "2.1.23", "4.0.0"] {
+            assert!(matches!(
+                analyze_delivery_report(&dsn_with_status(status)),
+                DeliveryReportAnalysis::Dsn(_)
+            ));
+        }
+        for status in ["9.1.1", "5.01.1", "5.1.001", "5.1234.1"] {
+            assert!(matches!(
+                analyze_delivery_report(&dsn_with_status(status)),
+                DeliveryReportAnalysis::Malformed {
+                    kind: DeliveryReportKind::Dsn,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn mdn_disposition_allows_ows_and_separates_modifiers() {
+        for disposition in [
+            "manual-action / MDN-sent-manually ; displayed",
+            "automatic-action/MDN-sent-automatically ; processed / error",
+            "automatic-action / MDN-sent-automatically ; displayed / error , x-corpus-extension",
+        ] {
+            assert!(matches!(
+                analyze_delivery_report(&mdn_with_disposition(disposition)),
+                DeliveryReportAnalysis::Mdn(_)
+            ));
+        }
+        let result = analyze_delivery_report(&mdn_with_disposition(
+            "automatic-action / MDN-sent-automatically ; displayed / error , x-corpus-extension",
+        ));
+        let DeliveryReportAnalysis::Mdn(report) = result else {
+            panic!("unexpected result: {result:?}");
+        };
+        assert_eq!(report.disposition.action_mode, "automatic-action");
+        assert_eq!(report.disposition.sending_mode, "mdn-sent-automatically");
+        assert_eq!(
+            report.disposition.modifiers,
+            ["error", "x-corpus-extension"]
+        );
+    }
+
+    #[test]
+    fn unparseable_mime_does_not_classify_by_text() {
+        let result = analyze_delivery_report(b"Content-Type: text/plain\r\n\rdelivery-status");
+        assert!(matches!(result, DeliveryReportAnalysis::Unparseable { .. }));
+    }
+
+    #[test]
+    fn report_with_incoherent_second_part_is_malformed() {
+        let raw = b"Content-Type: multipart/report; report-type=delivery-status; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nnot a delivery status part\r\n--b--\r\n";
+        assert!(matches!(
+            analyze_delivery_report(raw),
+            DeliveryReportAnalysis::Malformed {
+                kind: DeliveryReportKind::Dsn,
+                ..
+            }
+        ));
+        let raw = b"Content-Type: multipart/report; report-type=disposition-notification; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nnot an MDN part\r\n--b--\r\n";
+        assert!(matches!(
+            analyze_delivery_report(raw),
+            DeliveryReportAnalysis::Malformed {
+                kind: DeliveryReportKind::Mdn,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn folded_fields_preserve_a_separator() {
+        let raw = b"Content-Type: multipart/report; report-type=delivery-status; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nsummary\r\n--b\r\nContent-Type: message/delivery-status\r\n\r\nReporting-MTA: dns; mta.example.invalid\r\n\r\nFinal-Recipient: rfc822; recipient@example.invalid\r\nAction: failed\r\nStatus: 5.1.1\r\nDiagnostic-Code: smtp; 550 mailbox\r\n unavailable\r\n\r\n--b--\r\n";
+        let DeliveryReportAnalysis::Dsn(report) = analyze_delivery_report(raw) else {
+            panic!("unexpected result");
+        };
+        assert_eq!(
+            report.recipients[0].diagnostic_code.as_deref(),
+            Some("550 mailbox unavailable")
+        );
     }
 
     #[test]

@@ -1,0 +1,11 @@
+{
+  "case": "mdn-15-ows-modifiers",
+  "kind": "mdn",
+  "validity": "valid",
+  "original_message_id": null,
+  "recipients": [
+    {"original_recipient": null, "final_recipient": "recipient@example.invalid", "action": "automatic-action/MDN-sent-automatically; displayed/error/x-corpus-extension", "status": null, "diagnostic_code": null, "extra_fields": {}}
+  ],
+  "action": "automatic-action/MDN-sent-automatically; displayed/error/x-corpus-extension",
+  "message_fields": {}
+}

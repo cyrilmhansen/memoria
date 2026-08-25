@@ -19,7 +19,7 @@ deterministic. No real mailbox data, credentials, or personal content is used.
 
 ## Corpus
 
-The permanent corpus contains exactly 42 `.eml` files and 42 checked
+The permanent corpus contains exactly 44 `.eml` files and 44 checked
 `.expected.json` golden oracles. They are independent of the mailparse data
 model, but are generated from the same deterministic fixture specifications as
 the `.eml` files; they are not an independently authored second corpus.
@@ -28,8 +28,8 @@ the unchanged golden values.
 
 | Category | Count | Validity split |
 | --- | ---: | --- |
-| MDN | 14 | valid |
-| DSN | 13 | valid |
+| MDN | 15 | valid |
+| DSN | 14 | valid |
 | Human-looking negatives and malformed reports | 11 | 4 ordinary valid, 1 unsupported MDN, 2 malformed DSN (incoherent structure and missing `Reporting-MTA`), 1 isolated malformed MDN, 2 malformed reports, 1 malformed DSN with missing required fields |
 | RFC 6533 prospective cases | 4 | unsupported (2 DSN, 2 MDN) |
 
@@ -95,12 +95,12 @@ cargo run --offline --manifest-path experiments/mdn-dsn-corpus-probe/Cargo.toml 
   experiments/mdn-dsn-corpus-probe --dump-mailparse
 ```
 
-The checker passes all 42 fixtures:
+The checker passes all 44 fixtures:
 
 ```text
-checked=42 counts={
-  "dsn malformed": 4, "dsn unsupported": 2, "dsn valid": 13,
-  "mdn malformed": 2, "mdn unsupported": 3, "mdn valid": 14,
+checked=44 counts={
+  "dsn malformed": 4, "dsn unsupported": 2, "dsn valid": 14,
+  "mdn malformed": 2, "mdn unsupported": 3, "mdn valid": 15,
   "ordinary valid": 4
 }
 ```
@@ -159,10 +159,10 @@ Correlation is deliberately narrow:
 
 ## Result and limits
 
-**Fact verified:** mailparse is sufficient for the first MIME-tree inspection,
-but it does not provide a semantic MDN/DSN model. A future product parser will
-need a small layer above `ParsedMail` for report-type validation, MDN field
-rules, DSN per-message/per-recipient grouping, and RFC 6533 policy.
+**Fact verified:** mailparse is sufficient for the MIME-tree inspection, but it
+does not provide a semantic MDN/DSN model. The product parser now supplies the
+small layer above `ParsedMail` for report-type validation, MDN field rules,
+DSN per-message/per-recipient grouping, and RFC 6533 policy.
 
 **Fact verified:** MDN validation checks `Final-Recipient` and `Disposition`;
 `Original-Message-ID` is expected exactly when the original message had a
@@ -181,3 +181,17 @@ bounded experiment.
 **Open limitation:** RFC 6533 fixtures are prospective and classified as
 unsupported here; no claim is made about production internationalized-report
 support.
+
+## Product-parser hardening
+
+The product parser extends the corpus with two golden fixtures, bringing the
+total to 44: one DSN exercises the valid extensible statuses `5.7.26`,
+`2.1.23`, and `4.0.0`, and one MDN exercises optional whitespace and comma/
+slash-separated modifiers. Direct regression tests cover invalid status
+syntax (`9.1.1`, leading zeroes, and overlong components), folded-field
+unfolding, both MDN and DSN reports with an incoherent second part, and a
+non-parseable MIME document whose bytes merely mention delivery-status.
+
+An unparseable complete MIME input is now reported as `Unparseable { reason }`;
+the parser no longer guesses MDN or DSN from text. Structurally recognizable
+but invalid reports remain `Malformed` with their known kind.

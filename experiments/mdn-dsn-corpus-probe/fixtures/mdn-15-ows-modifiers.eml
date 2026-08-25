@@ -1,0 +1,18 @@
+From: notifier@example.invalid
+To: sender@example.invalid
+Subject: Synthetic mdn-15-ows-modifiers
+Message-ID: <mdn-15-ows-modifiers@example.invalid>
+MIME-Version: 1.0
+Content-Type: multipart/report; report-type=disposition-notification; boundary="report-mdn-15-ows-modifiers"
+
+--report-mdn-15-ows-modifiers
+Content-Type: text/plain; charset=utf-8
+
+Synthetic disposition whitespace report.
+--report-mdn-15-ows-modifiers
+Content-Type: message/disposition-notification
+
+Final-Recipient: rfc822; recipient@example.invalid
+Disposition: automatic-action / MDN-sent-automatically ; displayed / error , x-corpus-extension
+
+--report-mdn-15-ows-modifiers--

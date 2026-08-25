@@ -1,0 +1,13 @@
+{
+  "case": "dsn-14-status-boundaries",
+  "kind": "dsn",
+  "validity": "valid",
+  "original_message_id": null,
+  "recipients": [
+    {"original_recipient": null, "final_recipient": "five@example.invalid", "action": "failed", "status": "5.7.26", "diagnostic_code": null, "extra_fields": {}},
+    {"original_recipient": null, "final_recipient": "two@example.invalid", "action": "delivered", "status": "2.1.23", "diagnostic_code": null, "extra_fields": {}},
+    {"original_recipient": null, "final_recipient": "four@example.invalid", "action": "delayed", "status": "4.0.0", "diagnostic_code": null, "extra_fields": {"will-retry-until": "Thu, 21 Aug 2026 11:00:00 +0000"}}
+  ],
+  "action": null,
+  "message_fields": {"reporting-mta": "dns; mta.example.invalid"}
+}
