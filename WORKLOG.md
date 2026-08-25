@@ -717,3 +717,8 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
 - Adopté [`ASSURANCE.md`](ASSURANCE.md), version 0.2, comme spécification de
   référence pour la criticité, les frontières d’autorité et les exigences de
   conservation de Memoria.
+
+## 2026-08-25 — Checkpoint Tier A1
+
+- A1 lecture RAW autoritative clôturé dans
+  `6537af7d4837c0d849d53ea602f6c1b6f4e50cbd`.

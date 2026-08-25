@@ -608,3 +608,17 @@ résultats d'expérience locale :
   les FLAGS sont restées sans `\\Seen`.
 - La validation native `cargo check --workspace` et `cargo test --workspace`
   a passé sur le clone au commit `0f348371515d1e57b241894e2a767019541750e0`.
+
+## 2026-08-25 — Tier A1 : lecture RAW autoritative
+
+- **Fait vérifié :** depuis le commit
+  `6537af7d4837c0d849d53ea602f6c1b6f4e50cbd`, la lecture vérifie que l’ID
+  contenu dans la frame correspond au record demandé.
+- **Fait vérifié :** les coordonnées de segment, offset et `frame_bytes` sont
+  validées avant lecture ; les longueurs stockées sont confrontées aux bornes
+  physiques réelles avant allocation, et la réservation du RAW est faillible.
+- **Décision de projet :** aucune limite maximale nouvelle n’a été ajoutée au
+  format historique.
+- **État :** A1 est clôturé. Cette correction ne résout ni le recovery, ni la
+  crash-consistency, ni le multi-writer, ni la reconstruction après perte
+  partielle.
