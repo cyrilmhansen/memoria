@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Bound;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 use tantivy::collector::TopDocs;
 use tantivy::indexer::{IndexWriterOptions, NoMergePolicy};
@@ -36,6 +36,7 @@ pub use delivery_report::{
 
 pub const DEFAULT_SEED: u64 = 0x4d_41_49_4c_41_52_43;
 const FRAME_MAGIC: &[u8; 8] = b"MAARC001";
+const FRAME_HEADER_BYTES: u64 = 32;
 
 #[derive(Clone, Debug)]
 pub struct Attachment {
@@ -1548,7 +1549,46 @@ pub fn recover_segments(root: &Path) -> io::Result<(u64, u64)> {
 }
 
 pub fn read_record(root: &Path, location: &ArchiveLocation) -> io::Result<(u64, Vec<u8>)> {
-    let mut file = File::open(root.join(&location.segment))?;
+    let segment = Path::new(&location.segment);
+    if segment.is_absolute()
+        || segment
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+        || !location.segment.starts_with("segment-")
+        || !location.segment.ends_with(".arc")
+        || location
+            .segment
+            .strip_prefix("segment-")
+            .and_then(|value| value.strip_suffix(".arc"))
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_none()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid archive segment coordinate",
+        ));
+    }
+    if location.frame_bytes < FRAME_HEADER_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid archive frame length coordinate",
+        ));
+    }
+
+    let path = root.join(segment);
+    let file_len = fs::metadata(&path)?.len();
+    let coordinate_end = location
+        .offset
+        .checked_add(location.frame_bytes)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "archive coordinate overflow"))?;
+    if location.offset > file_len || coordinate_end > file_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "archive coordinate is outside the segment",
+        ));
+    }
+
+    let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(location.offset))?;
     let mut header = [0u8; 32];
     file.read_exact(&mut header)?;
@@ -1561,7 +1601,32 @@ pub fn read_record(root: &Path, location: &ArchiveLocation) -> io::Result<(u64, 
     let id = u64::from_le_bytes(header[8..16].try_into().unwrap());
     let len = u64::from_le_bytes(header[16..24].try_into().unwrap());
     let checksum = u64::from_le_bytes(header[24..32].try_into().unwrap());
-    let mut body = vec![0u8; len as usize];
+    let available_body_bytes = file_len - location.offset - FRAME_HEADER_BYTES;
+    if len > available_body_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "archive frame body exceeds the segment",
+        ));
+    }
+    let expected_frame_bytes = FRAME_HEADER_BYTES.checked_add(len).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "archive frame length overflow")
+    })?;
+    if location.frame_bytes != expected_frame_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "archive frame length does not match catalog coordinate",
+        ));
+    }
+    let body_len = usize::try_from(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "archive frame body length does not fit in memory",
+        )
+    })?;
+    let mut body = Vec::new();
+    body.try_reserve_exact(body_len)
+        .map_err(|error| io::Error::other(format!("archive frame allocation failed: {error}")))?;
+    body.resize(body_len, 0);
     file.read_exact(&mut body)?;
     if fnv64(&body) != checksum {
         return Err(io::Error::new(
@@ -2904,20 +2969,41 @@ pub fn search_gmail_archive(
 
 pub fn read_archived_raw(root: &Path, doc_id: u64) -> io::Result<Vec<u8>> {
     let catalog = Connection::open(root.join("metadata.sqlite")).map_err(sqlite_io)?;
-    let location = catalog
+    let catalog_id = i64::try_from(doc_id).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "archive record id does not fit in the catalog",
+        )
+    })?;
+    let (segment, offset, frame_bytes) = catalog
         .query_row(
             "SELECT segment,archive_offset,frame_bytes FROM messages WHERE doc_id=?1",
-            [doc_id as i64],
+            [catalog_id],
             |row| {
-                Ok(ArchiveLocation {
-                    segment: row.get(0)?,
-                    offset: row.get::<_, i64>(1)? as u64,
-                    frame_bytes: row.get::<_, i64>(2)? as u64,
-                })
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
             },
         )
         .map_err(sqlite_io)?;
-    read_record(&root.join("archive"), &location).map(|(_, raw)| raw)
+    let location = ArchiveLocation {
+        segment,
+        offset: u64::try_from(offset)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "negative archive offset"))?,
+        frame_bytes: u64::try_from(frame_bytes).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "negative archive frame length")
+        })?,
+    };
+    let (record_id, raw) = read_record(&root.join("archive"), &location)?;
+    if record_id != doc_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "catalog/archive id mismatch",
+        ));
+    }
+    Ok(raw)
 }
 
 pub fn export_message_eml(root: &Path, doc_id: u64, destination: &Path) -> io::Result<()> {
@@ -3265,6 +3351,17 @@ fn _ordering_is_total(a: f32, b: f32) -> Ordering {
 mod tests {
     use super::*;
 
+    fn raw_read_test_root(label: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "memoria-raw-read-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
     #[test]
     fn corpus_is_deterministic_from_seed_and_id() {
         let config = CorpusConfig {
@@ -3451,6 +3548,115 @@ mod tests {
         assert_eq!(id, message.id);
         assert_eq!(raw, message.raw);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn authoritative_read_rejects_a_catalog_location_to_another_valid_frame() {
+        let root = raw_read_test_root("identity");
+        let archive = root.join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        let first_raw = b"first raw";
+        let second_raw = b"second raw";
+        let mut writer = ArchiveWriter::open(&archive, 4096).unwrap();
+        let first_location = writer.append_raw(1, first_raw).unwrap();
+        let second_location = writer.append_raw(2, second_raw).unwrap();
+        writer.sync().unwrap();
+        let catalog = create_metadata(&root.join("metadata.sqlite")).unwrap();
+        for (id, raw) in [(1, first_raw.as_slice()), (2, second_raw.as_slice())] {
+            let message = Message {
+                id,
+                message_id: format!("fixture-{id}"),
+                timestamp: 0,
+                sender: "sender@example.test".into(),
+                recipients: Vec::new(),
+                subject: String::new(),
+                text_body: String::new(),
+                html_body: None,
+                account: "fixture".into(),
+                folder: "Inbox".into(),
+                thread: "thread".into(),
+                attachments: Vec::new(),
+                raw: raw.to_vec(),
+            };
+            let location = if id == 1 {
+                &first_location
+            } else {
+                &second_location
+            };
+            insert_metadata(&catalog, &message, location).unwrap();
+        }
+        catalog
+            .execute(
+                "UPDATE messages SET segment=?1, archive_offset=?2, frame_bytes=?3 WHERE doc_id=1",
+                params![
+                    second_location.segment,
+                    second_location.offset as i64,
+                    second_location.frame_bytes as i64
+                ],
+            )
+            .unwrap();
+        drop(catalog);
+        drop(writer);
+
+        let error = read_archived_raw(&root, 1).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn record_read_rejects_inconsistent_coordinates() {
+        let root = raw_read_test_root("coordinates");
+        let archive = root.join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        let mut writer = ArchiveWriter::open(&archive, 4096).unwrap();
+        let location = writer.append_raw(7, b"coordinate fixture").unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+
+        let mut wrong_frame_bytes = location.clone();
+        wrong_frame_bytes.frame_bytes -= 1;
+        assert_eq!(
+            read_record(&archive, &wrong_frame_bytes)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut outside = location.clone();
+        outside.offset = u64::MAX;
+        assert_eq!(
+            read_record(&archive, &outside).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        let mut invalid_segment = location;
+        invalid_segment.segment = "../segment-000000.arc".into();
+        assert_eq!(
+            read_record(&archive, &invalid_segment).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn record_read_rejects_a_stored_length_before_allocating_it() {
+        let root = raw_read_test_root("length");
+        let archive = root.join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        let mut writer = ArchiveWriter::open(&archive, 4096).unwrap();
+        let location = writer.append_raw(9, b"bounded fixture").unwrap();
+        writer.sync().unwrap();
+        drop(writer);
+
+        let path = archive.join(&location.segment);
+        let mut file = OpenOptions::new().write(true).open(path).unwrap();
+        file.seek(SeekFrom::Start(location.offset + 16)).unwrap();
+        file.write_all(&u64::MAX.to_le_bytes()).unwrap();
+        drop(file);
+
+        let error = read_record(&archive, &location).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
