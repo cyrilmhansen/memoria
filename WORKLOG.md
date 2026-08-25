@@ -691,3 +691,20 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
 - Observé séparément les URLs distantes, références locales, liens et signaux
   explicables ; aucun jugement de tracking ni modification Memoria.
 - Rapport : `experiments/2026-08-25-html-remote-evidence-corpus.md`.
+
+## 2026-08-25 — API produit HTML remote-resource evidence
+
+- Ajouté `html_remote_evidence::analyze_html_remote_evidence` sans réseau,
+  UI, SQLite ni Tantivy.
+- Les tests produit consomment directement les 30 fixtures/goldens du probe ;
+  exploration déterministe de HTML malformé ajoutée sans nouvelle dépendance
+  de fuzzing.
+- Validation du workspace : 56 tests passent ; le seul échec reste le test
+  HTML préexistant dépendant de `/var/tmp` en lecture seule.
+
+## 2026-08-25 — Correction de propriété du TreeSink HTML
+
+- Remplacé le stockage `Box::leak(QualName)` par des handles `Rc<RefCell<_>>`.
+- Ajouté des tests de libération, répétition sur 1 000 éléments et absence de
+  doublons lors de la reconstruction html5ever.
+- Les 5 tests ciblés et le workspace complet passent.

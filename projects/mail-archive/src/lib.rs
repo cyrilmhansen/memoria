@@ -21,6 +21,7 @@ mod attachment_text;
 pub mod delivery_report;
 pub mod gmail;
 pub mod html_preview;
+pub mod html_remote_evidence;
 pub mod i18n;
 pub mod imap;
 

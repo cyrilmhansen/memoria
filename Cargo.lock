@@ -3279,6 +3279,7 @@ dependencies = [
  "fontique",
  "futures",
  "getrandom 0.3.4",
+ "html5ever",
  "mailparse",
  "open",
  "reqwest",

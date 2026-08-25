@@ -574,6 +574,12 @@ résultats d'expérience locale :
   élément, dimensions, visibilité inline, query) des signaux heuristiques ; ne
   jamais produire une conclusion `is_tracker` dans cette couche.
 - Détails : `experiments/2026-08-25-html-remote-evidence-corpus.md`.
+- **Fait vérifié :** Memoria expose maintenant cette analyse offline via
+  `html_remote_evidence::analyze_html_remote_evidence`; les 30 fixtures sont
+  réutilisées directement par les tests produit. Le résultat ne contient
+  aucun verdict de tracking.
+- **Correction vérifiée :** le `TreeSink` possède ses `QualName` dans des
+  nœuds `Rc<RefCell<_>>` ; aucune fuite volontaire `Box::leak` ne subsiste.
 ## IMAP multi-mailbox
 
 - `LIST` expose les noms protocolaire, delimiter, attributs et SPECIAL-USE sans

@@ -125,3 +125,29 @@ The experiment establishes a useful future boundary: deterministic evidence
 can be collected from original HTML independently of sanitization, while any
 tracking suspicion policy must remain a separate, explicit layer. It does not
 justify changing the current blocking policy or adding product analysis yet.
+
+## Product API follow-up
+
+Memoria now exposes `analyze_html_remote_evidence(&str) -> HtmlRemoteEvidence`
+in `html_remote_evidence`. It uses the same 30 fixtures and 30 goldens directly
+from product tests. The public result keeps `remote_resources`,
+`local_references`, and `links` separate; `RemoteResourceSignal` contains only
+the three explicit signals above and has no tracker verdict.
+
+The product adds a direct `html5ever 0.39` dependency. Its transitive
+`markup5ever` and the existing `ammonia`/`url` graph were already present, so
+no new package family was introduced. The CI-profile application measured
+36,993,824 bytes after the change; no before/after attribution was attempted
+because this build was not paired with a clean pre-change binary.
+
+The product corpus tests pass, including a deterministic malformed-input
+exploration loop. Full workspace validation is otherwise green except for the
+pre-existing HTML preview test that writes under the read-only `/var/tmp`
+mount in this environment.
+
+The product TreeSink owns qualified names inside `Rc<RefCell<Node>>` handles;
+it does not use `Box::leak`. A repeated 1,000-image document analyzed 20 times
+kept a stable observation count, and a `Weak` handle confirmed that the sink's
+name storage is released after analysis. A malformed table/formatting fixture
+that exercises html5ever reconstruction produced exactly two image
+observations, with no duplicate generated resource entries.
