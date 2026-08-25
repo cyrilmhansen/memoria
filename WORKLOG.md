@@ -722,3 +722,18 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
 
 - A1 lecture RAW autoritative clôturé dans
   `6537af7d4837c0d849d53ea602f6c1b6f4e50cbd`.
+
+## 2026-08-25 — Implémentation A2.1 : inventaire RAW/catalogue
+
+- Ajout de `inventory_records`, API minimale d’inventaire par record, en
+  lecture seule stricte de SQLite et des segments.
+- La validation de frame reste celle de `read_record`; aucune seconde
+  implémentation du framing, aucun appel à `recover_segments` et aucune
+  recherche globale de magic ne sont utilisés.
+- Tests ciblés ajoutés pour les cinq corruptions centrales, la disparition
+  d’un segment, une coordonnée négative et une queue tronquée. Le test de
+  corruption compare aussi les octets du segment et l’état (présence et
+  contenu) de `metadata.sqlite`, `metadata.sqlite-wal` et
+  `metadata.sqlite-shm` avant/après l’inventaire.
+- Commande de reproduction ciblée :
+  `cargo test -p mail-archive-experiment inventory_ -- --nocapture`.

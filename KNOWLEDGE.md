@@ -622,3 +622,22 @@ résultats d'expérience locale :
 - **État :** A1 est clôturé. Cette correction ne résout ni le recovery, ni la
   crash-consistency, ni le multi-writer, ni la reconstruction après perte
   partielle.
+
+## 2026-08-25 — Tier A2.1 : inventaire read-only des records
+
+- **Fait vérifié :** `inventory_records` ouvre `metadata.sqlite` avec le flag
+  SQLite read-only et vérifie chaque ligne indépendamment en réutilisant
+  `read_record`; une frame invalide ne bloque pas les suivantes.
+- **Fait vérifié :** `AvailableValidated` signifie que la plage physique, le
+  framing, l’identité du record, la longueur et le checksum du format actuel
+  concordent; ce n’est pas une garantie cryptographique d’intégrité.
+  `PhysicallyMissing` signifie que le segment ou la plage de bytes n’existe
+  plus. `Inconsistent` signifie que la coordonnée catalogue est invalide ou
+  que des bytes présents ne valident pas; ce statut n’attribue pas la faute au
+  RAW ou au catalogue.
+- **Fait vérifié :** les corruptions centrales du magic, de l’ID, de la
+  longueur, du checksum et du payload laissent disponibles les deux voisins;
+  une queue tronquée conserve les frames réellement présentes.
+- **Limite :** A2.1 inventorie et signale; il ne répare pas une archive, ne
+  reconstruit pas le catalogue et ne résout pas l’attribution d’une
+  incohérence.

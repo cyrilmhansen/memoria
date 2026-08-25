@@ -1,6 +1,6 @@
 use flate2::{write::GzEncoder, Compression};
 use mailparse::{parse_mail, MailHeaderMap, ParsedMail};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -181,11 +181,35 @@ enum CasPiece {
     Blob(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArchiveLocation {
     pub segment: String,
     pub offset: u64,
     pub frame_bytes: u64,
+}
+
+/// Result of checking one catalogue record against its RAW frame.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RecordInventoryStatus {
+    /// The catalogue coordinates, frame identity, length and format checksum
+    /// all agree, and the payload was read successfully. The checksum is the
+    /// archive format's validation field, not a cryptographic integrity claim.
+    AvailableValidated,
+    /// The referenced segment or the referenced bytes are no longer present
+    /// on disk. This status does not assign blame to either source.
+    PhysicallyMissing,
+    /// The available bytes do not validate as the catalogue's frame, or the
+    /// catalogue coordinate itself is invalid. The evidence is insufficient
+    /// to attribute the inconsistency to RAW or to SQLite.
+    Inconsistent { reason: String },
+}
+
+/// Read-only per-record result returned by [`inventory_records`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordInventory {
+    pub doc_id: i64,
+    pub location: Option<ArchiveLocation>,
+    pub status: RecordInventoryStatus,
 }
 
 #[derive(Clone, Debug)]
@@ -1548,16 +1572,15 @@ pub fn recover_segments(root: &Path) -> io::Result<(u64, u64)> {
     Ok((recovered, truncated))
 }
 
-pub fn read_record(root: &Path, location: &ArchiveLocation) -> io::Result<(u64, Vec<u8>)> {
-    let segment = Path::new(&location.segment);
+fn archive_segment_path(root: &Path, segment_name: &str) -> io::Result<PathBuf> {
+    let segment = Path::new(segment_name);
     if segment.is_absolute()
         || segment
             .components()
             .any(|component| !matches!(component, Component::Normal(_)))
-        || !location.segment.starts_with("segment-")
-        || !location.segment.ends_with(".arc")
-        || location
-            .segment
+        || !segment_name.starts_with("segment-")
+        || !segment_name.ends_with(".arc")
+        || segment_name
             .strip_prefix("segment-")
             .and_then(|value| value.strip_suffix(".arc"))
             .and_then(|value| value.parse::<u64>().ok())
@@ -1568,6 +1591,191 @@ pub fn read_record(root: &Path, location: &ArchiveLocation) -> io::Result<(u64, 
             "invalid archive segment coordinate",
         ));
     }
+    Ok(root.join(segment))
+}
+
+fn inventory_inconsistent(
+    doc_id: i64,
+    location: Option<ArchiveLocation>,
+    reason: impl Into<String>,
+) -> RecordInventory {
+    RecordInventory {
+        doc_id,
+        location,
+        status: RecordInventoryStatus::Inconsistent {
+            reason: reason.into(),
+        },
+    }
+}
+
+/// Check every record named by the SQLite catalogue independently.
+///
+/// The catalogue is opened read-only and this function never repairs, truncates,
+/// creates or migrates either input. A missing segment/byte range is reported
+/// separately from an invalid frame. Frame validation itself is delegated to
+/// [`read_record`], the authoritative A1 reader.
+pub fn inventory_records(root: &Path) -> io::Result<Vec<RecordInventory>> {
+    let catalog = Connection::open_with_flags(
+        root.join("metadata.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(sqlite_io)?;
+    let mut statement = catalog
+        .prepare(
+            "SELECT doc_id, segment, archive_offset, frame_bytes FROM messages ORDER BY doc_id",
+        )
+        .map_err(sqlite_io)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                // messages.doc_id is INTEGER PRIMARY KEY, so decode it
+                // independently before handling the coordinate columns.
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1).map_err(|error| error.to_string()),
+                row.get::<_, i64>(2).map_err(|error| error.to_string()),
+                row.get::<_, i64>(3).map_err(|error| error.to_string()),
+            ))
+        })
+        .map_err(sqlite_io)?;
+    let mut inventory = Vec::new();
+    for row in rows {
+        let (doc_id, segment, offset, frame_bytes) = match row {
+            Ok(value) => value,
+            // A row whose primary key cannot be decoded cannot be represented
+            // as a RecordInventory without inventing an identifier.
+            Err(error) => return Err(sqlite_io(error)),
+        };
+        let segment = match segment {
+            Ok(segment) => segment,
+            Err(error) => {
+                inventory.push(inventory_inconsistent(
+                    doc_id,
+                    None,
+                    format!("catalog segment is invalid: {error}"),
+                ));
+                continue;
+            }
+        };
+        let offset = match offset {
+            Ok(offset) => offset,
+            Err(error) => {
+                inventory.push(inventory_inconsistent(
+                    doc_id,
+                    Some(ArchiveLocation {
+                        segment,
+                        offset: 0,
+                        frame_bytes: 0,
+                    }),
+                    format!("catalog offset is invalid: {error}"),
+                ));
+                continue;
+            }
+        };
+        let frame_bytes = match frame_bytes {
+            Ok(frame_bytes) => frame_bytes,
+            Err(error) => {
+                inventory.push(inventory_inconsistent(
+                    doc_id,
+                    Some(ArchiveLocation {
+                        segment,
+                        offset: 0,
+                        frame_bytes: 0,
+                    }),
+                    format!("catalog frame length is invalid: {error}"),
+                ));
+                continue;
+            }
+        };
+        let location = ArchiveLocation {
+            segment,
+            offset: u64::try_from(offset).unwrap_or(0),
+            frame_bytes: u64::try_from(frame_bytes).unwrap_or(0),
+        };
+        if doc_id < 0 || offset < 0 || frame_bytes < 0 {
+            inventory.push(inventory_inconsistent(
+                doc_id,
+                Some(location),
+                "negative catalogue record or archive coordinate",
+            ));
+            continue;
+        }
+        let path = match archive_segment_path(&root.join("archive"), &location.segment) {
+            Ok(path) => path,
+            Err(error) => {
+                inventory.push(inventory_inconsistent(
+                    doc_id,
+                    Some(location),
+                    error.to_string(),
+                ));
+                continue;
+            }
+        };
+        let file_len = match fs::metadata(&path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                inventory.push(RecordInventory {
+                    doc_id,
+                    location: Some(location),
+                    status: RecordInventoryStatus::PhysicallyMissing,
+                });
+                continue;
+            }
+            Err(error) => {
+                inventory.push(inventory_inconsistent(
+                    doc_id,
+                    Some(location),
+                    error.to_string(),
+                ));
+                continue;
+            }
+        };
+        let Some(coordinate_end) = location.offset.checked_add(location.frame_bytes) else {
+            inventory.push(inventory_inconsistent(
+                doc_id,
+                Some(location),
+                "archive coordinate overflow",
+            ));
+            continue;
+        };
+        if coordinate_end > file_len {
+            inventory.push(RecordInventory {
+                doc_id,
+                location: Some(location),
+                status: RecordInventoryStatus::PhysicallyMissing,
+            });
+            continue;
+        }
+        if location.frame_bytes < FRAME_HEADER_BYTES {
+            inventory.push(inventory_inconsistent(
+                doc_id,
+                Some(location),
+                "catalog frame length is smaller than the frame header",
+            ));
+            continue;
+        }
+        match read_record(&root.join("archive"), &location) {
+            Ok((record_id, _)) if record_id == doc_id as u64 => inventory.push(RecordInventory {
+                doc_id,
+                location: Some(location),
+                status: RecordInventoryStatus::AvailableValidated,
+            }),
+            Ok((record_id, _)) => inventory.push(inventory_inconsistent(
+                doc_id,
+                Some(location),
+                format!("catalog/frame id mismatch: frame contains {record_id}"),
+            )),
+            Err(error) => inventory.push(inventory_inconsistent(
+                doc_id,
+                Some(location),
+                error.to_string(),
+            )),
+        }
+    }
+    Ok(inventory)
+}
+
+pub fn read_record(root: &Path, location: &ArchiveLocation) -> io::Result<(u64, Vec<u8>)> {
+    let path = archive_segment_path(root, &location.segment)?;
     if location.frame_bytes < FRAME_HEADER_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1575,7 +1783,6 @@ pub fn read_record(root: &Path, location: &ArchiveLocation) -> io::Result<(u64, 
         ));
     }
 
-    let path = root.join(segment);
     let file_len = fs::metadata(&path)?.len();
     let coordinate_end = location
         .offset
@@ -3357,7 +3564,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "memoria-raw-read-{label}-{}-{nonce}",
+            "atlas-raw-read-{label}-{}-{nonce}",
             std::process::id()
         ))
     }
@@ -3656,6 +3863,180 @@ mod tests {
 
         let error = read_record(&archive, &location).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn inventory_fixture(label: &str) -> (PathBuf, Vec<ArchiveLocation>, Vec<Vec<u8>>) {
+        let root = raw_read_test_root(label);
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("archive")).unwrap();
+        let catalog = create_metadata(&root.join("metadata.sqlite")).unwrap();
+        let mut writer = ArchiveWriter::open(&root.join("archive"), 64 * 1024).unwrap();
+        let raws = vec![
+            b"frame one payload".to_vec(),
+            b"frame two payload".to_vec(),
+            b"frame three payload".to_vec(),
+        ];
+        let mut locations = Vec::new();
+        for (id, raw) in raws.iter().enumerate() {
+            let location = writer.append_raw(id as u64, raw).unwrap();
+            let message = Message {
+                id: id as u64,
+                message_id: format!("inventory-{id}"),
+                timestamp: 0,
+                sender: String::new(),
+                recipients: Vec::new(),
+                subject: String::new(),
+                text_body: String::new(),
+                html_body: None,
+                account: String::new(),
+                folder: String::new(),
+                thread: String::new(),
+                attachments: Vec::new(),
+                raw: raw.clone(),
+            };
+            insert_metadata(&catalog, &message, &location).unwrap();
+            locations.push(location);
+        }
+        writer.sync().unwrap();
+        drop(catalog);
+        drop(writer);
+        (root, locations, raws)
+    }
+
+    #[test]
+    fn inventory_keeps_neighbors_available_for_each_central_frame_corruption() {
+        for (label, field_offset) in [
+            ("magic", 0usize),
+            ("id", 8),
+            ("length", 16),
+            ("checksum", 24),
+            ("payload", 32),
+        ] {
+            let (root, locations, _) = inventory_fixture(label);
+            let segment_path = root.join("archive").join(&locations[1].segment);
+            let before_segment = fs::read(&segment_path).unwrap();
+            let sqlite_paths = [
+                root.join("metadata.sqlite"),
+                root.join("metadata.sqlite-wal"),
+                root.join("metadata.sqlite-shm"),
+            ];
+            let before_sqlite = sqlite_paths
+                .iter()
+                .map(|path| fs::read(path).ok())
+                .collect::<Vec<_>>();
+            let mut segment = before_segment.clone();
+            segment[locations[1].offset as usize + field_offset] ^= 1;
+            fs::write(&segment_path, &segment).unwrap();
+
+            let result = inventory_records(&root).unwrap();
+            assert!(matches!(
+                result[0].status,
+                RecordInventoryStatus::AvailableValidated
+            ));
+            assert!(matches!(
+                result[1].status,
+                RecordInventoryStatus::Inconsistent { .. }
+            ));
+            assert!(matches!(
+                result[2].status,
+                RecordInventoryStatus::AvailableValidated
+            ));
+            let after_sqlite = sqlite_paths
+                .iter()
+                .map(|path| fs::read(path).ok())
+                .collect::<Vec<_>>();
+            assert_eq!(after_sqlite, before_sqlite);
+            assert_eq!(fs::read(&segment_path).unwrap(), segment);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn inventory_reports_missing_segment_without_hiding_other_records() {
+        let (root, locations, _) = inventory_fixture("missing-segment");
+        let original_segment = root.join("archive").join(&locations[0].segment);
+        let missing_segment = "segment-000001.arc";
+        fs::copy(
+            &original_segment,
+            root.join("archive").join(missing_segment),
+        )
+        .unwrap();
+        let catalog = Connection::open(root.join("metadata.sqlite")).unwrap();
+        catalog
+            .execute(
+                "UPDATE messages SET segment=?1, archive_offset=0 WHERE doc_id=0",
+                params![missing_segment],
+            )
+            .unwrap();
+        drop(catalog);
+        fs::remove_file(root.join("archive").join(missing_segment)).unwrap();
+        let result = inventory_records(&root).unwrap();
+        assert!(matches!(
+            result[0].status,
+            RecordInventoryStatus::PhysicallyMissing
+        ));
+        assert!(matches!(
+            result[1].status,
+            RecordInventoryStatus::AvailableValidated
+        ));
+        assert!(matches!(
+            result[2].status,
+            RecordInventoryStatus::AvailableValidated
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inventory_continues_after_invalid_catalogue_coordinate_and_truncated_tail() {
+        let (root, locations, _) = inventory_fixture("invalid-coordinate");
+        let catalog = Connection::open(root.join("metadata.sqlite")).unwrap();
+        catalog
+            .execute("UPDATE messages SET archive_offset=-1 WHERE doc_id=1", [])
+            .unwrap();
+        drop(catalog);
+        let result = inventory_records(&root).unwrap();
+        assert!(matches!(
+            result[0].status,
+            RecordInventoryStatus::AvailableValidated
+        ));
+        assert!(matches!(
+            result[1].status,
+            RecordInventoryStatus::Inconsistent { .. }
+        ));
+        assert_eq!(result[1].doc_id, 1);
+        assert!(matches!(
+            result[2].status,
+            RecordInventoryStatus::AvailableValidated
+        ));
+        let catalog = Connection::open(root.join("metadata.sqlite")).unwrap();
+        catalog
+            .execute("UPDATE messages SET segment=123 WHERE doc_id=1", [])
+            .unwrap();
+        drop(catalog);
+        let result = inventory_records(&root).unwrap();
+        assert_eq!(result[1].doc_id, 1);
+        assert!(matches!(
+            result[1].status,
+            RecordInventoryStatus::Inconsistent { .. }
+        ));
+        let segment_path = root.join("archive").join(&locations[0].segment);
+        let mut segment = fs::read(&segment_path).unwrap();
+        segment.truncate(locations[2].offset as usize);
+        fs::write(&segment_path, segment).unwrap();
+        let result = inventory_records(&root).unwrap();
+        assert!(matches!(
+            result[0].status,
+            RecordInventoryStatus::AvailableValidated
+        ));
+        assert!(matches!(
+            result[1].status,
+            RecordInventoryStatus::Inconsistent { .. }
+        ));
+        assert!(matches!(
+            result[2].status,
+            RecordInventoryStatus::PhysicallyMissing
+        ));
         let _ = fs::remove_dir_all(root);
     }
 
