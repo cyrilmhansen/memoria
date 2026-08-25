@@ -549,6 +549,16 @@ résultats d'expérience locale :
   `Original-Message-ID` dépend du `Message-ID` original, pas de la présence
   d’une troisième partie.
 - Détails : `experiments/2026-08-24-mdn-dsn-corpus.md`.
+
+## 2026-08-25 — Parser produit MDN/DSN initial
+
+- **Fait vérifié :** `delivery_report::analyze_delivery_report` analyse les
+  MDN/DSN classiques démontrés par les 42 golden fixtures, conserve séparés
+  les champs DSN per-message/per-destinataire, et classe les quatre types
+  RFC 6533 comme `Unsupported`.
+- **Décision :** cette API reste une analyse isolée du RAW ; elle ne corrèle
+  pas de message, ne modifie ni catalogue ni index, et ne traite pas
+  l’authenticité DKIM/SPF.
 ## IMAP multi-mailbox
 
 - `LIST` expose les noms protocolaire, delimiter, attributs et SPECIAL-USE sans

@@ -18,6 +18,7 @@ use tantivy::{doc, Index, IndexReader, IndexWriter, Order, TantivyDocument, Term
 
 pub mod app_config;
 mod attachment_text;
+pub mod delivery_report;
 pub mod gmail;
 pub mod html_preview;
 pub mod i18n;
@@ -26,6 +27,10 @@ pub mod imap;
 pub use attachment_text::{
     discover_providers, providers_for_mime, selected_provider, AttachmentTextStats, BackendKind,
     ExtractionProvider, ProviderAvailability, ProviderId, ProviderSelection,
+};
+pub use delivery_report::{
+    analyze_delivery_report, DeliveryReportAnalysis, DeliveryReportKind, DsnMessageFields,
+    DsnRecipient, DsnReport, MdnDisposition, MdnReport,
 };
 
 pub const DEFAULT_SEED: u64 = 0x4d_41_49_4c_41_52_43;

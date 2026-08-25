@@ -667,3 +667,10 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
   invalidante ajoutée.
 - Le probe classe les rapports valides, malformés et non supportés sans
   modifier Memoria ; rapport : `experiments/2026-08-24-mdn-dsn-corpus.md`.
+
+## 2026-08-25 — Parser produit MDN/DSN initial
+
+- Ajouté `delivery_report::analyze_delivery_report` dans le crate
+  `mail-archive-experiment`, sans changement de stockage ou d’index.
+- Les tests produit lisent directement les 42 `.eml` et `.expected.json` du
+  corpus commité et valident Ordinary, MDN, DSN, Malformed et Unsupported.
