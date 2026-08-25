@@ -1,7 +1,7 @@
 use mail_archive_experiment::*;
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -99,7 +99,7 @@ fn generate(
     Ok(())
 }
 
-fn cas_benchmark(out: &PathBuf, config: CorpusConfig) -> Result<(), Box<dyn std::error::Error>> {
+fn cas_benchmark(out: &Path, config: CorpusConfig) -> Result<(), Box<dyn std::error::Error>> {
     let variants = [
         CasVariant::Inline,
         CasVariant::Exact,
@@ -122,7 +122,7 @@ fn cas_benchmark(out: &PathBuf, config: CorpusConfig) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-fn gmail_sync(args: &[String], default_out: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn gmail_sync(args: &[String], default_out: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let archive = PathBuf::from(
         option(args, "--archive").unwrap_or_else(|| default_out.display().to_string()),
     );
@@ -150,7 +150,7 @@ fn gmail_sync(args: &[String], default_out: &PathBuf) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-fn gmail_report(args: &[String], default_out: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn gmail_report(args: &[String], default_out: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let archive = PathBuf::from(
         option(args, "--archive").unwrap_or_else(|| default_out.display().to_string()),
     );
@@ -206,7 +206,7 @@ fn gmail_report(args: &[String], default_out: &PathBuf) -> Result<(), Box<dyn st
     Ok(())
 }
 
-fn gmail_index(args: &[String], default_out: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn gmail_index(args: &[String], default_out: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let archive = PathBuf::from(
         option(args, "--archive").unwrap_or_else(|| default_out.display().to_string()),
     );
@@ -275,7 +275,7 @@ fn gmail_index(args: &[String], default_out: &PathBuf) -> Result<(), Box<dyn std
     Ok(())
 }
 
-fn search(args: &[String], default_out: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn search(args: &[String], default_out: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let archive = PathBuf::from(
         option(args, "--archive").unwrap_or_else(|| default_out.display().to_string()),
     );

@@ -1320,7 +1320,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return;
         };
         let messages = (0..ui.get_results().row_count())
-            .filter_map(|index| ui.get_results().row_data(index as usize))
+            .filter_map(|index| ui.get_results().row_data(index))
             .map(|row| {
                 (
                     row.doc_id as u64,

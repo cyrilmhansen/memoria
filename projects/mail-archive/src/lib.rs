@@ -101,7 +101,7 @@ impl CorpusProfile {
     pub const fn defaults(self) -> (u32, u32, usize) {
         match self {
             Self::Light => (3, 20, 64 * 1024),
-            Self::Personal => (30, 55, 1 * 1024 * 1024),
+            Self::Personal => (30, 55, 1024 * 1024),
             Self::Heavy => (65, 35, 8 * 1024 * 1024),
         }
     }
@@ -441,7 +441,7 @@ fn walk_mime_parts(
             inline,
         };
         attachments.push(info.clone());
-        if let Some(payloads) = payloads.as_deref_mut() {
+        if let Some(payloads) = payloads {
             let decoded_text = if info.mime.starts_with("text/") && bytes.len() <= 64 * 1024 * 1024
             {
                 part.get_body().ok()
@@ -579,11 +579,8 @@ pub struct GmailSearchIndex {
 
 impl GmailSearchIndex {
     pub fn open(root: &Path) -> io::Result<Self> {
-        let (index, fields) = open_or_create_gmail_tantivy(root)
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
-        let reader = index
-            .reader()
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+        let (index, fields) = open_or_create_gmail_tantivy(root).map_err(io::Error::other)?;
+        let reader = index.reader().map_err(io::Error::other)?;
         create_metadata(&root.join("metadata.sqlite")).map_err(sqlite_io)?;
         let catalog = Connection::open(root.join("metadata.sqlite")).map_err(sqlite_io)?;
         let source_rows: i64 = catalog
@@ -645,7 +642,7 @@ impl GmailSearchIndex {
                     &TopDocs::with_limit(request.limit)
                         .order_by_fast_field::<i64>("timestamp", Order::Desc),
                 )
-                .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?
+                .map_err(io::Error::other)?
                 .into_iter()
                 .map(|(_, address)| (0.0, address))
                 .collect()
@@ -655,13 +652,11 @@ impl GmailSearchIndex {
                     &parsed,
                     &TopDocs::with_limit(request.limit).order_by_score(),
                 )
-                .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?
+                .map_err(io::Error::other)?
         };
         let mut results = Vec::new();
         for (score, address) in top_docs {
-            let document: TantivyDocument = searcher
-                .doc(address)
-                .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+            let document: TantivyDocument = searcher.doc(address).map_err(io::Error::other)?;
             let doc_id = document
                 .get_first(self.fields.doc_id)
                 .and_then(|value| value.as_u64())
@@ -726,9 +721,7 @@ impl GmailSearchIndex {
     }
 
     pub fn reload(&self) -> io::Result<()> {
-        self.reader
-            .reload()
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))
+        self.reader.reload().map_err(io::Error::other)
     }
 }
 
@@ -1282,8 +1275,8 @@ fn cas_hash(payload: &[u8], decoded: bool) -> String {
     // The current synthetic MIME payload is already decoded. Keeping the
     // flag explicit makes the equality of exact/decoded results observable,
     // and leaves the decoder boundary ready for real MIME fixtures.
-    let bytes = if decoded { payload } else { payload };
-    blake3::hash(bytes).to_hex().to_string()
+    let _ = decoded;
+    blake3::hash(payload).to_hex().to_string()
 }
 
 fn externalize_message(
@@ -1735,10 +1728,14 @@ pub fn parse_gmail_message(
     )?;
     let (attachment_text, attachment_text_stats) = if attachment_count > 0 {
         attachment_text::extract_attachment_texts(&parsed).unwrap_or_else(|_| {
-            let mut stats = AttachmentTextStats::default();
-            stats.encountered = attachment_count;
-            stats.failures = attachment_count;
-            (String::new(), stats)
+            (
+                String::new(),
+                AttachmentTextStats {
+                    encountered: attachment_count,
+                    failures: attachment_count,
+                    ..Default::default()
+                },
+            )
         })
     } else {
         (String::new(), AttachmentTextStats::default())
@@ -1874,6 +1871,7 @@ pub fn gmail_message_exists(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn insert_gmail_metadata(
     connection: &Connection,
     source_account: &str,
@@ -1996,6 +1994,7 @@ pub fn upsert_imap_mailbox(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn insert_imap_metadata(
     connection: &Connection,
     source_account: &str,
@@ -2331,9 +2330,7 @@ pub fn index_tantivy_archive(
     start_id: u64,
     end_id: u64,
 ) -> io::Result<PipelineStats> {
-    let mut writer = index
-        .writer(50_000_000)
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    let mut writer = index.writer(50_000_000).map_err(io::Error::other)?;
     let stats = for_each_archived_message(archive_root, start_id, end_id, |message| {
         writer
             .add_document(doc!(
@@ -2346,12 +2343,10 @@ pub fn index_tantivy_archive(
                 fields.folder => message.folder.clone(),
                 fields.account => message.account.clone()
             ))
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+            .map_err(io::Error::other)?;
         Ok(())
     })?;
-    writer
-        .commit()
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    writer.commit().map_err(io::Error::other)?;
     Ok(stats)
 }
 
@@ -2536,8 +2531,7 @@ where
     F: FnMut(&str),
 {
     let open_started = Instant::now();
-    let (index, fields) = open_or_create_gmail_tantivy(root)
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+    let (index, fields) = open_or_create_gmail_tantivy(root).map_err(io::Error::other)?;
     let mut stats = GmailIndexStats {
         open_us: open_started.elapsed().as_micros(),
         ..Default::default()
@@ -2580,11 +2574,11 @@ where
             .build();
         index
             .writer_with_options(options)
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?
+            .map_err(io::Error::other)?
     } else {
         index
             .writer(writer_config.memory_budget_bytes)
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?
+            .map_err(io::Error::other)?
     };
     if writer_config.no_merge_policy {
         writer.set_merge_policy(Box::new(NoMergePolicy));
@@ -2679,9 +2673,7 @@ where
                 document.add_text(fields.attachment_family, family);
             }
         }
-        writer
-            .add_document(document)
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+        writer.add_document(document).map_err(io::Error::other)?;
         state_transaction
             .execute(
                 "INSERT OR REPLACE INTO indexed_docs VALUES (?1,?2,?3,?4,?5,?6)",
@@ -2697,13 +2689,13 @@ where
             .map_err(sqlite_io)?;
         stats.indexed += 1;
         changed = true;
-        if stats.examined % 100_000 == 0 {
+        if stats.examined.is_multiple_of(100_000) {
             observe("indexing_100k_boundary");
         }
         Ok(())
     })?;
     if track_current {
-        for (doc_id, _) in &known {
+        for doc_id in known.keys() {
             if !current.contains(doc_id) {
                 writer.delete_term(Term::from_field_u64(fields.doc_id, *doc_id));
                 state_transaction
@@ -2720,9 +2712,7 @@ where
             .load_metas()
             .map(|meta| meta.segments.len() as u64)
             .unwrap_or(0);
-        writer
-            .commit()
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error))?;
+        writer.commit().map_err(io::Error::other)?;
         observe("after_commit");
         stats.segments_after_commit = index
             .load_metas()
@@ -2736,7 +2726,7 @@ where
         .map(|meta| meta.segments.len() as u64)
         .unwrap_or(0);
     stats.index_us = index_started.elapsed().as_micros();
-    stats.index_bytes = directory_bytes(&gmail_index_dir(root))?;
+    stats.index_bytes = directory_bytes(gmail_index_dir(root))?;
     Ok(stats)
 }
 
@@ -3233,7 +3223,7 @@ pub fn build_archive(
 }
 
 fn sqlite_io(error: rusqlite::Error) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, error)
+    io::Error::other(error)
 }
 
 pub fn directory_bytes(root: impl AsRef<Path>) -> io::Result<u64> {
@@ -3769,17 +3759,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1]
         );
-        assert!(
-            index
-                .search_request(&SearchRequest {
-                    attachment: AttachmentFilter::With,
-                    limit: 10,
-                    ..Default::default()
-                })
-                .unwrap()
-                .is_empty()
-                == false
-        );
+        assert!(!index
+            .search_request(&SearchRequest {
+                attachment: AttachmentFilter::With,
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty());
         assert_eq!(
             index
                 .search_request(&SearchRequest {

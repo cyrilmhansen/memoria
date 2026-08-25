@@ -318,7 +318,7 @@ fn extract_one(payload: &AttachmentPayload) -> ExtractionResult {
         _ => return ExtractionResult::Unsupported,
     }
     if payload.info.mime.starts_with("text/") {
-        let text = payload.decoded_text.as_deref().unwrap_or_else(|| "");
+        let text = payload.decoded_text.as_deref().unwrap_or("");
         let text = if payload.info.mime == "text/html" {
             crate::html_text(text)
         } else {

@@ -900,7 +900,7 @@ pub fn sync_account_with_progress<T: GmailTransport, P: FnMut(&SyncProgress)>(
     let state = crate::gmail_state(&connection, source_account)
         .map_err(|error| GmailError::Other(error.to_string()))?;
     let mut stats = SyncStats::default();
-    let result = if let Some((history_id, complete)) = state {
+    if let Some((history_id, complete)) = state {
         if !complete {
             stats.full_sync = true;
             full_sync(
@@ -954,11 +954,11 @@ pub fn sync_account_with_progress<T: GmailTransport, P: FnMut(&SyncProgress)>(
             &mut progress,
         )
     }?;
-    let _ = result;
     stats.duration_ms = started.elapsed().as_millis();
     Ok(stats)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn full_sync<T: GmailTransport>(
     root: &Path,
     connection: &mut Connection,
@@ -1044,6 +1044,7 @@ fn full_sync<T: GmailTransport>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn incremental_sync<T: GmailTransport>(
     root: &Path,
     connection: &mut Connection,

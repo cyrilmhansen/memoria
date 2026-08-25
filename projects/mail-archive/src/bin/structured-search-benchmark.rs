@@ -68,7 +68,7 @@ fn labels(hash: u64) -> Vec<String> {
     if bucket < 8 {
         result.push("STARRED".to_string());
     }
-    if bucket % 13 == 0 {
+    if bucket.is_multiple_of(13) {
         result.push("IMPORTANT".to_string());
     }
     result
