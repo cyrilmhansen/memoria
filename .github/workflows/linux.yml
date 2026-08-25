@@ -1,0 +1,17 @@
+name: Linux
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --workspace --all-targets
+      - name: Clippy baseline with warnings denied
+        run: cargo clippy -p mail-archive-experiment --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace
