@@ -699,12 +699,21 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
 - Les tests produit consomment directement les 30 fixtures/goldens du probe ;
   exploration déterministe de HTML malformé ajoutée sans nouvelle dépendance
   de fuzzing.
-- Validation du workspace : 56 tests passent ; le seul échec reste le test
-  HTML préexistant dépendant de `/var/tmp` en lecture seule.
+- Validation produit : les tests de l’API passent ; `cargo test --workspace`
+  échoue encore uniquement sur le test HTML préexistant dépendant de `/var/tmp`
+  en lecture seule dans l’environnement local.
 
 ## 2026-08-25 — Correction de propriété du TreeSink HTML
 
 - Remplacé le stockage `Box::leak(QualName)` par des handles `Rc<RefCell<_>>`.
 - Ajouté des tests de libération, répétition sur 1 000 éléments et absence de
   doublons lors de la reconstruction html5ever.
-- Les 5 tests ciblés et le workspace complet passent.
+- Les 5 tests ciblés passent ; le workspace complet reste en échec uniquement
+  sur le test HTML dépendant de `/var/tmp` en lecture seule dans l’environnement
+  local.
+
+## 2026-08-25 — Adoption de la politique d’assurance
+
+- Adopté [`ASSURANCE.md`](ASSURANCE.md), version 0.2, comme spécification de
+  référence pour la criticité, les frontières d’autorité et les exigences de
+  conservation de Memoria.

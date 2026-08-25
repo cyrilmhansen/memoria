@@ -7,6 +7,7 @@ framework partagé.
 ## Avant de travailler
 
 - Lire `KNOWLEDGE.md` avant tout travail.
+- Lire `ASSURANCE.md` : il définit les tiers A/B/C, les frontières d’autorité et les exigences de conservation.
 - Consulter les notes pertinentes dans `experiments/` avant de rechercher à
   nouveau une solution.
 - Privilégier l'expérience minimale qui permet de trancher une incertitude.

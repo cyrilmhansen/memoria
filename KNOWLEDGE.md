@@ -1,5 +1,8 @@
 # Knowledge map
 
+La référence pour la criticité et l’assurance du code est désormais
+[`ASSURANCE.md`](ASSURANCE.md).
+
 Carte concise des conclusions techniques vérifiées et réutilisables entre les
 applications. Les expériences détaillées, mesures et échecs restent dans
 [`experiments/`](experiments/).
