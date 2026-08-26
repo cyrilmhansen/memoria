@@ -188,6 +188,33 @@ pub struct ArchiveLocation {
     pub frame_bytes: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingRawLocation {
+    pub location: ArchiveLocation,
+    pub batch_id: u64,
+}
+
+impl std::ops::Deref for PendingRawLocation {
+    type Target = ArchiveLocation;
+
+    fn deref(&self) -> &Self::Target {
+        &self.location
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableRawBatch {
+    pub batch_id: u64,
+    pub records: u64,
+    pub frame_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArchiveWriterState {
+    Ready,
+    Poisoned,
+}
+
 /// Result of checking one catalogue record against its RAW frame.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RecordInventoryStatus {
@@ -1459,6 +1486,36 @@ pub struct ArchiveWriter {
     segment_name: String,
     offset: u64,
     segment_number: u64,
+    batch_id: u64,
+    pending_records: u64,
+    pending_frame_bytes: u64,
+    file_dirty: bool,
+    namespace_sync_pending: bool,
+    current_segment_created: bool,
+    poisoned: Option<String>,
+    #[cfg(test)]
+    fault: ArchiveWriterFaultInjection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArchiveWriterWriteComponent {
+    Magic,
+    Id,
+    Length,
+    Checksum,
+    Payload,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+struct ArchiveWriterFaultInjection {
+    fail_component: Option<ArchiveWriterWriteComponent>,
+    partial_payload: bool,
+    fail_sync_remaining: usize,
+    fail_namespace_remaining: usize,
+    sync_calls: usize,
+    namespace_sync_calls: usize,
+    namespace_sync_paths: Vec<PathBuf>,
 }
 
 impl ArchiveWriter {
@@ -1477,6 +1534,7 @@ impl ArchiveWriter {
         let segment_number = numbers.max().unwrap_or(0);
         let segment_name = format!("segment-{segment_number:06}.arc");
         let path = root.join(&segment_name);
+        let segment_created = !path.exists();
         let mut file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -1490,42 +1548,206 @@ impl ArchiveWriter {
             segment_name,
             offset,
             segment_number,
+            batch_id: 0,
+            pending_records: 0,
+            pending_frame_bytes: 0,
+            file_dirty: false,
+            namespace_sync_pending: false,
+            current_segment_created: segment_created,
+            poisoned: None,
+            #[cfg(test)]
+            fault: ArchiveWriterFaultInjection::default(),
         })
     }
 
-    pub fn append(&mut self, message: &Message) -> io::Result<ArchiveLocation> {
+    #[cfg(test)]
+    fn open_with_faults(
+        root: &Path,
+        segment_bytes: u64,
+        fault: ArchiveWriterFaultInjection,
+    ) -> io::Result<Self> {
+        let mut writer = Self::open(root, segment_bytes)?;
+        writer.fault = fault;
+        Ok(writer)
+    }
+
+    pub fn append(&mut self, message: &Message) -> io::Result<PendingRawLocation> {
         self.append_raw(message.id, &message.raw)
     }
 
-    pub fn append_raw(&mut self, id: u64, raw: &[u8]) -> io::Result<ArchiveLocation> {
-        let frame_bytes = 8 + 8 + 8 + 8 + raw.len() as u64;
+    pub fn append_raw(&mut self, id: u64, raw: &[u8]) -> io::Result<PendingRawLocation> {
+        self.ensure_ready()?;
+        let frame_bytes = FRAME_HEADER_BYTES
+            .checked_add(raw.len() as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "frame size overflow"))?;
         if self.offset > 0 && self.offset + frame_bytes > self.segment_bytes {
-            self.file.sync_all()?;
-            self.segment_number += 1;
-            self.segment_name = format!("segment-{:06}.arc", self.segment_number);
-            self.file = OpenOptions::new()
+            self.sync_current_file()?;
+            let next_segment_number = self.segment_number + 1;
+            let next_segment_name = format!("segment-{next_segment_number:06}.arc");
+            let next_file = OpenOptions::new()
                 .create(true)
+                .create_new(true)
                 .read(true)
                 .append(true)
-                .open(self.root.join(&self.segment_name))?;
-            self.offset = self.file.seek(SeekFrom::End(0))?;
+                .open(self.root.join(&next_segment_name))?;
+            self.file = next_file;
+            self.segment_number = next_segment_number;
+            self.segment_name = next_segment_name;
+            self.offset = 0;
+            self.file_dirty = false;
+            self.namespace_sync_pending = false;
+            self.current_segment_created = true;
         }
         let start = self.offset;
-        self.file.write_all(FRAME_MAGIC)?;
-        self.file.write_all(&id.to_le_bytes())?;
-        self.file.write_all(&(raw.len() as u64).to_le_bytes())?;
-        self.file.write_all(&fnv64(raw).to_le_bytes())?;
-        self.file.write_all(raw)?;
+        self.write_frame_component(ArchiveWriterWriteComponent::Magic, FRAME_MAGIC)?;
+        self.write_frame_component(ArchiveWriterWriteComponent::Id, &id.to_le_bytes())?;
+        self.write_frame_component(
+            ArchiveWriterWriteComponent::Length,
+            &(raw.len() as u64).to_le_bytes(),
+        )?;
+        self.write_frame_component(
+            ArchiveWriterWriteComponent::Checksum,
+            &fnv64(raw).to_le_bytes(),
+        )?;
+        self.write_frame_component(ArchiveWriterWriteComponent::Payload, raw)?;
         self.offset += frame_bytes;
-        Ok(ArchiveLocation {
-            segment: self.segment_name.clone(),
-            offset: start,
-            frame_bytes,
+        self.pending_records += 1;
+        self.pending_frame_bytes += frame_bytes;
+        if self.current_segment_created {
+            self.namespace_sync_pending = true;
+        }
+        Ok(PendingRawLocation {
+            location: ArchiveLocation {
+                segment: self.segment_name.clone(),
+                offset: start,
+                frame_bytes,
+            },
+            batch_id: self.batch_id,
         })
     }
 
+    pub fn durable_barrier(&mut self) -> io::Result<DurableRawBatch> {
+        self.ensure_ready()?;
+        if self.file_dirty {
+            self.sync_current_file()?;
+        }
+        if self.namespace_sync_pending {
+            self.sync_namespace()?;
+            self.namespace_sync_pending = false;
+        }
+        let receipt = DurableRawBatch {
+            batch_id: self.batch_id,
+            records: self.pending_records,
+            frame_bytes: self.pending_frame_bytes,
+        };
+        self.batch_id += 1;
+        self.pending_records = 0;
+        self.pending_frame_bytes = 0;
+        Ok(receipt)
+    }
+
     pub fn sync(&mut self) -> io::Result<()> {
-        self.file.sync_all()
+        self.durable_barrier().map(|_| ())
+    }
+
+    pub fn state(&self) -> ArchiveWriterState {
+        if self.poisoned.is_some() {
+            ArchiveWriterState::Poisoned
+        } else {
+            ArchiveWriterState::Ready
+        }
+    }
+
+    pub fn pending_raw(&self) -> (u64, u64) {
+        (self.pending_records, self.pending_frame_bytes)
+    }
+
+    pub fn file_dirty(&self) -> bool {
+        self.file_dirty
+    }
+
+    pub fn namespace_sync_pending(&self) -> bool {
+        self.namespace_sync_pending
+    }
+
+    fn ensure_ready(&self) -> io::Result<()> {
+        if let Some(reason) = &self.poisoned {
+            return Err(io::Error::other(format!(
+                "archive writer is poisoned: {reason}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn poison(&mut self, error: io::Error) -> io::Error {
+        if self.poisoned.is_none() {
+            self.poisoned = Some(error.to_string());
+        }
+        error
+    }
+
+    fn write_frame_component(
+        &mut self,
+        component: ArchiveWriterWriteComponent,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        self.file_dirty = true;
+        #[cfg(not(test))]
+        let _ = component;
+        #[cfg(test)]
+        if self.fault.fail_component == Some(component) {
+            if component == ArchiveWriterWriteComponent::Payload && self.fault.partial_payload {
+                let prefix_len = bytes.len().min(1);
+                self.file
+                    .write_all(&bytes[..prefix_len])
+                    .map_err(|error| self.poison(error))?;
+            }
+            return Err(self.poison(io::Error::other(format!(
+                "injected failure during {component:?}"
+            ))));
+        }
+        self.file
+            .write_all(bytes)
+            .map_err(|error| self.poison(error))
+    }
+
+    fn sync_current_file(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            self.fault.sync_calls += 1;
+            if self.fault.fail_sync_remaining > 0 {
+                self.fault.fail_sync_remaining -= 1;
+                return Err(io::Error::other("injected segment sync failure"));
+            }
+        }
+        self.file.sync_all()?;
+        self.file_dirty = false;
+        Ok(())
+    }
+
+    fn sync_namespace(&mut self) -> io::Result<()> {
+        #[cfg(test)]
+        {
+            self.fault.namespace_sync_calls += 1;
+            self.fault.namespace_sync_paths.push(self.root.clone());
+            if self.fault.fail_namespace_remaining > 0 {
+                self.fault.fail_namespace_remaining -= 1;
+                return Err(io::Error::other("injected namespace sync failure"));
+            }
+        }
+        sync_archive_namespace(&self.root)
+    }
+}
+
+fn sync_archive_namespace(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
     }
 }
 
@@ -3829,6 +4051,202 @@ mod tests {
     }
 
     #[test]
+    fn archive_writer_pending_batches_and_empty_barriers_are_explicit() {
+        let root = raw_read_test_root("writer-pending");
+        let _ = fs::remove_dir_all(&root);
+        let mut writer = ArchiveWriter::open(&root, 4096).unwrap();
+
+        let empty = writer.durable_barrier().unwrap();
+        assert_eq!(empty.records, 0);
+        assert_eq!(empty.frame_bytes, 0);
+        assert!(!writer.file_dirty());
+        assert!(!writer.namespace_sync_pending());
+        assert_eq!(writer.fault.sync_calls, 0);
+        assert_eq!(writer.fault.namespace_sync_calls, 0);
+        let empty_again = writer.durable_barrier().unwrap();
+        assert_eq!(empty_again.records, 0);
+        assert_eq!(empty_again.frame_bytes, 0);
+        assert!(empty_again.batch_id > empty.batch_id);
+        assert_eq!(writer.fault.sync_calls, 0);
+        assert_eq!(writer.fault.namespace_sync_calls, 0);
+
+        let pending = writer.append_raw(7, b"pending").unwrap();
+        assert_eq!(pending.batch_id, empty_again.batch_id + 1);
+        assert_eq!(writer.pending_raw(), (1, pending.frame_bytes));
+        assert_eq!(writer.state(), ArchiveWriterState::Ready);
+        assert!(writer.file_dirty());
+        assert!(writer.namespace_sync_pending());
+        let durable = writer.durable_barrier().unwrap();
+        assert_eq!(durable.batch_id, pending.batch_id);
+        assert_eq!(durable.records, 1);
+        assert_eq!(durable.frame_bytes, pending.frame_bytes);
+        assert_eq!(writer.pending_raw(), (0, 0));
+        assert!(!writer.file_dirty());
+        assert!(!writer.namespace_sync_pending());
+        assert_eq!(writer.fault.sync_calls, 1);
+        assert_eq!(writer.fault.namespace_sync_calls, 1);
+        writer.durable_barrier().unwrap();
+        assert_eq!(writer.fault.sync_calls, 1);
+        assert_eq!(writer.fault.namespace_sync_calls, 1);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn archive_writer_poison_is_sticky_for_every_frame_component() {
+        let components = [
+            ArchiveWriterWriteComponent::Magic,
+            ArchiveWriterWriteComponent::Id,
+            ArchiveWriterWriteComponent::Length,
+            ArchiveWriterWriteComponent::Checksum,
+            ArchiveWriterWriteComponent::Payload,
+        ];
+        for component in components {
+            let root = raw_read_test_root(&format!("writer-poison-{component:?}"));
+            let _ = fs::remove_dir_all(&root);
+            let mut writer = ArchiveWriter::open_with_faults(
+                &root,
+                4096,
+                ArchiveWriterFaultInjection {
+                    fail_component: Some(component),
+                    partial_payload: component == ArchiveWriterWriteComponent::Payload,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let first = writer.append_raw(7, b"poison").unwrap_err();
+            assert!(first.to_string().contains("injected failure"));
+            assert_eq!(writer.state(), ArchiveWriterState::Poisoned);
+            let second = writer.append_raw(8, b"later").unwrap_err();
+            assert!(second.to_string().contains("archive writer is poisoned"));
+            let barrier = writer.durable_barrier().unwrap_err();
+            assert!(barrier.to_string().contains("archive writer is poisoned"));
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn archive_writer_sync_failure_is_retryable_and_rotation_syncs_old_segment() {
+        let root = raw_read_test_root("writer-sync-failure");
+        let _ = fs::remove_dir_all(&root);
+        let mut writer = ArchiveWriter::open_with_faults(
+            &root,
+            4096,
+            ArchiveWriterFaultInjection {
+                fail_sync_remaining: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        writer.append_raw(1, &[1u8; 64]).unwrap();
+        assert!(writer.durable_barrier().is_err());
+        assert_eq!(writer.state(), ArchiveWriterState::Ready);
+        assert_eq!(writer.pending_raw().0, 1);
+        assert!(writer.file_dirty());
+        assert!(writer.durable_barrier().is_ok());
+        assert_eq!(writer.fault.sync_calls, 2);
+        let _ = fs::remove_dir_all(&root);
+
+        let root = raw_read_test_root("writer-rotation");
+        let _ = fs::remove_dir_all(&root);
+        let mut writer = ArchiveWriter::open(&root, 1024).unwrap();
+        writer.append_raw(1, &[1u8; 800]).unwrap();
+        writer.durable_barrier().unwrap();
+        let first_segment = root.join("segment-000000.arc");
+        writer.append_raw(2, &[2u8; 800]).unwrap();
+        assert_eq!(writer.segment_name, "segment-000001.arc");
+        assert_eq!(writer.fault.sync_calls, 2);
+        assert!(fs::metadata(first_segment).unwrap().len() > 0);
+        assert!(writer.namespace_sync_pending());
+        writer.durable_barrier().unwrap();
+        assert_eq!(writer.fault.sync_calls, 3);
+        assert!(!writer.namespace_sync_pending());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn archive_writer_namespace_barrier_failure_is_retryable() {
+        let root = raw_read_test_root("writer-namespace-failure");
+        let _ = fs::remove_dir_all(&root);
+        let mut writer = ArchiveWriter::open_with_faults(
+            &root,
+            4096,
+            ArchiveWriterFaultInjection {
+                fail_namespace_remaining: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        writer.append_raw(1, b"namespace").unwrap();
+        assert!(writer.durable_barrier().is_err());
+        assert!(!writer.file_dirty());
+        assert!(writer.namespace_sync_pending());
+        writer.durable_barrier().unwrap();
+        assert_eq!(writer.fault.sync_calls, 1);
+        assert_eq!(writer.fault.namespace_sync_calls, 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn archive_writer_namespace_sync_is_scoped_to_archive_root() {
+        for root_preexisting in [true, false] {
+            let root = raw_read_test_root(if root_preexisting {
+                "namespace-existing-root"
+            } else {
+                "namespace-created-root"
+            });
+            let _ = fs::remove_dir_all(&root);
+            if root_preexisting {
+                fs::create_dir_all(&root).unwrap();
+            }
+            assert_eq!(root.exists(), root_preexisting);
+            let mut writer = ArchiveWriter::open_with_faults(
+                &root,
+                4096,
+                ArchiveWriterFaultInjection::default(),
+            )
+            .unwrap();
+            writer.append_raw(1, b"namespace scope").unwrap();
+            writer.durable_barrier().unwrap();
+            assert_eq!(writer.fault.namespace_sync_paths, vec![root.clone()]);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn archive_writer_reopen_appends_after_an_uncertain_frame_without_truncating() {
+        let root = raw_read_test_root("writer-reopen");
+        let _ = fs::remove_dir_all(&root);
+        let mut writer = ArchiveWriter::open(&root, 4096).unwrap();
+        writer.append_raw(1, b"durable").unwrap();
+        writer.durable_barrier().unwrap();
+        drop(writer);
+
+        let mut failed = ArchiveWriter::open_with_faults(
+            &root,
+            4096,
+            ArchiveWriterFaultInjection {
+                fail_component: Some(ArchiveWriterWriteComponent::Payload),
+                partial_payload: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(failed.append_raw(2, b"uncertain").is_err());
+        drop(failed);
+        let length_after_failure = fs::metadata(root.join("segment-000000.arc")).unwrap().len();
+
+        let mut reopened = ArchiveWriter::open(&root, 4096).unwrap();
+        let later = reopened.append_raw(3, b"later").unwrap();
+        reopened.durable_barrier().unwrap();
+        let final_length = fs::metadata(root.join("segment-000000.arc")).unwrap().len();
+        assert!(final_length > length_after_failure);
+        let (record_id, raw) = read_record(&root, &later.location).unwrap();
+        assert_eq!(record_id, 3);
+        assert_eq!(raw, b"later");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn corpus_is_deterministic_from_seed_and_id() {
         let config = CorpusConfig {
             messages: 10,
@@ -4079,7 +4497,7 @@ mod tests {
         writer.sync().unwrap();
         drop(writer);
 
-        let mut wrong_frame_bytes = location.clone();
+        let mut wrong_frame_bytes = location.location.clone();
         wrong_frame_bytes.frame_bytes -= 1;
         assert_eq!(
             read_record(&archive, &wrong_frame_bytes)
@@ -4088,14 +4506,14 @@ mod tests {
             io::ErrorKind::InvalidData
         );
 
-        let mut outside = location.clone();
+        let mut outside = location.location.clone();
         outside.offset = u64::MAX;
         assert_eq!(
             read_record(&archive, &outside).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
 
-        let mut invalid_segment = location;
+        let mut invalid_segment = location.location;
         invalid_segment.segment = "../segment-000000.arc".into();
         assert_eq!(
             read_record(&archive, &invalid_segment).unwrap_err().kind(),
@@ -4155,7 +4573,7 @@ mod tests {
                 raw: raw.clone(),
             };
             insert_metadata(&catalog, &message, &location).unwrap();
-            locations.push(location);
+            locations.push(location.location);
         }
         writer.sync().unwrap();
         drop(catalog);
@@ -4427,7 +4845,7 @@ mod tests {
                 &location,
             )
             .unwrap();
-            locations.push(location);
+            locations.push(location.location);
         }
         writer.sync().unwrap();
         drop(catalog);

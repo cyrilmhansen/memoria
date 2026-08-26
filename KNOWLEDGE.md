@@ -683,3 +683,22 @@ résultats d'expérience locale :
 - **Limite :** A3.1 ne rend pas atomique ou durable l’ordre RAW → SQLite et ne
   résout donc pas la publication complète, la crash-consistency ou le
   multiwriter.
+
+## 2026-08-26 — Tier A3.2a : durabilité RAW explicite
+
+- **Fait vérifié :** `ArchiveWriter::append_raw` retourne une
+  `PendingRawLocation` liée au lot courant; seule `durable_barrier` produit un
+  reçu `DurableRawBatch` couvrant les records et bytes du lot précédent.
+- **Fait vérifié :** toute erreur pendant l’écriture des composants d’une frame
+  empoisonne définitivement le writer courant. Une nouvelle ouverture reprend
+  à l’EOF sans troncature ni réparation.
+- **Fait vérifié :** lorsque le répertoire d’archive est déjà établi
+  durablement, la barrière synchronise le segment courant lorsqu’il est dirty
+  et, sous Unix, le répertoire pour les segments nouvellement créés. `open` peut
+  créer ce répertoire, mais la primitive ne synchronise pas son parent : la
+  durabilité de la création initiale de l’archive reste une dette séparée.
+  Sous Windows, la synchronisation de namespace n’est pas revendiquée par
+  cette primitive minimale.
+- **Limite :** Gmail et IMAP publient encore SQLite selon leur ordre actuel et
+  n’utilisent pas encore un group commit RAW/catalogue; A3.2a ne résout donc
+  pas A3.

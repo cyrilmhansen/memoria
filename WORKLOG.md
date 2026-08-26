@@ -779,3 +779,21 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
   rollback complet pour Gmail et IMAP, puis le retry sans blocage `UNIQUE`.
 - Cette étape ne modifie ni l’ordre RAW → SQLite, ni `ArchiveWriter`, ni les
   syncs, ni Tantivy ; A3 global reste non résolu.
+
+## 2026-08-26 — Implémentation A3.2a : primitive de durabilité RAW
+
+- `ArchiveWriter` distingue désormais les locations RAW pending des lots
+  durablement barriérés et expose l’état minimal Ready/Poisoned.
+- Une erreur d’écriture de magic, ID, longueur, checksum ou payload empoisonne
+  le writer ; les barrières et append ultérieurs échouent sans recalage ni
+  troncature. Une nouvelle ouverture reprend à l’EOF.
+- Les barrières synchronisent les écritures dirty et, sous Unix, le namespace
+  du répertoire d’archive lorsqu’un segment a été créé, sous la précondition
+  que ce répertoire est déjà établi durablement. `ArchiveWriter::open` peut
+  créer le root, mais son parent n’est pas synchronisé ; cette durabilité
+  initiale reste une dette séparée. La garantie namespace n’est pas revendiquée
+  sous Windows.
+- Tests ajoutés pour les composants en échec, les barrières retryables, la
+  rotation, le namespace, les barrières vides et la réouverture.
+- Gmail/IMAP, SQLite, le format et l’ordre de publication restent inchangés ;
+  A3.2b est nécessaire pour leur coordination.
