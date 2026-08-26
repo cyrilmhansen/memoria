@@ -742,8 +742,8 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
 ## 2026-08-25 — Implémentation A2.2 : indexation Tantivy partielle
 
 - Le chemin incrémental `index_gmail_archive`, appelé après les
-  synchronisations Gmail/IMAP, conserve le fast-path pour les fingerprints
-  inchangés. `rebuild_gmail_archive` revalide tous les RAW `present` via
+  synchronisations Gmail/IMAP, revalide désormais le RAW lié même sur son
+  fast-path pour les fingerprints inchangés. `rebuild_gmail_archive` revalide tous les RAW `present` via
   `inventory_records`; les corruptions postérieures à l’indexation sont ainsi
   détectées explicitement en mode rebuild.
 - Les suppressions Tantivy et `indexed_docs` passent par le même chemin local
@@ -860,6 +860,25 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
 - **État :** A1.1 est obtenu ; A1.2 reste ouvert pour les lecteurs
   autoritatifs secondaires.
 
+## 2026-08-26 — A1.2 : propagation aux lecteurs secondaires
+
+- Inventaire : `read_record` est conservé pour la lecture physique et
+  `inventory_records` pour le diagnostic indépendant ; ils ne sont pas des
+  lectures catalogue autoritatives. L’analyse MIME, `for_each_archived_message`,
+  la validation d’identité source et l’indexation/reconstruction Tantivy sont
+  les lecteurs autoritatifs traités.
+- Ces chemins consomment maintenant `RawReference`/`read_authoritative_raw`;
+  le fast-path incrémental revalide également le RAW avant de conserver une
+  entrée indexée. Les coordonnées valides vers une autre frame et les digests
+  erronés échouent sans substitution silencieuse.
+- Test ajouté : l’index secondaire refuse la substitution de la frame du
+  `doc_id=0` à celle du `doc_id=1` et un digest catalogue incorrect, tandis
+  que la référence correcte reste indexable. Le scénario même `doc_id`, avec
+  contenu différent, est déjà couvert par le test A1.1 de `read_archived_raw`.
+- **État :** A1 global est fermé : les lecteurs autoritatifs identifiés par
+  cet inventaire ont été corrigés ; les primitives physiques restent hors de
+  cette frontière d’autorité.
+
 ## 2026-08-26 — Correction Sol High : validation catalogue complète
 
 - Le dernier bypass `Connection::open` de `archive_summary` a été supprimé ;
@@ -876,5 +895,5 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
   fichier existant. Les tests vérifient aussi les
   catalogues version 0 à application_id correct, colonnes/index incompatibles,
   SQL trompeur et l’absence byte-à-byte de sidecars lors du refus.
-- **État :** A1 global reste ouvert jusqu’à A1.2 ; cette correction ne
-  propage pas encore la référence liée aux lecteurs autoritatifs secondaires.
+- **État corrigé :** la correction A1.2 ci-dessus a depuis propagé la
+  référence liée aux lecteurs autoritatifs secondaires ; A1 global est fermé.

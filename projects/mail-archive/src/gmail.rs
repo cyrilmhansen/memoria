@@ -258,33 +258,26 @@ pub fn analyze_archived_mime(root: &Path) -> Result<OfflineMimeReport, GmailErro
     let connection = crate::open_catalogue(&root.join("metadata.sqlite"))
         .map_err(|error| GmailError::Other(error.to_string()))?;
     let mut statement = connection
-        .prepare("SELECT doc_id,segment,archive_offset,frame_bytes FROM messages ORDER BY doc_id")
+        .prepare("SELECT doc_id FROM messages ORDER BY doc_id")
         .map_err(|error| GmailError::Other(error.to_string()))?;
     let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, i64>(0)? as u64,
-                crate::ArchiveLocation {
-                    segment: row.get(1)?,
-                    offset: row.get::<_, i64>(2)? as u64,
-                    frame_bytes: row.get::<_, i64>(3)? as u64,
-                },
-            ))
-        })
+        .query_map([], |row| row.get::<_, i64>(0))
         .map_err(|error| GmailError::Other(error.to_string()))?;
+    let doc_ids: Vec<u64> = rows
+        .map(|row| {
+            row.map(|doc_id| doc_id as u64)
+                .map_err(|error| GmailError::Other(error.to_string()))
+        })
+        .collect::<Result<_, _>>()?;
     let mut report = OfflineMimeReport::default();
     let mut encoded_hashes = std::collections::HashMap::new();
     let mut decoded_hashes = std::collections::HashMap::new();
     let mut candidate_encoded_hashes = std::collections::HashMap::new();
     let mut candidate_decoded_hashes = std::collections::HashMap::new();
     let mut candidate_over_64k_hashes = std::collections::HashMap::new();
-    for row in rows {
-        let (doc_id, location) = row.map_err(|error| GmailError::Other(error.to_string()))?;
-        let (record_id, raw) = crate::read_record(&root.join("archive"), &location)
+    for doc_id in doc_ids {
+        let raw = crate::read_catalogue_raw(&root.join("archive"), &connection, doc_id)
             .map_err(|error| GmailError::Io(error.to_string()))?;
-        if record_id != doc_id {
-            return Err(GmailError::Other("catalog/archive id mismatch".into()));
-        }
         report.messages += 1;
         report.raw_sizes.push(raw.len());
         report.checksum_verified_frames += 1;

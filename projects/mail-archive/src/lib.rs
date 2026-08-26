@@ -2093,7 +2093,7 @@ pub(crate) fn validate_catalog_record(
 ) -> io::Result<()> {
     let row = connection
         .query_row(
-            "SELECT message_id,segment,archive_offset,frame_bytes FROM messages WHERE doc_id=?1",
+            "SELECT message_id,segment,archive_offset,frame_bytes,raw_blake3 FROM messages WHERE doc_id=?1",
             [doc_id],
             |row| {
                 Ok((
@@ -2101,6 +2101,7 @@ pub(crate) fn validate_catalog_record(
                     row.get::<_, String>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
                 ))
             },
         )
@@ -2119,33 +2120,83 @@ pub(crate) fn validate_catalog_record(
             "catalogue archive coordinate is negative",
         ));
     }
-    let location = ArchiveLocation {
-        segment: row.1,
-        offset: u64::try_from(row.2).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "catalogue archive offset overflow",
-            )
-        })?,
-        frame_bytes: u64::try_from(row.3).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "catalogue frame length overflow",
-            )
-        })?,
-    };
-    let (frame_id, _) = read_record(archive_root, &location)?;
-    if frame_id
-        != u64::try_from(doc_id).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "negative catalogue document ID")
-        })?
-    {
+    let reference = raw_reference_from_catalog_values(doc_id, row.1, row.2, row.3, row.4)?;
+    read_authoritative_raw(archive_root, &reference)?;
+    Ok(())
+}
+
+fn raw_reference_from_catalog_values(
+    doc_id: i64,
+    segment: String,
+    offset: i64,
+    frame_bytes: i64,
+    raw_blake3: Vec<u8>,
+) -> io::Result<RawReference> {
+    if doc_id < 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "catalogue/frame ID mismatch",
+            "negative catalogue document ID",
         ));
     }
-    Ok(())
+    if offset < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "negative archive offset",
+        ));
+    }
+    if frame_bytes < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "negative archive frame length",
+        ));
+    }
+    if raw_blake3.len() != 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "catalogue raw BLAKE3 length is not 32 bytes",
+        ));
+    }
+    let mut blake3 = [0u8; 32];
+    blake3.copy_from_slice(&raw_blake3);
+    Ok(RawReference {
+        doc_id: doc_id as u64,
+        location: ArchiveLocation {
+            segment,
+            offset: offset as u64,
+            frame_bytes: frame_bytes as u64,
+        },
+        blake3,
+    })
+}
+
+pub(crate) fn read_catalogue_raw(
+    archive_root: &Path,
+    connection: &Connection,
+    doc_id: u64,
+) -> io::Result<Vec<u8>> {
+    let catalog_id = i64::try_from(doc_id).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "archive record id does not fit in the catalog",
+        )
+    })?;
+    let (segment, offset, frame_bytes, raw_blake3) = connection
+        .query_row(
+            "SELECT segment,archive_offset,frame_bytes,raw_blake3 FROM messages WHERE doc_id=?1",
+            [catalog_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            },
+        )
+        .map_err(sqlite_io)?;
+    let reference =
+        raw_reference_from_catalog_values(catalog_id, segment, offset, frame_bytes, raw_blake3)?;
+    read_authoritative_raw(archive_root, &reference)
 }
 
 pub fn parse_archived_message(id: u64, raw: &[u8]) -> io::Result<ParsedMessage> {
@@ -2345,32 +2396,27 @@ where
 {
     let metadata = open_catalogue(&root.join("metadata.sqlite")).map_err(sqlite_io)?;
     let mut statement = metadata
-        .prepare("SELECT doc_id, segment, archive_offset, frame_bytes FROM messages WHERE doc_id >= ?1 AND doc_id < ?2 ORDER BY doc_id")
+        .prepare("SELECT doc_id, segment, archive_offset, frame_bytes, raw_blake3 FROM messages WHERE doc_id >= ?1 AND doc_id < ?2 ORDER BY doc_id")
         .map_err(sqlite_io)?;
     let rows = statement
         .query_map(params![start_id as i64, end_id as i64], |row| {
             Ok((
                 row.get::<_, i64>(0)? as u64,
-                ArchiveLocation {
-                    segment: row.get(1)?,
-                    offset: row.get::<_, i64>(2)? as u64,
-                    frame_bytes: row.get::<_, i64>(3)? as u64,
-                },
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
             ))
         })
         .map_err(sqlite_io)?;
     let mut stats = PipelineStats::default();
     for row in rows {
-        let (id, location) = row.map_err(sqlite_io)?;
+        let (id, segment, offset, frame_bytes, digest) = row.map_err(sqlite_io)?;
+        let reference =
+            raw_reference_from_catalog_values(id as i64, segment, offset, frame_bytes, digest)?;
         let read_started = Instant::now();
-        let (record_id, raw) = read_record(&root.join("archive"), &location)?;
+        let raw = read_authoritative_raw(&root.join("archive"), &reference)?;
         stats.read_us += read_started.elapsed().as_micros();
-        if record_id != id {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "catalog/archive id mismatch",
-            ));
-        }
         let parse_started = Instant::now();
         let message = parse_archived_message(id, &raw)?;
         stats.parse_us += parse_started.elapsed().as_micros();
@@ -4075,6 +4121,18 @@ struct GmailCatalogRow {
     source_state: String,
     timestamp: i64,
     location: ArchiveLocation,
+    raw_blake3: Vec<u8>,
+}
+
+fn read_gmail_catalog_raw(root: &Path, row: &GmailCatalogRow) -> io::Result<Vec<u8>> {
+    let reference = raw_reference_from_catalog_values(
+        row.doc_id as i64,
+        row.location.segment.clone(),
+        row.location.offset as i64,
+        row.location.frame_bytes as i64,
+        row.raw_blake3.clone(),
+    )?;
+    read_authoritative_raw(&root.join("archive"), &reference)
 }
 
 fn for_each_gmail_catalog_row<F>(root: &Path, mut visit: F) -> io::Result<()>
@@ -4084,16 +4142,16 @@ where
     let connection = open_catalogue(&root.join("metadata.sqlite")).map_err(sqlite_io)?;
     let mut statement = connection
         .prepare(
-            "SELECT doc_id,source_account,labels,source_state,timestamp,segment,archive_offset,frame_bytes
+            "SELECT doc_id,source_account,labels,source_state,timestamp,segment,archive_offset,frame_bytes,raw_blake3
              FROM (
                SELECT g.doc_id AS doc_id,g.source_account AS source_account,g.label_ids AS labels,g.source_state AS source_state,
                       COALESCE(g.internal_date_ms,0) AS timestamp,
-                      m.segment AS segment,m.archive_offset AS archive_offset,m.frame_bytes AS frame_bytes
+                      m.segment AS segment,m.archive_offset AS archive_offset,m.frame_bytes AS frame_bytes,m.raw_blake3 AS raw_blake3
                FROM gmail_messages g JOIN messages m ON m.doc_id=g.doc_id
                UNION ALL
                SELECT i.doc_id AS doc_id,i.source_account AS source_account,'[]' AS labels,i.source_state AS source_state,
                       COALESCE(i.internal_date_ms,0) AS timestamp,
-                      m.segment AS segment,m.archive_offset AS archive_offset,m.frame_bytes AS frame_bytes
+                      m.segment AS segment,m.archive_offset AS archive_offset,m.frame_bytes AS frame_bytes,m.raw_blake3 AS raw_blake3
                FROM imap_messages i JOIN messages m ON m.doc_id=i.doc_id
              )
              ORDER BY doc_id",
@@ -4112,6 +4170,7 @@ where
                     offset: row.get::<_, i64>(6)? as u64,
                     frame_bytes: row.get::<_, i64>(7)? as u64,
                 },
+                raw_blake3: row.get(8)?,
             })
         })
         .map_err(sqlite_io)?;
@@ -4316,6 +4375,13 @@ where
             return Ok(());
         }
         if mode == GmailIndexMode::Incremental && unchanged {
+            if read_gmail_catalog_raw(root, &row).is_err() {
+                delete_indexed_doc(&mut writer, fields, &state_transaction, row.doc_id)?;
+                stats.raw_inconsistent += 1;
+                stats.removed += 1;
+                changed = true;
+                return Ok(());
+            }
             stats.skipped += 1;
             return Ok(());
         }
@@ -4340,8 +4406,8 @@ where
         }
         writer.delete_term(Term::from_field_u64(fields.doc_id, row.doc_id));
         let read_started = Instant::now();
-        let (record_id, raw) = match read_record(&root.join("archive"), &row.location) {
-            Ok(value) => value,
+        let raw = match read_gmail_catalog_raw(root, &row) {
+            Ok(raw) => raw,
             Err(_) => {
                 delete_indexed_doc(&mut writer, fields, &state_transaction, row.doc_id)?;
                 stats.raw_inconsistent += 1;
@@ -4351,13 +4417,6 @@ where
             }
         };
         stats.read_us += read_started.elapsed().as_micros();
-        if record_id != row.doc_id {
-            delete_indexed_doc(&mut writer, fields, &state_transaction, row.doc_id)?;
-            stats.raw_inconsistent += 1;
-            stats.removed += 1;
-            changed = true;
-            return Ok(());
-        }
         let parse_started = Instant::now();
         let parsed = match parse_gmail_message(&raw, labels_for_index(&row.labels)) {
             Ok(parsed) => parsed,
@@ -4637,48 +4696,7 @@ pub fn search_gmail_archive(
 
 pub fn read_archived_raw(root: &Path, doc_id: u64) -> io::Result<Vec<u8>> {
     let catalog = open_catalogue(&root.join("metadata.sqlite")).map_err(sqlite_io)?;
-    let catalog_id = i64::try_from(doc_id).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "archive record id does not fit in the catalog",
-        )
-    })?;
-    let (segment, offset, frame_bytes, raw_blake3) = catalog
-        .query_row(
-            "SELECT segment,archive_offset,frame_bytes,raw_blake3 FROM messages WHERE doc_id=?1",
-            [catalog_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
-                ))
-            },
-        )
-        .map_err(sqlite_io)?;
-    if raw_blake3.len() != 32 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "catalogue raw BLAKE3 length is not 32 bytes",
-        ));
-    }
-    let mut expected_blake3 = [0u8; 32];
-    expected_blake3.copy_from_slice(&raw_blake3);
-    let reference = RawReference {
-        doc_id,
-        location: ArchiveLocation {
-            segment,
-            offset: u64::try_from(offset).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "negative archive offset")
-            })?,
-            frame_bytes: u64::try_from(frame_bytes).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "negative archive frame length")
-            })?,
-        },
-        blake3: expected_blake3,
-    };
-    read_authoritative_raw(&root.join("archive"), &reference)
+    read_catalogue_raw(&root.join("archive"), &catalog, doc_id)
 }
 
 pub fn read_authoritative_raw(
@@ -6525,7 +6543,47 @@ mod tests {
     }
 
     #[test]
-    fn gmail_index_incremental_fast_path_defers_post_index_corruption_to_rebuild() {
+    fn gmail_index_rejects_catalogue_substitution_and_wrong_digest() {
+        let (root, locations) = gmail_inventory_fixture("linked-secondary");
+        assert_eq!(index_gmail_archive(&root).unwrap().indexed, 3);
+
+        let catalog = Connection::open(root.join("metadata.sqlite")).unwrap();
+        catalog
+            .execute(
+                "UPDATE messages SET segment=?1, archive_offset=?2, frame_bytes=?3 WHERE doc_id=1",
+                params![
+                    locations[0].segment,
+                    locations[0].offset as i64,
+                    locations[0].frame_bytes as i64
+                ],
+            )
+            .unwrap();
+        drop(catalog);
+        let stats = index_gmail_archive(&root).unwrap();
+        assert_eq!(stats.raw_inconsistent, 1);
+        assert_eq!(indexed_doc_ids(&root), vec![0, 2]);
+
+        let catalog = Connection::open(root.join("metadata.sqlite")).unwrap();
+        catalog
+            .execute(
+                "UPDATE messages SET segment=?1, archive_offset=?2, frame_bytes=?3, raw_blake3=?4 WHERE doc_id=1",
+                params![
+                    locations[1].segment,
+                    locations[1].offset as i64,
+                    locations[1].frame_bytes as i64,
+                    vec![0u8; 32]
+                ],
+            )
+            .unwrap();
+        drop(catalog);
+        let stats = index_gmail_archive(&root).unwrap();
+        assert_eq!(stats.raw_inconsistent, 1);
+        assert_eq!(indexed_doc_ids(&root), vec![0, 2]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gmail_index_incremental_fast_path_revalidates_post_index_corruption() {
         let (root, locations) = gmail_inventory_fixture("incremental-fast-path");
         index_gmail_archive(&root).unwrap();
         let stats = index_gmail_archive(&root).unwrap();
@@ -6539,10 +6597,10 @@ mod tests {
         corrupted[locations[1].offset as usize + 32] ^= 1;
         fs::write(&segment_path, corrupted).unwrap();
         let stats = index_gmail_archive(&root).unwrap();
-        assert_eq!(stats.skipped, 3);
-        assert_eq!(stats.raw_inconsistent, 0);
-        assert!(!stats.partial);
-        assert_eq!(indexed_search_ids(&root, "a2-beta"), vec![1]);
+        assert_eq!(stats.skipped, 2);
+        assert_eq!(stats.raw_inconsistent, 1);
+        assert!(stats.partial);
+        assert!(indexed_search_ids(&root, "a2-beta").is_empty());
 
         let stats = rebuild_gmail_archive(&root).unwrap();
         assert_eq!(stats.raw_inconsistent, 1);
@@ -6622,9 +6680,9 @@ mod tests {
         drop(catalog);
 
         let stats = index_gmail_archive(&root).unwrap();
-        assert_eq!(stats.parse_failures, 1);
+        assert_eq!(stats.parse_failures, 0);
         assert_eq!(stats.raw_unavailable, 0);
-        assert_eq!(stats.raw_inconsistent, 0);
+        assert_eq!(stats.raw_inconsistent, 1);
         assert!(stats.partial);
         assert_eq!(indexed_doc_ids(&root), vec![0, 2]);
         assert!(indexed_search_ids(&root, "a2-beta").is_empty());

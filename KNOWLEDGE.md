@@ -771,3 +771,19 @@ résultats d'expérience locale :
   construit qui paraît v1.
 - **État :** A1.1 est obtenu ; A1 reste ouvert jusqu’à A1.2, qui doit encore
   propager la référence liée à tous les lecteurs autoritatifs secondaires.
+
+## 2026-08-26 — A1.2 : lecteurs secondaires liés au catalogue
+
+- **Fait vérifié :** l’analyse MIME hors ligne, le parcours des messages
+  archivés, la validation des identités source et la reconstruction Tantivy
+  utilisent désormais la référence catalogue complète et la primitive
+  autoritative (coordonnées, framing, `doc_id`, FNV et BLAKE3).
+- **Fait vérifié :** le fast-path incrémental Tantivy revalide aussi le RAW
+  lié avant de conserver un document indexé ; une substitution de coordonnées
+  ou un digest catalogue erroné est refusé.
+- **Distinction maintenue :** `read_record` et `inventory_records` restent des
+  primitives/outils de validation physique diagnostic, sans prétention de
+  liaison catalogue autoritative.
+- **État :** A1 est fermé : tous les lecteurs autoritatifs identifiés dans
+  l’inventaire sont maintenant liés ; `read_record`/`inventory_records` restent
+  explicitement physiques et diagnostiques.
