@@ -1,10 +1,14 @@
+#[cfg(target_os = "linux")]
 use serde_json::Value;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::thread;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use std::time::{Duration, Instant};
 
 static PREVIEW_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -13,7 +17,9 @@ static PREVIEW_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub enum PreviewError {
     Disabled,
     Unavailable,
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     Provider(String),
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     Timeout,
     Io(String),
 }
@@ -23,13 +29,16 @@ impl std::fmt::Display for PreviewError {
         match self {
             Self::Disabled => formatter.write_str("prévisualisations désactivées"),
             Self::Unavailable => formatter.write_str("aucun provider de miniature disponible"),
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             Self::Provider(error) => write!(formatter, "provider de miniature : {error}"),
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             Self::Timeout => formatter.write_str("le provider de miniature a expiré"),
             Self::Io(error) => write!(formatter, "prévisualisation impossible : {error}"),
         }
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<(), PreviewError> {
     let started = Instant::now();
     loop {
@@ -49,6 +58,7 @@ fn wait_with_timeout(child: &mut Child, timeout: Duration) -> Result<(), Preview
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn run_helper(program: &Path, args: &[&str]) -> Result<Output, PreviewError> {
     let mut child = Command::new(program)
         .args(args)
@@ -63,6 +73,7 @@ fn run_helper(program: &Path, args: &[&str]) -> Result<Output, PreviewError> {
         .map_err(|error| PreviewError::Io(error.to_string()))
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn executable_candidates(name: &str, variable: &str) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(path) = env::var_os(variable) {
@@ -77,6 +88,7 @@ fn executable_candidates(name: &str, variable: &str) -> Vec<PathBuf> {
     candidates
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn first_executable(candidates: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
     let path_entries = env::var_os("PATH")
         .map(|path| env::split_paths(&path).collect::<Vec<_>>())
@@ -101,6 +113,7 @@ fn output_path(directory: &Path) -> Result<PathBuf, PreviewError> {
     Ok(directory.join(format!("preview-{}-{serial}.png", std::process::id())))
 }
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn valid_output(path: &Path) -> Result<PathBuf, PreviewError> {
     let bytes = fs::read(path).map_err(|error| PreviewError::Io(error.to_string()))?;
     if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {
@@ -109,6 +122,7 @@ fn valid_output(path: &Path) -> Result<PathBuf, PreviewError> {
     Ok(path.to_path_buf())
 }
 
+#[cfg(target_os = "linux")]
 fn json_output(stdout: &[u8]) -> Option<PathBuf> {
     let value: Value = serde_json::from_slice(stdout).ok()?;
     (value.get("result")?.as_str()? == "thumbnail")
@@ -116,6 +130,7 @@ fn json_output(stdout: &[u8]) -> Option<PathBuf> {
         .flatten()
 }
 
+#[cfg(target_os = "linux")]
 fn machine_output(stdout: &[u8]) -> Option<PathBuf> {
     let line = std::str::from_utf8(stdout).ok()?.trim();
     let mut fields = line.split('\t');
@@ -125,6 +140,7 @@ fn machine_output(stdout: &[u8]) -> Option<PathBuf> {
     Some(PathBuf::from(fields.next()?))
 }
 
+#[cfg(target_os = "linux")]
 fn run_kio(input: &Path, output: &Path, size: u32) -> Result<PathBuf, PreviewError> {
     let mut candidates = executable_candidates(
         "memoria-kio-thumbnail-helper",
@@ -152,6 +168,7 @@ fn run_kio(input: &Path, output: &Path, size: u32) -> Result<PathBuf, PreviewErr
     valid_output(&path)
 }
 
+#[cfg(target_os = "linux")]
 fn run_freedesktop(input: &Path, size: u32) -> Result<PathBuf, PreviewError> {
     let Some(probe) = first_executable(executable_candidates(
         "system-thumbnail-probe",
@@ -178,6 +195,8 @@ pub fn preview_attachment(
     output_directory: &Path,
     max_size: u32,
 ) -> Result<PathBuf, PreviewError> {
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    let _ = (input, max_size);
     if env::var_os("MEMORIA_DISABLE_SYSTEM_PREVIEWS").is_some() {
         return Err(PreviewError::Disabled);
     }
@@ -225,7 +244,7 @@ pub fn preview_attachment(
 #[allow(dead_code)]
 fn main() {}
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
