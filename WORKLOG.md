@@ -812,3 +812,18 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
 - La liaison runtime est maintenant exacte : chaque location contient un
   ordinal et le `doc_id` écrit ; les publishers refusent les doublons, trous,
   ordinaux hors plage et identités discordantes, sans relire les RAW.
+
+## 2026-08-26 — Implémentation A3.3 : frontières source et retry fail-closed
+
+- Gmail sépare maintenant les parcours complets des parcours `query`/`max` ;
+  la fence complète non vide est prise avant le scan et `profile.historyId`
+  n’est pas utilisé comme fence. Une boîte vide ne publie aucune nouvelle
+  frontière ; l’incremental exige un `historyId` terminal avant le commit
+  séparé du curseur.
+- Les skips Gmail/IMAP valident désormais la ligne `messages`, l’identité
+  canonique et la frame RAW avec A1. Les identités existantes incohérentes et
+  les collisions historiques canoniques bloquent sans réparation ; une
+  suppression Gmail inconnue reste un no-op explicite.
+- IMAP rejette `limit=0` et ne publie la frontière qu’après FETCH, lots A3.2 et
+  session réussis. Aucune réconciliation complète des flags/suppressions ni
+  migration d’archives pré-A3 n’a été ajoutée.

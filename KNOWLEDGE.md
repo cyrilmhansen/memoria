@@ -715,3 +715,17 @@ résultats d'expérience locale :
 - Chaque `PendingRawLocation` porte aussi son ordinal dans le lot et le
   `doc_id` écrit par `append_raw`; le publisher exige une couverture exacte,
   unique et complète des ordinaux ainsi que la concordance du `doc_id`.
+
+## 2026-08-26 — Tier A3.3 : frontières source et retry fail-closed
+
+- Une full sync Gmail non bornée établit sa fence avant le traitement :
+  `historyId` du premier message de la première page. Une boîte vide ne
+  publie pas de nouvelle `gmail_state`; une full sync `query` ou `max` ne
+  modifie pas non plus `gmail_state`.
+- L’incremental Gmail ne publie son curseur qu’après la réponse terminale avec
+  un `historyId` valide et après les lots durables. Les identités existantes
+  sont revalidées via le catalogue et le lecteur A1 ; une incohérence bloque
+  l’avancement sans réparation automatique.
+- IMAP rejette `limit=0`, conserve la frontière de plage UID et revalide les
+  identités existantes avant de les ignorer. Les anciennes lignes canoniques
+  sans provenance source sont refusées avant tout append.

@@ -1,7 +1,7 @@
 use crate::GmailIndexStats;
 use async_imap::types::{Fetch, NameAttribute};
 use futures::TryStreamExt;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use rustls::pki_types::{pem::PemObject, CertificateDer, ServerName};
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -124,6 +124,9 @@ pub fn sync_imap(root: &Path, config: &ImapConfig) -> Result<ImapSyncStats, Imap
     if config.source_account.is_empty() {
         return Err(ImapError::Config("source account must not be empty".into()));
     }
+    if config.limit == Some(0) {
+        return Err(ImapError::Config("limit must be greater than zero".into()));
+    }
     let metadata = crate::create_metadata(&root.join("metadata.sqlite"))
         .map_err(|error| ImapError::Io(error.to_string()))?;
     let known_uid_validity =
@@ -161,15 +164,14 @@ pub fn sync_imap(root: &Path, config: &ImapConfig) -> Result<ImapSyncStats, Imap
         |message| {
             stats.raw_fetched += 1;
             stats.network_bytes += message.raw.len() as u64;
-            if crate::imap_message_exists(
+            if imap_identity_is_valid(
+                root,
                 &metadata,
                 &config.source_account,
                 &config.mailbox,
                 message.uid_validity,
                 message.uid,
-            )
-            .map_err(|error| ImapError::Io(error.to_string()))?
-            {
+            )? {
                 return Ok(());
             }
             let identity = (
@@ -181,6 +183,13 @@ pub fn sync_imap(root: &Path, config: &ImapConfig) -> Result<ImapSyncStats, Imap
             if pending_ids.contains(&identity) {
                 return Ok(());
             }
+            ensure_imap_message_id_available(
+                &metadata,
+                &config.source_account,
+                &config.mailbox,
+                message.uid_validity,
+                message.uid,
+            )?;
             let doc_id = next_doc_id;
             next_doc_id = next_doc_id
                 .checked_add(1)
@@ -256,6 +265,66 @@ fn batch_full(batch: &[crate::ImapBatchRecord]) -> bool {
             .map(|record| record.location.frame_bytes)
             .sum::<u64>()
             >= IMPORT_BATCH_BYTES_LIMIT
+}
+
+fn canonical_imap_message_id(source: &str, mailbox: &str, uid_validity: u32, uid: u32) -> String {
+    format!("imap:{source}:{mailbox}:{uid_validity}:{uid}")
+}
+
+fn imap_identity_is_valid(
+    root: &Path,
+    connection: &Connection,
+    source: &str,
+    mailbox: &str,
+    uid_validity: u32,
+    uid: u32,
+) -> Result<bool, ImapError> {
+    let doc_id = connection
+        .query_row(
+            "SELECT doc_id FROM imap_messages WHERE source_account=?1 AND mailbox=?2 AND uid_validity=?3 AND uid=?4",
+            rusqlite::params![source, mailbox, uid_validity as i64, uid as i64],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| ImapError::Io(error.to_string()))?;
+    let Some(doc_id) = doc_id else {
+        return Ok(false);
+    };
+    crate::validate_catalog_record(
+        &root.join("archive"),
+        connection,
+        doc_id,
+        &canonical_imap_message_id(source, mailbox, uid_validity, uid),
+    )
+    .map_err(|error| {
+        ImapError::Io(format!(
+            "known IMAP identity {source}/{mailbox}/{uid_validity}/{uid} is not valid locally: {error}"
+        ))
+    })?;
+    Ok(true)
+}
+
+fn ensure_imap_message_id_available(
+    connection: &Connection,
+    source: &str,
+    mailbox: &str,
+    uid_validity: u32,
+    uid: u32,
+) -> Result<(), ImapError> {
+    let canonical = canonical_imap_message_id(source, mailbox, uid_validity, uid);
+    let exists = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE message_id=?1)",
+            [canonical.as_str()],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| ImapError::Io(error.to_string()))?;
+    if exists {
+        return Err(ImapError::Io(format!(
+            "historical messages row already uses IMAP identity {source}/{mailbox}/{uid_validity}/{uid} without source metadata"
+        )));
+    }
+    Ok(())
 }
 
 fn flush_batch_if_needed(

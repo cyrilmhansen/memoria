@@ -2067,6 +2067,69 @@ pub fn read_record(root: &Path, location: &ArchiveLocation) -> io::Result<(u64, 
     Ok((id, body))
 }
 
+pub(crate) fn validate_catalog_record(
+    archive_root: &Path,
+    connection: &Connection,
+    doc_id: i64,
+    canonical_message_id: &str,
+) -> io::Result<()> {
+    let row = connection
+        .query_row(
+            "SELECT message_id,segment,archive_offset,frame_bytes FROM messages WHERE doc_id=?1",
+            [doc_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(sqlite_io)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "catalogue messages row missing"))?;
+    if row.0 != canonical_message_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "catalogue source message_id mismatch",
+        ));
+    }
+    if row.2 < 0 || row.3 < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "catalogue archive coordinate is negative",
+        ));
+    }
+    let location = ArchiveLocation {
+        segment: row.1,
+        offset: u64::try_from(row.2).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "catalogue archive offset overflow",
+            )
+        })?,
+        frame_bytes: u64::try_from(row.3).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "catalogue frame length overflow",
+            )
+        })?,
+    };
+    let (frame_id, _) = read_record(archive_root, &location)?;
+    if frame_id
+        != u64::try_from(doc_id).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "negative catalogue document ID")
+        })?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "catalogue/frame ID mismatch",
+        ));
+    }
+    Ok(())
+}
+
 pub fn parse_archived_message(id: u64, raw: &[u8]) -> io::Result<ParsedMessage> {
     let text = String::from_utf8_lossy(raw);
     let (headers, body) = text.split_once("\r\n\r\n").unwrap_or((text.as_ref(), ""));

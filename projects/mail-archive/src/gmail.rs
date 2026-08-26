@@ -2,7 +2,7 @@ use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
 use mailparse::{body::Body, parse_mail, DispositionType, MailHeaderMap};
 use reqwest::blocking::Client;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
@@ -917,6 +917,21 @@ pub fn sync_account_with_progress<T: GmailTransport, P: FnMut(&SyncProgress)>(
     let state = crate::gmail_state(&connection, source_account)
         .map_err(|error| GmailError::Other(error.to_string()))?;
     let mut stats = SyncStats::default();
+    if query.is_some() || max_messages.is_some() {
+        stats.full_sync = true;
+        full_sync(
+            root,
+            &mut connection,
+            source_account,
+            transport,
+            query,
+            max_messages,
+            &mut stats,
+            &mut progress,
+        )?;
+        stats.duration_ms = started.elapsed().as_millis();
+        return Ok(stats);
+    }
     if let Some((history_id, complete)) = state {
         if !complete {
             stats.full_sync = true;
@@ -991,8 +1006,27 @@ fn full_sync<T: GmailTransport>(
     let mut page = None;
     let mut listed_messages = Vec::new();
     let reconcile = max.is_none() && query.is_none();
+    let complete = reconcile;
+    let mut fence = None;
     loop {
         let response = transport.list(page.as_deref(), query)?;
+        if fence.is_none() {
+            fence = if let Some(first) = response.messages.first() {
+                let metadata = transport.get_metadata(&first.id)?;
+                Some(
+                    metadata
+                        .history_id
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            GmailError::Other(
+                                "first listed Gmail message has no valid historyId".into(),
+                            )
+                        })?,
+                )
+            } else {
+                None
+            };
+        }
         let next_page = response.next_page_token.clone();
         for listed in response.messages {
             if max
@@ -1024,11 +1058,11 @@ fn full_sync<T: GmailTransport>(
     for listed in listed_messages {
         stats.examined += 1;
         seen.insert(listed.id.clone());
-        if pending_ids.contains(&listed.id)
-            || crate::gmail_message_exists(connection, source, &listed.id)
-                .map_err(|error| GmailError::Other(error.to_string()))?
-        {
-            if reconcile || stats.full_sync {
+        if pending_ids.contains(&listed.id) {
+            continue;
+        }
+        if gmail_identity_is_valid(root, connection, source, &listed.id)? {
+            if reconcile {
                 let metadata = transport.get_metadata(&listed.id)?;
                 crate::repair_gmail_metadata(
                     connection,
@@ -1048,6 +1082,7 @@ fn full_sync<T: GmailTransport>(
             }
             continue;
         }
+        ensure_gmail_message_id_available(connection, source, &listed.id)?;
         let raw = transport.get_raw(&listed.id)?;
         import_raw(
             &mut writer,
@@ -1076,14 +1111,16 @@ fn full_sync<T: GmailTransport>(
         &mut pending_ids,
         stats,
     )?;
-    let complete = max.is_none() && query.is_none();
     if complete {
         stats.deletions += crate::mark_gmail_missing_from_full_sync(connection, source, &seen)
             .map_err(|error| GmailError::Other(error.to_string()))?;
     }
-    let history = transport.profile()?.history_id;
-    crate::set_gmail_state(connection, source, &history, complete)
-        .map_err(|error| GmailError::Other(error.to_string()))?;
+    if complete {
+        if let Some(history) = fence {
+            crate::set_gmail_state(connection, source, &history, true)
+                .map_err(|error| GmailError::Other(error.to_string()))?;
+        }
+    }
     Ok(())
 }
 
@@ -1105,20 +1142,21 @@ fn incremental_sync<T: GmailTransport>(
         crate::next_doc_id(connection).map_err(|error| GmailError::Other(error.to_string()))?;
     let mut staged = Vec::new();
     let mut pending_ids = HashSet::new();
-    let mut latest = Some(start.to_string());
+    let mut terminal_history = None;
     loop {
         let response = transport.history(start, page.as_deref())?;
-        latest = response.history_id.clone().or(latest);
+        let response_history_id = response.history_id.clone();
         let next_page = response.next_page_token.clone();
         for record in response.history {
             for added in record.messages_added {
                 stats.examined += 1;
-                if pending_ids.contains(&added.message.id)
-                    || crate::gmail_message_exists(connection, source, &added.message.id)
-                        .map_err(|error| GmailError::Other(error.to_string()))?
-                {
+                if pending_ids.contains(&added.message.id) {
                     continue;
                 }
+                if gmail_identity_is_valid(root, connection, source, &added.message.id)? {
+                    continue;
+                }
+                ensure_gmail_message_id_available(connection, source, &added.message.id)?;
                 let raw = transport.get_raw(&added.message.id)?;
                 import_raw(
                     &mut writer,
@@ -1155,6 +1193,12 @@ fn incremental_sync<T: GmailTransport>(
                     &mut pending_ids,
                     stats,
                 )?;
+                if !gmail_identity_is_valid(root, connection, source, &label.message.id)? {
+                    return Err(GmailError::Other(format!(
+                        "label event references unknown Gmail identity {}",
+                        label.message.id
+                    )));
+                }
                 let raw = transport.get_raw(&label.message.id)?;
                 crate::update_gmail_labels(
                     connection,
@@ -1166,6 +1210,9 @@ fn incremental_sync<T: GmailTransport>(
                 stats.label_changes += 1;
                 progress(&progress_snapshot(stats, None));
             }
+        }
+        if page.is_none() {
+            terminal_history = response_history_id;
         }
         page = next_page;
         if page.is_none() {
@@ -1179,9 +1226,68 @@ fn incremental_sync<T: GmailTransport>(
         &mut pending_ids,
         stats,
     )?;
-    if let Some(history) = latest {
-        crate::set_gmail_state(connection, source, &history, complete)
-            .map_err(|error| GmailError::Other(error.to_string()))?;
+    let history = terminal_history
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            GmailError::Other("terminal Gmail history response has no historyId".into())
+        })?;
+    crate::set_gmail_state(connection, source, &history, complete)
+        .map_err(|error| GmailError::Other(error.to_string()))?;
+    Ok(())
+}
+
+fn canonical_gmail_message_id(source: &str, gmail_id: &str) -> String {
+    format!("gmail:{source}:{gmail_id}")
+}
+
+fn gmail_identity_is_valid(
+    root: &Path,
+    connection: &Connection,
+    source: &str,
+    gmail_id: &str,
+) -> Result<bool, GmailError> {
+    let doc_id = connection
+        .query_row(
+            "SELECT doc_id FROM gmail_messages WHERE source_account=?1 AND gmail_message_id=?2",
+            rusqlite::params![source, gmail_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| GmailError::Other(error.to_string()))?;
+    let Some(doc_id) = doc_id else {
+        return Ok(false);
+    };
+    crate::validate_catalog_record(
+        &root.join("archive"),
+        connection,
+        doc_id,
+        &canonical_gmail_message_id(source, gmail_id),
+    )
+    .map_err(|error| {
+        GmailError::Other(format!(
+            "known Gmail identity {source}/{gmail_id} is not valid locally: {error}"
+        ))
+    })?;
+    Ok(true)
+}
+
+fn ensure_gmail_message_id_available(
+    connection: &Connection,
+    source: &str,
+    gmail_id: &str,
+) -> Result<(), GmailError> {
+    let canonical = canonical_gmail_message_id(source, gmail_id);
+    let exists = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE message_id=?1)",
+            [canonical.as_str()],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| GmailError::Other(error.to_string()))?;
+    if exists {
+        return Err(GmailError::Other(format!(
+            "historical messages row already uses Gmail identity {source}/{gmail_id} without source metadata"
+        )));
     }
     Ok(())
 }
@@ -1464,7 +1570,7 @@ mod tests {
         let second = sync_account(&root, "fixture-account", &mut transport, None, None).unwrap();
         assert_eq!(second.new_messages, 10);
         assert_eq!(transport.raw_calls, 10);
-        assert_eq!(transport.metadata_calls, 1000);
+        assert_eq!(transport.metadata_calls, 1001);
         let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
         assert_eq!(
             connection
@@ -1521,6 +1627,12 @@ mod tests {
         };
         let first = sync_account(&root, "fixture-account", &mut transport, None, None).unwrap();
         assert_eq!(first.new_messages, 2);
+        let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
+        assert_eq!(
+            crate::gmail_state(&connection, "fixture-account").unwrap(),
+            Some(("10".into(), true))
+        );
+        drop(connection);
         let second = sync_account(&root, "fixture-account", &mut transport, None, None).unwrap();
         assert_eq!(second.new_messages, 0);
         assert_eq!(second.examined, 0);
@@ -1536,6 +1648,191 @@ mod tests {
                 .unwrap(),
             2
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bounded_gmail_sync_preserves_a_complete_state() {
+        let root = std::env::temp_dir().join(format!("gmail-bounded-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
+        crate::set_gmail_state(&connection, "fixture-account", "7", true).unwrap();
+        drop(connection);
+        let message = RawMessage {
+            id: "bounded".into(),
+            thread_id: "thread-bounded".into(),
+            label_ids: vec!["INBOX".into()],
+            history_id: Some("8".into()),
+            internal_date: None,
+            raw: "RnJvbTogYm91bmRlZEBleGFtcGxlLnRlc3QNCg0KYm91bmRlZA==".into(),
+        };
+        let mut transport = Fixture {
+            pages: vec![ListPage {
+                messages: vec![ListedMessage {
+                    id: message.id.clone(),
+                    thread_id: message.thread_id.clone(),
+                }],
+                next_page_token: None,
+            }],
+            messages: [(message.id.clone(), message)].into_iter().collect(),
+            history: vec![HistoryPage::default()],
+            expire_history: false,
+            raw_calls: 0,
+            metadata_calls: 0,
+        };
+        sync_account(
+            &root,
+            "fixture-account",
+            &mut transport,
+            Some("from:bounded"),
+            None,
+        )
+        .unwrap();
+        let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
+        assert_eq!(
+            crate::gmail_state(&connection, "fixture-account").unwrap(),
+            Some(("7".into(), true))
+        );
+        drop(connection);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn empty_full_sync_does_not_publish_profile_fence() {
+        let root = std::env::temp_dir().join(format!("gmail-empty-fence-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let message = RawMessage {
+            id: "after-empty".into(),
+            thread_id: "thread-after-empty".into(),
+            label_ids: vec!["INBOX".into()],
+            history_id: Some("21".into()),
+            internal_date: None,
+            raw: "RnJvbTogYWZ0ZXItZW1wdHlAZXhhbXBsZS50ZXN0DQoNCmFmdGVyLWVtcHR5".into(),
+        };
+        let mut transport = Fixture {
+            pages: vec![ListPage::default()],
+            messages: std::collections::HashMap::new(),
+            history: vec![HistoryPage::default()],
+            expire_history: false,
+            raw_calls: 0,
+            metadata_calls: 0,
+        };
+        sync_account(&root, "fixture-account", &mut transport, None, None).unwrap();
+        let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
+        assert_eq!(
+            crate::gmail_state(&connection, "fixture-account").unwrap(),
+            None
+        );
+        drop(connection);
+        transport.pages = vec![ListPage {
+            messages: vec![ListedMessage {
+                id: message.id.clone(),
+                thread_id: message.thread_id.clone(),
+            }],
+            next_page_token: None,
+        }];
+        transport.messages.insert(message.id.clone(), message);
+        let stats = sync_account(&root, "fixture-account", &mut transport, None, None).unwrap();
+        assert_eq!(stats.new_messages, 1);
+        let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
+        assert_eq!(
+            crate::gmail_state(&connection, "fixture-account").unwrap(),
+            Some(("21".into(), true))
+        );
+        drop(connection);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn incremental_gmail_requires_terminal_history_id() {
+        let root =
+            std::env::temp_dir().join(format!("gmail-terminal-history-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
+        crate::set_gmail_state(&connection, "fixture-account", "7", true).unwrap();
+        drop(connection);
+        let mut transport = Fixture {
+            pages: vec![ListPage::default()],
+            messages: std::collections::HashMap::new(),
+            history: vec![HistoryPage::default()],
+            expire_history: false,
+            raw_calls: 0,
+            metadata_calls: 0,
+        };
+        assert!(sync_account(&root, "fixture-account", &mut transport, None, None).is_err());
+        let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
+        assert_eq!(
+            crate::gmail_state(&connection, "fixture-account").unwrap(),
+            Some(("7".into(), true))
+        );
+        drop(connection);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn known_gmail_identity_with_invalid_raw_fails_closed() {
+        let root = std::env::temp_dir().join(format!("gmail-known-invalid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
+        let mut writer = crate::ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        let raw = b"From: known@example.test\r\n\r\nknown\r\n";
+        let location = writer.append_raw(0, raw).unwrap();
+        writer.durable_barrier().unwrap();
+        crate::insert_gmail_metadata(
+            &connection,
+            "fixture-account",
+            "known",
+            0,
+            "thread-known",
+            "[]",
+            None,
+            None,
+            &location,
+        )
+        .unwrap();
+        crate::set_gmail_state(&connection, "fixture-account", "7", true).unwrap();
+        drop(writer);
+        drop(connection);
+        let path = root.join("archive/segment-000000.arc");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[0] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        let message = RawMessage {
+            id: "known".into(),
+            thread_id: "thread-known".into(),
+            label_ids: vec![],
+            history_id: Some("8".into()),
+            internal_date: None,
+            raw: URL_SAFE_NO_PAD.encode(raw),
+        };
+        let mut transport = Fixture {
+            pages: vec![ListPage::default()],
+            messages: [(message.id.clone(), message)].into_iter().collect(),
+            history: vec![HistoryPage {
+                history: vec![HistoryRecord {
+                    id: "8".into(),
+                    messages_added: vec![HistoryMessageAdded {
+                        message: ListedMessage {
+                            id: "known".into(),
+                            thread_id: "thread-known".into(),
+                        },
+                    }],
+                    ..Default::default()
+                }],
+                history_id: Some("8".into()),
+                ..Default::default()
+            }],
+            expire_history: false,
+            raw_calls: 0,
+            metadata_calls: 0,
+        };
+        assert!(sync_account(&root, "fixture-account", &mut transport, None, None).is_err());
+        let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
+        assert_eq!(
+            crate::gmail_state(&connection, "fixture-account").unwrap(),
+            Some(("7".into(), true))
+        );
+        drop(connection);
         let _ = std::fs::remove_dir_all(&root);
     }
 
