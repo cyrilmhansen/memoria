@@ -2049,7 +2049,7 @@ pub fn create_metadata(path: &Path) -> rusqlite::Result<Connection> {
         fs::create_dir_all(parent).ok();
     }
     let connection = Connection::open(path)?;
-    connection.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL; CREATE TABLE IF NOT EXISTS messages (doc_id INTEGER PRIMARY KEY, message_id TEXT NOT NULL UNIQUE, timestamp INTEGER NOT NULL, sender TEXT NOT NULL, recipients TEXT NOT NULL, subject TEXT NOT NULL, account TEXT NOT NULL, folder TEXT NOT NULL, thread TEXT NOT NULL, segment TEXT NOT NULL, archive_offset INTEGER NOT NULL, frame_bytes INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS attachments (doc_id INTEGER NOT NULL, filename TEXT NOT NULL, mime TEXT NOT NULL, bytes INTEGER NOT NULL, content_hash TEXT NOT NULL, PRIMARY KEY(doc_id, filename)); CREATE INDEX IF NOT EXISTS messages_timestamp ON messages(timestamp); CREATE INDEX IF NOT EXISTS messages_sender ON messages(sender); CREATE INDEX IF NOT EXISTS messages_folder ON messages(folder); CREATE TABLE IF NOT EXISTS gmail_state (source_account TEXT PRIMARY KEY, history_id TEXT NOT NULL, complete INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS gmail_messages (source_account TEXT NOT NULL, gmail_message_id TEXT NOT NULL, doc_id INTEGER NOT NULL UNIQUE, thread_id TEXT NOT NULL, label_ids TEXT NOT NULL, internal_date_ms INTEGER, message_history_id TEXT, source_state TEXT NOT NULL, first_seen_unix INTEGER NOT NULL, last_seen_unix INTEGER NOT NULL, PRIMARY KEY(source_account, gmail_message_id)); CREATE INDEX IF NOT EXISTS gmail_messages_state ON gmail_messages(source_account, source_state);")?;
+    connection.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=EXTRA; CREATE TABLE IF NOT EXISTS messages (doc_id INTEGER PRIMARY KEY, message_id TEXT NOT NULL UNIQUE, timestamp INTEGER NOT NULL, sender TEXT NOT NULL, recipients TEXT NOT NULL, subject TEXT NOT NULL, account TEXT NOT NULL, folder TEXT NOT NULL, thread TEXT NOT NULL, segment TEXT NOT NULL, archive_offset INTEGER NOT NULL, frame_bytes INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS attachments (doc_id INTEGER NOT NULL, filename TEXT NOT NULL, mime TEXT NOT NULL, bytes INTEGER NOT NULL, content_hash TEXT NOT NULL, PRIMARY KEY(doc_id, filename)); CREATE INDEX IF NOT EXISTS messages_timestamp ON messages(timestamp); CREATE INDEX IF NOT EXISTS messages_sender ON messages(sender); CREATE INDEX IF NOT EXISTS messages_folder ON messages(folder); CREATE TABLE IF NOT EXISTS gmail_state (source_account TEXT PRIMARY KEY, history_id TEXT NOT NULL, complete INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS gmail_messages (source_account TEXT NOT NULL, gmail_message_id TEXT NOT NULL, doc_id INTEGER NOT NULL UNIQUE, thread_id TEXT NOT NULL, label_ids TEXT NOT NULL, internal_date_ms INTEGER, message_history_id TEXT, source_state TEXT NOT NULL, first_seen_unix INTEGER NOT NULL, last_seen_unix INTEGER NOT NULL, PRIMARY KEY(source_account, gmail_message_id)); CREATE INDEX IF NOT EXISTS gmail_messages_state ON gmail_messages(source_account, source_state);")?;
     connection.execute_batch("CREATE TABLE IF NOT EXISTS imap_messages (source_account TEXT NOT NULL, mailbox TEXT NOT NULL, uid_validity INTEGER NOT NULL, uid INTEGER NOT NULL, doc_id INTEGER NOT NULL UNIQUE, flags TEXT NOT NULL, internal_date TEXT, internal_date_ms INTEGER, rfc822_size INTEGER, source_state TEXT NOT NULL, first_seen_unix INTEGER NOT NULL, last_seen_unix INTEGER NOT NULL, PRIMARY KEY(source_account, mailbox, uid_validity, uid)); CREATE INDEX IF NOT EXISTS imap_messages_state ON imap_messages(source_account, source_state); CREATE TABLE IF NOT EXISTS imap_scan_state (source_account TEXT NOT NULL, mailbox TEXT NOT NULL, uid_validity INTEGER NOT NULL, scanned_through_uid INTEGER NOT NULL, last_uid_next INTEGER NOT NULL, updated_unix INTEGER NOT NULL, PRIMARY KEY(source_account, mailbox, uid_validity)); CREATE TABLE IF NOT EXISTS imap_mailboxes (source_account TEXT NOT NULL, mailbox TEXT NOT NULL, delimiter TEXT, attributes TEXT NOT NULL, special_use TEXT NOT NULL, selectable INTEGER NOT NULL, last_seen_unix INTEGER NOT NULL, PRIMARY KEY(source_account, mailbox));")?;
     Ok(connection)
 }
@@ -2123,16 +2123,48 @@ pub fn insert_gmail_metadata(
     message_history_id: Option<&str>,
     location: &ArchiveLocation,
 ) -> rusqlite::Result<()> {
-    connection.execute(
+    insert_gmail_metadata_with_hook(
+        connection,
+        source_account,
+        gmail_id,
+        doc_id,
+        thread_id,
+        label_ids_json,
+        internal_date_ms,
+        message_history_id,
+        location,
+        || Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_gmail_metadata_with_hook<F>(
+    connection: &Connection,
+    source_account: &str,
+    gmail_id: &str,
+    doc_id: i64,
+    thread_id: &str,
+    label_ids_json: &str,
+    internal_date_ms: Option<i64>,
+    message_history_id: Option<&str>,
+    location: &ArchiveLocation,
+    after_messages: F,
+) -> rusqlite::Result<()>
+where
+    F: FnOnce() -> rusqlite::Result<()>,
+{
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute(
         "INSERT INTO messages(doc_id,message_id,timestamp,sender,recipients,subject,account,folder,thread,segment,archive_offset,frame_bytes) VALUES (?1,?2,0,'','','',?3,'','',?4,?5,?6)",
         params![doc_id, format!("gmail:{source_account}:{gmail_id}"), source_account, location.segment, location.offset as i64, location.frame_bytes as i64],
     )?;
+    after_messages()?;
     let now = chrono_like_now();
-    connection.execute(
+    transaction.execute(
         "INSERT INTO gmail_messages(source_account,gmail_message_id,doc_id,thread_id,label_ids,internal_date_ms,message_history_id,source_state,first_seen_unix,last_seen_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,'present',?8,?8)",
         params![source_account, gmail_id, doc_id, thread_id, label_ids_json, internal_date_ms, message_history_id, now],
     )?;
-    Ok(())
+    transaction.commit()
 }
 
 pub fn imap_message_exists(
@@ -2248,8 +2280,43 @@ pub fn insert_imap_metadata(
     doc_id: i64,
     location: &ArchiveLocation,
 ) -> rusqlite::Result<()> {
+    insert_imap_metadata_with_hook(
+        connection,
+        source_account,
+        mailbox,
+        uid_validity,
+        uid,
+        flags_json,
+        internal_date,
+        internal_date_ms,
+        rfc822_size,
+        doc_id,
+        location,
+        || Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_imap_metadata_with_hook<F>(
+    connection: &Connection,
+    source_account: &str,
+    mailbox: &str,
+    uid_validity: u32,
+    uid: u32,
+    flags_json: &str,
+    internal_date: Option<&str>,
+    internal_date_ms: Option<i64>,
+    rfc822_size: Option<u32>,
+    doc_id: i64,
+    location: &ArchiveLocation,
+    after_messages: F,
+) -> rusqlite::Result<()>
+where
+    F: FnOnce() -> rusqlite::Result<()>,
+{
     let message_id = format!("imap:{source_account}:{mailbox}:{uid_validity}:{uid}");
-    connection.execute(
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute(
         "INSERT INTO messages(doc_id,message_id,timestamp,sender,recipients,subject,account,folder,thread,segment,archive_offset,frame_bytes) VALUES (?1,?2,?3,'','','',?4,?5,'',?6,?7,?8)",
         params![
             doc_id,
@@ -2262,7 +2329,8 @@ pub fn insert_imap_metadata(
             location.frame_bytes as i64
         ],
     )?;
-    connection.execute(
+    after_messages()?;
+    transaction.execute(
         "INSERT INTO imap_messages(source_account,mailbox,uid_validity,uid,doc_id,flags,internal_date,internal_date_ms,rfc822_size,source_state,first_seen_unix,last_seen_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'present',?10,?10)",
         params![
             source_account,
@@ -2277,7 +2345,7 @@ pub fn insert_imap_metadata(
             chrono_like_now()
         ],
     )?;
-    Ok(())
+    transaction.commit()
 }
 
 pub fn update_gmail_labels(
@@ -3633,6 +3701,131 @@ mod tests {
             "memoria-raw-read-{label}-{}-{nonce}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn tier_a_catalogue_uses_delete_journal_and_extra_synchronous() {
+        let root = raw_read_test_root("catalogue-pragmas");
+        let _ = fs::remove_dir_all(&root);
+        let connection = create_metadata(&root.join("metadata.sqlite")).unwrap();
+        let journal_mode = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            .unwrap();
+        let synchronous = connection
+            .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_ascii_lowercase(), "delete");
+        assert_eq!(synchronous, 3);
+        drop(connection);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn catalogue_publication_rolls_back_and_retry_reuses_identity() {
+        let root = raw_read_test_root("catalogue-atomic");
+        let _ = fs::remove_dir_all(&root);
+        let connection = create_metadata(&root.join("metadata.sqlite")).unwrap();
+        let location = ArchiveLocation {
+            segment: "segment-000000.arc".into(),
+            offset: 0,
+            frame_bytes: 32,
+        };
+
+        let gmail_failure = insert_gmail_metadata_with_hook(
+            &connection,
+            "account",
+            "gmail-atomic",
+            0,
+            "thread",
+            "[]",
+            None,
+            None,
+            &location,
+            || Err(rusqlite::Error::InvalidQuery),
+        );
+        assert!(gmail_failure.is_err());
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM messages", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM gmail_messages", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        insert_gmail_metadata(
+            &connection,
+            "account",
+            "gmail-atomic",
+            0,
+            "thread",
+            "[]",
+            None,
+            None,
+            &location,
+        )
+        .unwrap();
+
+        let imap_failure = insert_imap_metadata_with_hook(
+            &connection,
+            "account",
+            "INBOX",
+            17,
+            42,
+            "[]",
+            None,
+            None,
+            None,
+            1,
+            &location,
+            || Err(rusqlite::Error::InvalidQuery),
+        );
+        assert!(imap_failure.is_err());
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM messages WHERE doc_id=1", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM imap_messages", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        insert_imap_metadata(
+            &connection,
+            "account",
+            "INBOX",
+            17,
+            42,
+            "[]",
+            None,
+            None,
+            None,
+            1,
+            &location,
+        )
+        .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM imap_messages WHERE source_account='account' AND mailbox='INBOX' AND uid_validity=17 AND uid=42",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

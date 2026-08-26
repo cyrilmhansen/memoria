@@ -768,3 +768,14 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
   et `metadata.sqlite-shm` restent byte-à-byte inchangés lorsqu’ils existent.
 - La réparation physique est différée jusqu’au chantier
   crash-consistency/publication.
+
+## 2026-08-26 — Implémentation A3.1 : publication catalogue atomique
+
+- `insert_gmail_metadata` et `insert_imap_metadata` utilisent désormais une
+  transaction SQLite unique pour `messages` et l’identité/provenance source.
+- Le catalogue Tier A est configuré en `journal_mode=DELETE` et
+  `synchronous=EXTRA`; un test vérifie les valeurs PRAGMA réellement actives.
+- Une fault injection déterministe entre les deux insertions vérifie le
+  rollback complet pour Gmail et IMAP, puis le retry sans blocage `UNIQUE`.
+- Cette étape ne modifie ni l’ordre RAW → SQLite, ni `ArchiveWriter`, ni les
+  syncs, ni Tantivy ; A3 global reste non résolu.

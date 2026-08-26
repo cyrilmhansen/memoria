@@ -671,3 +671,15 @@ résultats d'expérience locale :
 - **Fait vérifié :** une queue incomplète peut être inventoriée sans modifier
   les octets des segments ni de `metadata.sqlite` (et de ses fichiers WAL/SHM
   lorsqu’ils existent).
+
+## 2026-08-26 — Tier A3.1 : publication catalogue atomique
+
+- **Fait vérifié :** `insert_gmail_metadata` et `insert_imap_metadata` publient
+  `messages` et leur ligne d’identité/provenance dans une seule transaction
+  SQLite.
+- **Fait vérifié :** le catalogue utilise effectivement `journal_mode=DELETE`
+  et `synchronous=EXTRA`; une fault injection entre les deux insertions annule
+  les deux lignes et un retry réutilise l’identité sans conflit `UNIQUE`.
+- **Limite :** A3.1 ne rend pas atomique ou durable l’ordre RAW → SQLite et ne
+  résout donc pas la publication complète, la crash-consistency ou le
+  multiwriter.
