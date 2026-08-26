@@ -1,7 +1,7 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use mail_archive_experiment::{
-    create_metadata, directory_bytes, index_gmail_archive_with_observer_and_config, latency_stats,
+    create_catalogue, directory_bytes, index_gmail_archive_with_observer_and_config, latency_stats,
     ArchiveWriter, AttachmentFilter, GmailIndexWriterConfig, GmailSearchIndex, SearchRequest,
 };
 use rusqlite::params;
@@ -397,10 +397,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let phases = Arc::new(Mutex::new(Vec::new()));
     snapshot(&phases, "startup");
     let started = Instant::now();
-    let metadata = create_metadata(&out.join("metadata.sqlite"))?;
+    let metadata = create_catalogue(&out.join("metadata.sqlite"))?;
     snapshot(&phases, "catalog_opened");
     let transaction = metadata.unchecked_transaction()?;
-    let mut message_insert = transaction.prepare("INSERT INTO messages(doc_id,message_id,timestamp,sender,recipients,subject,account,folder,thread,segment,archive_offset,frame_bytes) VALUES (?1,?2,0,'','','',?3,'','',?4,?5,?6)")?;
+    let mut message_insert = transaction.prepare("INSERT INTO messages(doc_id,message_id,timestamp,sender,recipients,subject,account,folder,thread,segment,archive_offset,frame_bytes,raw_blake3) VALUES (?1,?2,0,'','','',?3,'','',?4,?5,?6,?7)")?;
     let mut gmail_insert = transaction.prepare("INSERT INTO gmail_messages(source_account,gmail_message_id,doc_id,thread_id,label_ids,internal_date_ms,message_history_id,source_state,first_seen_unix,last_seen_unix) VALUES ('synthetic','gmail-'||?1,?2,'thread-'||?1,?3,?4,?5,'present',0,0)")?;
     let mut writer = ArchiveWriter::open(&out.join("archive"), SEGMENT_BYTES)?;
     let mut population = Population::default();
@@ -415,6 +415,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             location.segment,
             location.offset as i64,
             location.frame_bytes as i64,
+            &location.reference.blake3[..],
         ])?;
         gmail_insert.execute(params![
             id as i64,
@@ -426,8 +427,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     drop(message_insert);
     drop(gmail_insert);
-    transaction.commit()?;
     writer.sync()?;
+    transaction.commit()?;
     snapshot(&phases, "after_archive_generation");
     let generate_ms = started.elapsed().as_millis();
     let index_started = Instant::now();

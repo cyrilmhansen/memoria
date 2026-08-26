@@ -720,8 +720,9 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
 
 ## 2026-08-25 — Checkpoint Tier A1
 
-- A1 lecture RAW autoritative clôturé dans
-  `6537af7d4837c0d849d53ea602f6c1b6f4e50cbd`.
+- **Superseded/corrigé par l’audit cold-start du 2026-08-26 :** le checkpoint
+  annonçait A1 clôturé, mais ne couvrait ni la validation v1 du catalogue ni
+  la liaison BLAKE3 ; A1 global reste ouvert jusqu’à A1.2.
 
 ## 2026-08-25 — Implémentation A2.1 : inventaire RAW/catalogue
 
@@ -827,3 +828,53 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
 - IMAP rejette `limit=0` et ne publie la frontière qu’après FETCH, lots A3.2 et
   session réussis. Aucune réconciliation complète des flags/suppressions ni
   migration d’archives pré-A3 n’a été ajoutée.
+
+## 2026-08-26 — Implémentation A1.1 : liaison catalogue v1 ↔ RAW par BLAKE3
+
+- Catalogue neuf et ouverture existante sont séparés : l’ouverture refuse
+  explicitement les versions/structures incompatibles avant modification.
+- `PendingRawLocation` transporte désormais une référence liée (`doc_id`,
+  `ArchiveLocation`, BLAKE3). Les publishers Gmail/IMAP et le générateur
+  écrivent `raw_blake3` atomiquement avec les coordonnées, après la barrière
+  RAW existante ; le format des segments reste inchangé.
+- `read_archived_raw` vérifie maintenant la liaison BLAKE3 après les contrôles
+  de frame existants. Le test de substitution après restart, ainsi que les
+  variantes hash/payload/FNV et le refus byte-à-byte inchangé d’un catalogue
+  legacy, passent.
+- A1.2 doit encore propager cette référence liée à tous les lecteurs
+  autoritatifs secondaires ; ce patch ne traite pas A3.2, suppressions Gmail,
+  orphelins, namespace ni A4.
+
+## 2026-08-26 — Correction audit cold-start A1.1
+
+- La clôture A1 précédente est invalidée : elle décrivait `read_record` comme
+  lecteur autoritatif et ne couvrait pas la validation complète du catalogue
+  v1.
+- La validation existante passe désormais par une connexion SQLite strictement
+  read-only, puis `open_catalogue` réouvre en read-write et rétablit les PRAGMA
+  runtime. Les catalogues incompatibles sont rejetés sans mutation observable.
+- La création construit le schéma dans une transaction avant de publier les
+  marqueurs `application_id`/`user_version`. Le corpus et
+  `structured-search-benchmark` synchronisent maintenant le RAW avant le
+  commit SQLite et insèrent la référence BLAKE3.
+- **État :** A1.1 est obtenu ; A1.2 reste ouvert pour les lecteurs
+  autoritatifs secondaires.
+
+## 2026-08-26 — Correction Sol High : validation catalogue complète
+
+- Le dernier bypass `Connection::open` de `archive_summary` a été supprimé ;
+  `inventory_records` valide également le catalogue v1 avant sa seconde
+  ouverture read-only. Les helpers de création restent le cas distinct des
+  catalogues neufs.
+- La validation compare désormais, via les PRAGMA structurels, l’ordre, le
+  type, la nullabilité, les défauts, la PK et l’absence de colonnes
+  supplémentaires de chaque table contractuelle, ainsi que les index
+  explicites/implicites, leur ordre, unicité et caractère partiel.
+- `raw_blake3` est vérifié par comparaison de la représentation
+  `sqlite_schema.sql` produite par SQLite depuis la DDL canonique Memoria dans
+  une base en mémoire ; aucune écriture ou récupération n’est effectuée sur le
+  fichier existant. Les tests vérifient aussi les
+  catalogues version 0 à application_id correct, colonnes/index incompatibles,
+  SQL trompeur et l’absence byte-à-byte de sidecars lors du refus.
+- **État :** A1 global reste ouvert jusqu’à A1.2 ; cette correction ne
+  propage pas encore la référence liée aux lecteurs autoritatifs secondaires.

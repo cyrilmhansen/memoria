@@ -619,9 +619,9 @@ résultats d'expérience locale :
   physiques réelles avant allocation, et la réservation du RAW est faillible.
 - **Décision de projet :** aucune limite maximale nouvelle n’a été ajoutée au
   format historique.
-- **État :** A1 est clôturé. Cette correction ne résout ni le recovery, ni la
-  crash-consistency, ni le multi-writer, ni la reconstruction après perte
-  partielle.
+- **État — superseded par l’audit cold-start du 2026-08-26 :** cette ancienne
+  clôture A1 ne couvrait pas la liaison catalogue v1/BLAKE3 et ne doit plus
+  être considérée comme valide.
 
 ## 2026-08-25 — Tier A2.1 : inventaire read-only des records
 
@@ -729,3 +729,45 @@ résultats d'expérience locale :
 - IMAP rejette `limit=0`, conserve la frontière de plage UID et revalide les
   identités existantes avant de les ignorer. Les anciennes lignes canoniques
   sans provenance source sont refusées avant tout append.
+
+## 2026-08-26 — A1.1 : liaison catalogue v1 ↔ RAW par BLAKE3
+
+- **Fait vérifié :** un catalogue neuf porte l’`application_id` Memoria stable,
+  `user_version=1` et `messages.raw_blake3 BLOB NOT NULL` avec une contrainte
+  de longueur de 32 octets. L’ouverture valide ces propriétés sans modifier
+  le fichier ; les catalogues legacy/version 0, structures invalides et
+  versions futures sont refusés explicitement. Toutes les ouvertures produit
+  d’un catalogue existant passent par cette validation, y compris le résumé
+  d’archive et l’inventaire.
+- **Fait vérifié :** `append_raw` calcule FNV64 et BLAKE3 une seule fois sans
+  changer le format des segments. La référence RAW pending regroupe `doc_id`,
+  coordonnées et BLAKE3 ; Gmail, IMAP et le corpus l’insèrent avec les
+  coordonnées dans leur transaction après `durable_barrier`.
+- **Fait vérifié :** `read_archived_raw` passe par la primitive autoritative
+  qui valide coordonnées/bornes, framing, `doc_id`, longueur, FNV et BLAKE3.
+  Les tests couvrent la substitution d’une frame durable non publiée, les
+  altérations de hash/payload et le payload modifié avec FNV cohérent.
+- **Limite A1.1 :** A1.2 doit encore propager la référence liée à tous les
+  lecteurs autoritatifs secondaires. Les lecteurs bas niveau et les lecteurs
+  dérivés ne sont pas refactorisés ici.
+
+### Correction audit cold-start — 2026-08-26
+
+- La validation d’un catalogue existant est désormais strictement
+  read-only avant toute ouverture read-write ; les PRAGMA `journal_mode=DELETE`
+  et `synchronous=EXTRA` sont rétablis après réouverture.
+- Le schéma v1 est contrôlé structurellement (ordre et propriétés exactes des
+  tables/colonnes, défauts contractuels, PK/UNIQUE, index contractuels et
+  index partiels). La DDL canonique v1 de `messages` est générée dans une base
+  mémoire par SQLite puis comparée à la représentation `sqlite_schema.sql` du
+  catalogue ; cela vérifie notamment exactement la contrainte `raw_blake3`.
+  Un fichier v1 incomplet est `CatalogInconsistent` et n’est pas accepté.
+- Les tests couvrent notamment version 0 avec application_id correct, colonne
+  manquante ou supplémentaire, index partiel ou mal ordonné, SQL BLAKE3
+  trompeur et l’absence de mutation/sidecar (`-wal`, `-shm`, `-journal`) lors
+  d’un refus.
+- La création construit et committe d’abord le schéma, puis publie les
+  marqueurs de version ; un échec ne laisse pas un fichier partiellement
+  construit qui paraît v1.
+- **État :** A1.1 est obtenu ; A1 reste ouvert jusqu’à A1.2, qui doit encore
+  propager la référence liée à tous les lecteurs autoritatifs secondaires.

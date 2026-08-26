@@ -511,7 +511,7 @@ fn initialize_archive(path: &std::path::Path) -> Result<(), String> {
     }
     fs::create_dir_all(path).map_err(|error| error.to_string())?;
     fs::create_dir_all(path.join("archive")).map_err(|error| error.to_string())?;
-    mail_archive_experiment::create_metadata(&path.join("metadata.sqlite"))
+    mail_archive_experiment::create_catalogue(&path.join("metadata.sqlite"))
         .map_err(|error| error.to_string())?;
     GmailSearchIndex::open(path).map_err(|error| error.to_string())?;
     index_gmail_archive(path).map_err(|error| error.to_string())?;

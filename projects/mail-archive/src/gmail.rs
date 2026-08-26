@@ -111,7 +111,7 @@ fn progress_snapshot_with_batch(
     snapshot.new_messages += staged.len() as u64;
     snapshot.archive_bytes_added += staged
         .iter()
-        .map(|record| record.location.frame_bytes)
+        .map(|record| record.location.reference.location.frame_bytes)
         .sum::<u64>();
     snapshot
 }
@@ -255,7 +255,7 @@ impl OfflineMimeReport {
 }
 
 pub fn analyze_archived_mime(root: &Path) -> Result<OfflineMimeReport, GmailError> {
-    let connection = Connection::open(root.join("metadata.sqlite"))
+    let connection = crate::open_catalogue(&root.join("metadata.sqlite"))
         .map_err(|error| GmailError::Other(error.to_string()))?;
     let mut statement = connection
         .prepare("SELECT doc_id,segment,archive_offset,frame_bytes FROM messages ORDER BY doc_id")
@@ -1335,7 +1335,7 @@ fn batch_full(batch: &[crate::GmailBatchRecord]) -> bool {
     batch.len() >= IMPORT_BATCH_RECORD_LIMIT
         || batch
             .iter()
-            .map(|record| record.location.frame_bytes)
+            .map(|record| record.location.reference.location.frame_bytes)
             .sum::<u64>()
             >= IMPORT_BATCH_BYTES_LIMIT
 }
@@ -1366,7 +1366,7 @@ fn flush_batch(
     let records = staged.len() as u64;
     let frame_bytes = staged
         .iter()
-        .map(|record| record.location.frame_bytes)
+        .map(|record| record.location.reference.location.frame_bytes)
         .sum::<u64>();
     crate::publish_gmail_batch(connection, staged, &durable)
         .map_err(|error| GmailError::Other(error.to_string()))?;

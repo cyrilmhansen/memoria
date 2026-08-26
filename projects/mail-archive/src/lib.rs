@@ -35,6 +35,8 @@ pub use delivery_report::{
 };
 
 pub const DEFAULT_SEED: u64 = 0x4d_41_49_4c_41_52_43;
+pub const MEMORIA_CATALOGUE_APPLICATION_ID: i64 = 0x4d_45_4d_31;
+pub const MEMORIA_CATALOGUE_VERSION: i64 = 1;
 const FRAME_MAGIC: &[u8; 8] = b"MAARC001";
 const FRAME_HEADER_BYTES: u64 = 32;
 
@@ -189,18 +191,24 @@ pub struct ArchiveLocation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PendingRawLocation {
+pub struct RawReference {
+    pub doc_id: u64,
     pub location: ArchiveLocation,
+    pub blake3: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingRawLocation {
+    pub reference: RawReference,
     pub batch_id: u64,
     pub ordinal: u64,
-    pub doc_id: u64,
 }
 
 impl std::ops::Deref for PendingRawLocation {
     type Target = ArchiveLocation;
 
     fn deref(&self) -> &Self::Target {
-        &self.location
+        &self.reference.location
     }
 }
 
@@ -662,8 +670,7 @@ impl GmailSearchIndex {
     pub fn open(root: &Path) -> io::Result<Self> {
         let (index, fields) = open_or_create_gmail_tantivy(root).map_err(io::Error::other)?;
         let reader = index.reader().map_err(io::Error::other)?;
-        create_metadata(&root.join("metadata.sqlite")).map_err(sqlite_io)?;
-        let catalog = Connection::open(root.join("metadata.sqlite")).map_err(sqlite_io)?;
+        let catalog = open_catalogue(&root.join("metadata.sqlite")).map_err(sqlite_io)?;
         let source_rows: i64 = catalog
             .query_row(
                 "SELECT (SELECT COUNT(*) FROM gmail_messages WHERE source_state='present') + (SELECT COUNT(*) FROM imap_messages WHERE source_state='present')",
@@ -819,7 +826,7 @@ pub struct ArchiveSummary {
 pub fn archive_summary(root: &Path) -> io::Result<ArchiveSummary> {
     let catalog_path = root.join("metadata.sqlite");
     let messages = if catalog_path.exists() {
-        let connection = Connection::open(&catalog_path).map_err(sqlite_io)?;
+        let connection = open_catalogue(&catalog_path).map_err(sqlite_io)?;
         connection
             .query_row("SELECT COUNT(*) FROM messages", [], |row| {
                 row.get::<_, i64>(0)
@@ -853,7 +860,7 @@ pub fn archive_summary(root: &Path) -> io::Result<ArchiveSummary> {
 }
 
 pub fn available_gmail_labels(root: &Path) -> io::Result<Vec<String>> {
-    let catalog = Connection::open(root.join("metadata.sqlite")).map_err(sqlite_io)?;
+    let catalog = open_catalogue(&root.join("metadata.sqlite")).map_err(sqlite_io)?;
     let mut statement = catalog
         .prepare("SELECT label_ids FROM gmail_messages WHERE source_state='present'")
         .map_err(sqlite_io)?;
@@ -1633,9 +1640,11 @@ impl ArchiveWriter {
             ArchiveWriterWriteComponent::Length,
             &(raw.len() as u64).to_le_bytes(),
         )?;
+        let checksum = fnv64(raw);
+        let blake3 = *blake3::hash(raw).as_bytes();
         self.write_frame_component(
             ArchiveWriterWriteComponent::Checksum,
-            &fnv64(raw).to_le_bytes(),
+            &checksum.to_le_bytes(),
         )?;
         self.write_frame_component(ArchiveWriterWriteComponent::Payload, raw)?;
         self.offset += frame_bytes;
@@ -1647,14 +1656,17 @@ impl ArchiveWriter {
             self.namespace_sync_pending = true;
         }
         Ok(PendingRawLocation {
-            location: ArchiveLocation {
-                segment: self.segment_name.clone(),
-                offset: start,
-                frame_bytes,
+            reference: RawReference {
+                doc_id: id,
+                location: ArchiveLocation {
+                    segment: self.segment_name.clone(),
+                    offset: start,
+                    frame_bytes,
+                },
+                blake3,
             },
             batch_id: self.batch_id,
             ordinal,
-            doc_id: id,
         })
     }
 
@@ -1825,8 +1837,10 @@ fn inventory_inconsistent(
 /// The catalogue is opened read-only and this function never repairs, truncates,
 /// creates or migrates either input. A missing segment/byte range is reported
 /// separately from an invalid frame. Frame validation itself is delegated to
-/// [`read_record`], the authoritative A1 reader.
+/// [`read_record`], the physical frame validator. This inventory path is
+/// diagnostic; it is not the catalogue-linked authoritative reader.
 pub fn inventory_records(root: &Path) -> io::Result<Vec<RecordInventory>> {
+    validate_existing_catalogue(&root.join("metadata.sqlite")).map_err(sqlite_io)?;
     let catalog = Connection::open_with_flags(
         root.join("metadata.sqlite"),
         OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -1997,6 +2011,10 @@ pub fn inventory_records(root: &Path) -> io::Result<Vec<RecordInventory>> {
     Ok(inventory)
 }
 
+/// Validate and read one physical frame by coordinates.
+///
+/// This low-level primitive has no catalogue/BLAKE3 binding and is therefore
+/// not an authoritative catalogue read. Use [`read_archived_raw`] for that.
 pub fn read_record(root: &Path, location: &ArchiveLocation) -> io::Result<(u64, Vec<u8>)> {
     let path = archive_segment_path(root, &location.segment)?;
     if location.frame_bytes < FRAME_HEADER_BYTES {
@@ -2325,7 +2343,7 @@ pub fn for_each_archived_message<F>(
 where
     F: FnMut(&ParsedMessage) -> io::Result<()>,
 {
-    let metadata = Connection::open(root.join("metadata.sqlite")).map_err(sqlite_io)?;
+    let metadata = open_catalogue(&root.join("metadata.sqlite")).map_err(sqlite_io)?;
     let mut statement = metadata
         .prepare("SELECT doc_id, segment, archive_offset, frame_bytes FROM messages WHERE doc_id >= ?1 AND doc_id < ?2 ORDER BY doc_id")
         .map_err(sqlite_io)?;
@@ -2362,23 +2380,854 @@ where
     Ok(stats)
 }
 
-pub fn create_metadata(path: &Path) -> rusqlite::Result<Connection> {
+fn catalogue_inconsistent(reason: impl Into<String>) -> rusqlite::Error {
+    rusqlite::Error::InvalidParameterName(format!("CatalogInconsistent: {}", reason.into()))
+}
+
+const CATALOGUE_SCHEMA: &str = "
+CREATE TABLE messages (doc_id INTEGER PRIMARY KEY, message_id TEXT NOT NULL UNIQUE, timestamp INTEGER NOT NULL, sender TEXT NOT NULL, recipients TEXT NOT NULL, subject TEXT NOT NULL, account TEXT NOT NULL, folder TEXT NOT NULL, thread TEXT NOT NULL, segment TEXT NOT NULL, archive_offset INTEGER NOT NULL, frame_bytes INTEGER NOT NULL, raw_blake3 BLOB NOT NULL CHECK(length(raw_blake3)=32));
+CREATE TABLE attachments (doc_id INTEGER NOT NULL, filename TEXT NOT NULL, mime TEXT NOT NULL, bytes INTEGER NOT NULL, content_hash TEXT NOT NULL, PRIMARY KEY(doc_id, filename));
+CREATE INDEX messages_timestamp ON messages(timestamp);
+CREATE INDEX messages_sender ON messages(sender);
+CREATE INDEX messages_folder ON messages(folder);
+CREATE TABLE gmail_state (source_account TEXT PRIMARY KEY, history_id TEXT NOT NULL, complete INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE gmail_messages (source_account TEXT NOT NULL, gmail_message_id TEXT NOT NULL, doc_id INTEGER NOT NULL UNIQUE, thread_id TEXT NOT NULL, label_ids TEXT NOT NULL, internal_date_ms INTEGER, message_history_id TEXT, source_state TEXT NOT NULL, first_seen_unix INTEGER NOT NULL, last_seen_unix INTEGER NOT NULL, PRIMARY KEY(source_account, gmail_message_id));
+CREATE INDEX gmail_messages_state ON gmail_messages(source_account, source_state);
+CREATE TABLE imap_messages (source_account TEXT NOT NULL, mailbox TEXT NOT NULL, uid_validity INTEGER NOT NULL, uid INTEGER NOT NULL, doc_id INTEGER NOT NULL UNIQUE, flags TEXT NOT NULL, internal_date TEXT, internal_date_ms INTEGER, rfc822_size INTEGER, source_state TEXT NOT NULL, first_seen_unix INTEGER NOT NULL, last_seen_unix INTEGER NOT NULL, PRIMARY KEY(source_account, mailbox, uid_validity, uid));
+CREATE INDEX imap_messages_state ON imap_messages(source_account, source_state);
+CREATE TABLE imap_scan_state (source_account TEXT NOT NULL, mailbox TEXT NOT NULL, uid_validity INTEGER NOT NULL, scanned_through_uid INTEGER NOT NULL, last_uid_next INTEGER NOT NULL, updated_unix INTEGER NOT NULL, PRIMARY KEY(source_account, mailbox, uid_validity));
+CREATE TABLE imap_mailboxes (source_account TEXT NOT NULL, mailbox TEXT NOT NULL, delimiter TEXT, attributes TEXT NOT NULL, special_use TEXT NOT NULL, selectable INTEGER NOT NULL, last_seen_unix INTEGER NOT NULL, PRIMARY KEY(source_account, mailbox));
+";
+
+pub fn create_catalogue(path: &Path) -> rusqlite::Result<Connection> {
+    if path.exists() {
+        return Err(rusqlite::Error::InvalidPath(path.to_path_buf()));
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).ok();
     }
-    let connection = Connection::open(path)?;
-    connection.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=EXTRA; CREATE TABLE IF NOT EXISTS messages (doc_id INTEGER PRIMARY KEY, message_id TEXT NOT NULL UNIQUE, timestamp INTEGER NOT NULL, sender TEXT NOT NULL, recipients TEXT NOT NULL, subject TEXT NOT NULL, account TEXT NOT NULL, folder TEXT NOT NULL, thread TEXT NOT NULL, segment TEXT NOT NULL, archive_offset INTEGER NOT NULL, frame_bytes INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS attachments (doc_id INTEGER NOT NULL, filename TEXT NOT NULL, mime TEXT NOT NULL, bytes INTEGER NOT NULL, content_hash TEXT NOT NULL, PRIMARY KEY(doc_id, filename)); CREATE INDEX IF NOT EXISTS messages_timestamp ON messages(timestamp); CREATE INDEX IF NOT EXISTS messages_sender ON messages(sender); CREATE INDEX IF NOT EXISTS messages_folder ON messages(folder); CREATE TABLE IF NOT EXISTS gmail_state (source_account TEXT PRIMARY KEY, history_id TEXT NOT NULL, complete INTEGER NOT NULL DEFAULT 0); CREATE TABLE IF NOT EXISTS gmail_messages (source_account TEXT NOT NULL, gmail_message_id TEXT NOT NULL, doc_id INTEGER NOT NULL UNIQUE, thread_id TEXT NOT NULL, label_ids TEXT NOT NULL, internal_date_ms INTEGER, message_history_id TEXT, source_state TEXT NOT NULL, first_seen_unix INTEGER NOT NULL, last_seen_unix INTEGER NOT NULL, PRIMARY KEY(source_account, gmail_message_id)); CREATE INDEX IF NOT EXISTS gmail_messages_state ON gmail_messages(source_account, source_state);")?;
-    connection.execute_batch("CREATE TABLE IF NOT EXISTS imap_messages (source_account TEXT NOT NULL, mailbox TEXT NOT NULL, uid_validity INTEGER NOT NULL, uid INTEGER NOT NULL, doc_id INTEGER NOT NULL UNIQUE, flags TEXT NOT NULL, internal_date TEXT, internal_date_ms INTEGER, rfc822_size INTEGER, source_state TEXT NOT NULL, first_seen_unix INTEGER NOT NULL, last_seen_unix INTEGER NOT NULL, PRIMARY KEY(source_account, mailbox, uid_validity, uid)); CREATE INDEX IF NOT EXISTS imap_messages_state ON imap_messages(source_account, source_state); CREATE TABLE IF NOT EXISTS imap_scan_state (source_account TEXT NOT NULL, mailbox TEXT NOT NULL, uid_validity INTEGER NOT NULL, scanned_through_uid INTEGER NOT NULL, last_uid_next INTEGER NOT NULL, updated_unix INTEGER NOT NULL, PRIMARY KEY(source_account, mailbox, uid_validity)); CREATE TABLE IF NOT EXISTS imap_mailboxes (source_account TEXT NOT NULL, mailbox TEXT NOT NULL, delimiter TEXT, attributes TEXT NOT NULL, special_use TEXT NOT NULL, selectable INTEGER NOT NULL, last_seen_unix INTEGER NOT NULL, PRIMARY KEY(source_account, mailbox));")?;
+    let mut connection = Connection::open(path)?;
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(CATALOGUE_SCHEMA)?;
+    transaction.commit()?;
+    // The schema is complete before either marker can make this file look like
+    // a Memoria catalogue. A failure leaves an explicitly invalid version 0
+    // file, never a partially constructed valid v1 catalogue.
+    connection.execute_batch(&format!(
+        "PRAGMA application_id={MEMORIA_CATALOGUE_APPLICATION_ID}; PRAGMA user_version={MEMORIA_CATALOGUE_VERSION}; PRAGMA journal_mode=DELETE; PRAGMA synchronous=EXTRA;"
+    ))?;
     Ok(connection)
+}
+
+#[derive(Clone, Copy)]
+struct ExpectedColumn {
+    name: &'static str,
+    declared_type: &'static str,
+    not_null: bool,
+    default: Option<&'static str>,
+    primary_key: i64,
+}
+
+#[derive(Clone, Copy)]
+struct ExpectedIndex {
+    name: &'static str,
+    columns: &'static [&'static str],
+    unique: bool,
+    partial: bool,
+}
+
+#[derive(Debug)]
+struct ActualColumn {
+    cid: i64,
+    name: String,
+    declared_type: String,
+    not_null: bool,
+    default: Option<String>,
+    primary_key: i64,
+    hidden: i64,
+}
+
+#[derive(Debug)]
+struct ActualIndex {
+    name: String,
+    unique: bool,
+    origin: String,
+    partial: bool,
+}
+
+fn table_columns(connection: &Connection, table: &str) -> rusqlite::Result<Vec<ActualColumn>> {
+    connection
+        .prepare(&format!("PRAGMA table_xinfo({table})"))?
+        .query_map([], |row| {
+            Ok(ActualColumn {
+                cid: row.get(0)?,
+                name: row.get(1)?,
+                declared_type: row.get(2)?,
+                not_null: row.get::<_, i64>(3)? != 0,
+                default: row.get(4)?,
+                primary_key: row.get(5)?,
+                hidden: row.get(6)?,
+            })
+        })?
+        .collect()
+}
+
+fn validate_table(
+    connection: &Connection,
+    table: &str,
+    expected: &[ExpectedColumn],
+) -> rusqlite::Result<()> {
+    let actual = table_columns(connection, table)?;
+    if actual.is_empty() {
+        return Err(catalogue_inconsistent(format!("missing table {table}")));
+    }
+    if actual.len() != expected.len() {
+        return Err(catalogue_inconsistent(format!(
+            "invalid column count for {table}"
+        )));
+    }
+    for (position, (column, wanted)) in actual.iter().zip(expected).enumerate() {
+        if column.hidden != 0
+            || column.cid != position as i64
+            || column.name != wanted.name
+            || !column
+                .declared_type
+                .eq_ignore_ascii_case(wanted.declared_type)
+            || column.not_null != wanted.not_null
+            || column.default.as_deref().map(str::trim) != wanted.default
+            || column.primary_key != wanted.primary_key
+        {
+            return Err(catalogue_inconsistent(format!(
+                "invalid {table} column {}",
+                wanted.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn table_indexes(connection: &Connection, table: &str) -> rusqlite::Result<Vec<ActualIndex>> {
+    connection
+        .prepare(&format!("PRAGMA index_list({table})"))?
+        .query_map([], |row| {
+            Ok(ActualIndex {
+                name: row.get(1)?,
+                unique: row.get::<_, i64>(2)? != 0,
+                origin: row.get(3)?,
+                partial: row.get::<_, i64>(4)? != 0,
+            })
+        })?
+        .collect()
+}
+
+fn index_columns(connection: &Connection, name: &str) -> rusqlite::Result<Vec<String>> {
+    connection
+        .prepare(&format!("PRAGMA index_info({name})"))?
+        .query_map([], |row| row.get::<_, String>(2))?
+        .collect()
+}
+
+fn validate_indexes(
+    connection: &Connection,
+    table: &str,
+    expected: &[ExpectedIndex],
+    allowed_unique: &[&[&str]],
+    required_unique: &[&[&str]],
+) -> rusqlite::Result<()> {
+    let actual = table_indexes(connection, table)?;
+    for index in &actual {
+        let columns = index_columns(connection, &index.name)?;
+        match index.origin.as_str() {
+            "c" => {
+                let Some(wanted) = expected.iter().find(|wanted| wanted.name == index.name) else {
+                    return Err(catalogue_inconsistent(format!(
+                        "unexpected index {}",
+                        index.name
+                    )));
+                };
+                if index.unique != wanted.unique
+                    || index.partial != wanted.partial
+                    || columns
+                        .iter()
+                        .map(String::as_str)
+                        .ne(wanted.columns.iter().copied())
+                {
+                    return Err(catalogue_inconsistent(format!(
+                        "invalid index {}",
+                        index.name
+                    )));
+                }
+            }
+            "u" | "pk" => {
+                if !index.unique
+                    || index.partial
+                    || !allowed_unique.iter().any(|wanted| {
+                        columns
+                            .iter()
+                            .map(String::as_str)
+                            .eq(wanted.iter().copied())
+                    })
+                {
+                    return Err(catalogue_inconsistent(format!(
+                        "invalid unique index {}",
+                        index.name
+                    )));
+                }
+            }
+            origin => {
+                return Err(catalogue_inconsistent(format!(
+                    "unsupported index origin {origin}"
+                )));
+            }
+        }
+    }
+    for wanted in expected {
+        if !actual.iter().any(|index| index.name == wanted.name) {
+            return Err(catalogue_inconsistent(format!(
+                "missing index {}",
+                wanted.name
+            )));
+        }
+    }
+    for wanted in required_unique {
+        let present = actual.iter().any(|index| {
+            index.origin == "u"
+                && index.unique
+                && !index.partial
+                && index_columns(connection, &index.name)
+                    .map(|columns| {
+                        columns
+                            .iter()
+                            .map(String::as_str)
+                            .eq(wanted.iter().copied())
+                    })
+                    .unwrap_or(false)
+        });
+        if !present {
+            return Err(catalogue_inconsistent(format!(
+                "missing UNIQUE constraint on {table}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_messages_schema_sql(connection: &Connection) -> rusqlite::Result<()> {
+    // The v1 catalogue is an internal format: SQLite's own canonical rendering
+    // of Memoria's reference DDL is the exact contract for this table. The
+    // existing catalogue is read-only; only the independent memory probe is
+    // created and written.
+    let reference = Connection::open_in_memory()?;
+    reference.execute_batch(CATALOGUE_SCHEMA)?;
+    let expected: String = reference.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type='table' AND name='messages'",
+        [],
+        |row| row.get(0),
+    )?;
+    let actual: String = connection.query_row(
+        "SELECT sql FROM sqlite_schema WHERE type='table' AND name='messages'",
+        [],
+        |row| row.get(0),
+    )?;
+    if actual != expected {
+        return Err(catalogue_inconsistent(
+            "messages DDL differs from canonical v1 DDL",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_catalogue_schema(connection: &Connection) -> rusqlite::Result<()> {
+    let expected_tables: HashSet<&str> = [
+        "messages",
+        "attachments",
+        "gmail_state",
+        "gmail_messages",
+        "imap_messages",
+        "imap_scan_state",
+        "imap_mailboxes",
+    ]
+    .into_iter()
+    .collect();
+    let actual_tables: HashSet<String> = connection
+        .prepare("PRAGMA table_list")?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        })?
+        .filter_map(|row| match row {
+            Ok((name, kind)) if !name.starts_with("sqlite_") && kind == "table" => Some(Ok(name)),
+            Ok((name, _)) if !name.starts_with("sqlite_") => Some(Err(catalogue_inconsistent(
+                format!("unexpected non-table object {name}"),
+            ))),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<rusqlite::Result<_>>()?;
+    if actual_tables.len() != expected_tables.len()
+        || expected_tables
+            .iter()
+            .any(|table| !actual_tables.contains(*table))
+    {
+        return Err(catalogue_inconsistent("catalogue table set mismatch"));
+    }
+    validate_table(
+        connection,
+        "messages",
+        &[
+            ExpectedColumn {
+                name: "doc_id",
+                declared_type: "INTEGER",
+                not_null: false,
+                default: None,
+                primary_key: 1,
+            },
+            ExpectedColumn {
+                name: "message_id",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "timestamp",
+                declared_type: "INTEGER",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "sender",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "recipients",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "subject",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "account",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "folder",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "thread",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "segment",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "archive_offset",
+                declared_type: "INTEGER",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "frame_bytes",
+                declared_type: "INTEGER",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "raw_blake3",
+                declared_type: "BLOB",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+        ],
+    )?;
+    validate_table(
+        connection,
+        "attachments",
+        &[
+            ExpectedColumn {
+                name: "doc_id",
+                declared_type: "INTEGER",
+                not_null: true,
+                default: None,
+                primary_key: 1,
+            },
+            ExpectedColumn {
+                name: "filename",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 2,
+            },
+            ExpectedColumn {
+                name: "mime",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "bytes",
+                declared_type: "INTEGER",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "content_hash",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+        ],
+    )?;
+    validate_table(
+        connection,
+        "gmail_state",
+        &[
+            ExpectedColumn {
+                name: "source_account",
+                declared_type: "TEXT",
+                not_null: false,
+                default: None,
+                primary_key: 1,
+            },
+            ExpectedColumn {
+                name: "history_id",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "complete",
+                declared_type: "INTEGER",
+                not_null: true,
+                default: Some("0"),
+                primary_key: 0,
+            },
+        ],
+    )?;
+    validate_table(
+        connection,
+        "gmail_messages",
+        &[
+            ExpectedColumn {
+                name: "source_account",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 1,
+            },
+            ExpectedColumn {
+                name: "gmail_message_id",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 2,
+            },
+            ExpectedColumn {
+                name: "doc_id",
+                declared_type: "INTEGER",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "thread_id",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "label_ids",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "internal_date_ms",
+                declared_type: "INTEGER",
+                not_null: false,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "message_history_id",
+                declared_type: "TEXT",
+                not_null: false,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "source_state",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "first_seen_unix",
+                declared_type: "INTEGER",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "last_seen_unix",
+                declared_type: "INTEGER",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+        ],
+    )?;
+    validate_table(
+        connection,
+        "imap_messages",
+        &[
+            ExpectedColumn {
+                name: "source_account",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 1,
+            },
+            ExpectedColumn {
+                name: "mailbox",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 2,
+            },
+            ExpectedColumn {
+                name: "uid_validity",
+                declared_type: "INTEGER",
+                not_null: true,
+                default: None,
+                primary_key: 3,
+            },
+            ExpectedColumn {
+                name: "uid",
+                declared_type: "INTEGER",
+                not_null: true,
+                default: None,
+                primary_key: 4,
+            },
+            ExpectedColumn {
+                name: "doc_id",
+                declared_type: "INTEGER",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "flags",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "internal_date",
+                declared_type: "TEXT",
+                not_null: false,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "internal_date_ms",
+                declared_type: "INTEGER",
+                not_null: false,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "rfc822_size",
+                declared_type: "INTEGER",
+                not_null: false,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "source_state",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "first_seen_unix",
+                declared_type: "INTEGER",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "last_seen_unix",
+                declared_type: "INTEGER",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+        ],
+    )?;
+    validate_table(
+        connection,
+        "imap_scan_state",
+        &[
+            ExpectedColumn {
+                name: "source_account",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 1,
+            },
+            ExpectedColumn {
+                name: "mailbox",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 2,
+            },
+            ExpectedColumn {
+                name: "uid_validity",
+                declared_type: "INTEGER",
+                not_null: true,
+                default: None,
+                primary_key: 3,
+            },
+            ExpectedColumn {
+                name: "scanned_through_uid",
+                declared_type: "INTEGER",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "last_uid_next",
+                declared_type: "INTEGER",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "updated_unix",
+                declared_type: "INTEGER",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+        ],
+    )?;
+    validate_table(
+        connection,
+        "imap_mailboxes",
+        &[
+            ExpectedColumn {
+                name: "source_account",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 1,
+            },
+            ExpectedColumn {
+                name: "mailbox",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 2,
+            },
+            ExpectedColumn {
+                name: "delimiter",
+                declared_type: "TEXT",
+                not_null: false,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "attributes",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "special_use",
+                declared_type: "TEXT",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "selectable",
+                declared_type: "INTEGER",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+            ExpectedColumn {
+                name: "last_seen_unix",
+                declared_type: "INTEGER",
+                not_null: true,
+                default: None,
+                primary_key: 0,
+            },
+        ],
+    )?;
+    validate_indexes(
+        connection,
+        "messages",
+        &[
+            ExpectedIndex {
+                name: "messages_timestamp",
+                columns: &["timestamp"],
+                unique: false,
+                partial: false,
+            },
+            ExpectedIndex {
+                name: "messages_sender",
+                columns: &["sender"],
+                unique: false,
+                partial: false,
+            },
+            ExpectedIndex {
+                name: "messages_folder",
+                columns: &["folder"],
+                unique: false,
+                partial: false,
+            },
+        ],
+        &[&["message_id"]],
+        &[&["message_id"]],
+    )?;
+    validate_indexes(
+        connection,
+        "attachments",
+        &[],
+        &[&["doc_id", "filename"]],
+        &[],
+    )?;
+    validate_indexes(connection, "gmail_state", &[], &[&["source_account"]], &[])?;
+    validate_indexes(
+        connection,
+        "gmail_messages",
+        &[ExpectedIndex {
+            name: "gmail_messages_state",
+            columns: &["source_account", "source_state"],
+            unique: false,
+            partial: false,
+        }],
+        &[&["source_account", "gmail_message_id"], &["doc_id"]],
+        &[&["doc_id"]],
+    )?;
+    validate_indexes(
+        connection,
+        "imap_messages",
+        &[ExpectedIndex {
+            name: "imap_messages_state",
+            columns: &["source_account", "source_state"],
+            unique: false,
+            partial: false,
+        }],
+        &[
+            &["source_account", "mailbox", "uid_validity", "uid"],
+            &["doc_id"],
+        ],
+        &[&["doc_id"]],
+    )?;
+    validate_indexes(
+        connection,
+        "imap_scan_state",
+        &[],
+        &[&["source_account", "mailbox", "uid_validity"]],
+        &[],
+    )?;
+    validate_indexes(
+        connection,
+        "imap_mailboxes",
+        &[],
+        &[&["source_account", "mailbox"]],
+        &[],
+    )?;
+    validate_messages_schema_sql(connection)?;
+    Ok(())
+}
+
+pub fn validate_existing_catalogue(path: &Path) -> rusqlite::Result<()> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let application_id: i64 =
+        connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
+    let user_version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if application_id != MEMORIA_CATALOGUE_APPLICATION_ID {
+        return Err(catalogue_inconsistent("unsupported application_id"));
+    }
+    if user_version != MEMORIA_CATALOGUE_VERSION {
+        return Err(catalogue_inconsistent("unsupported catalogue version"));
+    }
+    validate_catalogue_schema(&connection)
+}
+
+fn configure_catalogue_runtime(connection: &Connection) -> rusqlite::Result<()> {
+    connection.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=EXTRA;")?;
+    Ok(())
+}
+
+pub fn open_catalogue(path: &Path) -> rusqlite::Result<Connection> {
+    validate_existing_catalogue(path)?;
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    configure_catalogue_runtime(&connection)?;
+    Ok(connection)
+}
+
+fn create_or_open_catalogue(path: &Path) -> rusqlite::Result<Connection> {
+    if path.exists() {
+        open_catalogue(path)
+    } else {
+        create_catalogue(path)
+    }
+}
+
+pub fn create_metadata(path: &Path) -> rusqlite::Result<Connection> {
+    create_or_open_catalogue(path)
 }
 
 pub fn insert_metadata(
     connection: &Connection,
     message: &Message,
-    location: &ArchiveLocation,
+    location: &PendingRawLocation,
 ) -> rusqlite::Result<()> {
     connection.execute(
-        "INSERT INTO messages VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        "INSERT INTO messages VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             message.id as i64,
             message.message_id,
@@ -2389,9 +3238,10 @@ pub fn insert_metadata(
             message.account,
             message.folder,
             message.thread,
-            location.segment,
-            location.offset as i64,
-            location.frame_bytes as i64
+            location.reference.location.segment,
+            location.reference.location.offset as i64,
+            location.reference.location.frame_bytes as i64,
+            &location.reference.blake3[..]
         ],
     )?;
     for attachment in &message.attachments {
@@ -2439,7 +3289,7 @@ pub fn insert_gmail_metadata(
     label_ids_json: &str,
     internal_date_ms: Option<i64>,
     message_history_id: Option<&str>,
-    location: &ArchiveLocation,
+    location: &PendingRawLocation,
 ) -> rusqlite::Result<()> {
     let transaction = connection.unchecked_transaction()?;
     insert_gmail_metadata_in_transaction(
@@ -2467,7 +3317,7 @@ fn insert_gmail_metadata_with_hook<F>(
     label_ids_json: &str,
     internal_date_ms: Option<i64>,
     message_history_id: Option<&str>,
-    location: &ArchiveLocation,
+    location: &PendingRawLocation,
     after_messages: F,
 ) -> rusqlite::Result<()>
 where
@@ -2499,11 +3349,11 @@ fn insert_gmail_metadata_in_transaction(
     label_ids_json: &str,
     internal_date_ms: Option<i64>,
     message_history_id: Option<&str>,
-    location: &ArchiveLocation,
+    location: &PendingRawLocation,
 ) -> rusqlite::Result<()> {
     transaction.execute(
-        "INSERT INTO messages(doc_id,message_id,timestamp,sender,recipients,subject,account,folder,thread,segment,archive_offset,frame_bytes) VALUES (?1,?2,0,'','','',?3,'','',?4,?5,?6)",
-        params![doc_id, format!("gmail:{source_account}:{gmail_id}"), source_account, location.segment, location.offset as i64, location.frame_bytes as i64],
+        "INSERT INTO messages(doc_id,message_id,timestamp,sender,recipients,subject,account,folder,thread,segment,archive_offset,frame_bytes,raw_blake3) VALUES (?1,?2,0,'','','',?3,'','',?4,?5,?6,?7)",
+        params![doc_id, format!("gmail:{source_account}:{gmail_id}"), source_account, location.reference.location.segment, location.reference.location.offset as i64, location.reference.location.frame_bytes as i64, &location.reference.blake3[..]],
     )?;
     let now = chrono_like_now();
     transaction.execute(
@@ -2624,7 +3474,7 @@ pub fn insert_imap_metadata(
     internal_date_ms: Option<i64>,
     rfc822_size: Option<u32>,
     doc_id: i64,
-    location: &ArchiveLocation,
+    location: &PendingRawLocation,
 ) -> rusqlite::Result<()> {
     let transaction = connection.unchecked_transaction()?;
     insert_imap_metadata_in_transaction(
@@ -2656,7 +3506,7 @@ fn insert_imap_metadata_with_hook<F>(
     internal_date_ms: Option<i64>,
     rfc822_size: Option<u32>,
     doc_id: i64,
-    location: &ArchiveLocation,
+    location: &PendingRawLocation,
     after_messages: F,
 ) -> rusqlite::Result<()>
 where
@@ -2692,20 +3542,21 @@ fn insert_imap_metadata_in_transaction(
     internal_date_ms: Option<i64>,
     rfc822_size: Option<u32>,
     doc_id: i64,
-    location: &ArchiveLocation,
+    location: &PendingRawLocation,
 ) -> rusqlite::Result<()> {
     let message_id = format!("imap:{source_account}:{mailbox}:{uid_validity}:{uid}");
     transaction.execute(
-        "INSERT INTO messages(doc_id,message_id,timestamp,sender,recipients,subject,account,folder,thread,segment,archive_offset,frame_bytes) VALUES (?1,?2,?3,'','','',?4,?5,'',?6,?7,?8)",
+        "INSERT INTO messages(doc_id,message_id,timestamp,sender,recipients,subject,account,folder,thread,segment,archive_offset,frame_bytes,raw_blake3) VALUES (?1,?2,?3,'','','',?4,?5,'',?6,?7,?8,?9)",
         params![
             doc_id,
             message_id,
             internal_date_ms.unwrap_or(0),
             source_account,
             mailbox,
-            location.segment,
-            location.offset as i64,
-            location.frame_bytes as i64
+            location.reference.location.segment,
+            location.reference.location.offset as i64,
+            location.reference.location.frame_bytes as i64,
+            &location.reference.blake3[..]
         ],
     )?;
     transaction.execute(
@@ -2739,7 +3590,7 @@ where
     let mut count = 0u64;
     for (location, doc_id) in entries {
         if location.batch_id != durable.batch_id
-            || i64::try_from(location.doc_id).ok() != Some(doc_id)
+            || i64::try_from(location.reference.doc_id).ok() != Some(doc_id)
             || location.ordinal >= durable.records
             || !ordinals.insert(location.ordinal)
         {
@@ -2748,7 +3599,7 @@ where
             ));
         }
         frame_bytes = frame_bytes
-            .checked_add(location.location.frame_bytes)
+            .checked_add(location.reference.location.frame_bytes)
             .ok_or_else(|| batch_mismatch("batch frame byte count overflow"))?;
         count += 1;
     }
@@ -3230,7 +4081,7 @@ fn for_each_gmail_catalog_row<F>(root: &Path, mut visit: F) -> io::Result<()>
 where
     F: FnMut(GmailCatalogRow) -> io::Result<()>,
 {
-    let connection = create_metadata(&root.join("metadata.sqlite")).map_err(sqlite_io)?;
+    let connection = open_catalogue(&root.join("metadata.sqlite")).map_err(sqlite_io)?;
     let mut statement = connection
         .prepare(
             "SELECT doc_id,source_account,labels,source_state,timestamp,segment,archive_offset,frame_bytes
@@ -3785,39 +4636,66 @@ pub fn search_gmail_archive(
 }
 
 pub fn read_archived_raw(root: &Path, doc_id: u64) -> io::Result<Vec<u8>> {
-    let catalog = Connection::open(root.join("metadata.sqlite")).map_err(sqlite_io)?;
+    let catalog = open_catalogue(&root.join("metadata.sqlite")).map_err(sqlite_io)?;
     let catalog_id = i64::try_from(doc_id).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             "archive record id does not fit in the catalog",
         )
     })?;
-    let (segment, offset, frame_bytes) = catalog
+    let (segment, offset, frame_bytes, raw_blake3) = catalog
         .query_row(
-            "SELECT segment,archive_offset,frame_bytes FROM messages WHERE doc_id=?1",
+            "SELECT segment,archive_offset,frame_bytes,raw_blake3 FROM messages WHERE doc_id=?1",
             [catalog_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
                 ))
             },
         )
         .map_err(sqlite_io)?;
-    let location = ArchiveLocation {
-        segment,
-        offset: u64::try_from(offset)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "negative archive offset"))?,
-        frame_bytes: u64::try_from(frame_bytes).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "negative archive frame length")
-        })?,
-    };
-    let (record_id, raw) = read_record(&root.join("archive"), &location)?;
-    if record_id != doc_id {
+    if raw_blake3.len() != 32 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "catalog/archive id mismatch",
+            "catalogue raw BLAKE3 length is not 32 bytes",
+        ));
+    }
+    let mut expected_blake3 = [0u8; 32];
+    expected_blake3.copy_from_slice(&raw_blake3);
+    let reference = RawReference {
+        doc_id,
+        location: ArchiveLocation {
+            segment,
+            offset: u64::try_from(offset).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "negative archive offset")
+            })?,
+            frame_bytes: u64::try_from(frame_bytes).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "negative archive frame length")
+            })?,
+        },
+        blake3: expected_blake3,
+    };
+    read_authoritative_raw(&root.join("archive"), &reference)
+}
+
+pub fn read_authoritative_raw(
+    archive_root: &Path,
+    reference: &RawReference,
+) -> io::Result<Vec<u8>> {
+    let (record_id, raw) = read_record(archive_root, &reference.location)?;
+    if record_id != reference.doc_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "catalog/archive doc_id mismatch",
+        ));
+    }
+    if *blake3::hash(&raw).as_bytes() != reference.blake3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "catalogue/RAW BLAKE3 linkage mismatch",
         ));
     }
     Ok(raw)
@@ -4037,7 +4915,7 @@ pub fn build_archive(
     let archive_root = root.join("archive");
     let metadata_path = root.join("metadata.sqlite");
     let mut writer = ArchiveWriter::open(&archive_root, segment_bytes)?;
-    let mut metadata = create_metadata(&metadata_path).map_err(sqlite_io)?;
+    let mut metadata = create_catalogue(&metadata_path).map_err(sqlite_io)?;
     let transaction = metadata.transaction().map_err(sqlite_io)?;
     let mut sizes = Vec::with_capacity(config.messages.min(1_000_000) as usize);
     let mut bytes = 0u64;
@@ -4087,8 +4965,8 @@ pub fn build_archive(
             zstd_bytes += text_zstd + attachment_zstd;
         }
     }
-    transaction.commit().map_err(sqlite_io)?;
     writer.sync()?;
+    transaction.commit().map_err(sqlite_io)?;
     sizes.sort_unstable();
     let duplicate_sizes = duplicate_sizes(&attachment_counts, &unique_attachment_sizes);
     let unique_attachment_bytes: u64 = unique_attachment_sizes.values().sum();
@@ -4193,6 +5071,16 @@ mod tests {
         assert_eq!(journal_mode.to_ascii_lowercase(), "delete");
         assert_eq!(synchronous, 3);
         drop(connection);
+        let reopened = open_catalogue(&root.join("metadata.sqlite")).unwrap();
+        let reopened_journal = reopened
+            .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            .unwrap();
+        let reopened_synchronous = reopened
+            .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(reopened_journal.to_ascii_lowercase(), "delete");
+        assert_eq!(reopened_synchronous, 3);
+        drop(reopened);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4201,10 +5089,18 @@ mod tests {
         let root = raw_read_test_root("catalogue-atomic");
         let _ = fs::remove_dir_all(&root);
         let connection = create_metadata(&root.join("metadata.sqlite")).unwrap();
-        let location = ArchiveLocation {
-            segment: "segment-000000.arc".into(),
-            offset: 0,
-            frame_bytes: 32,
+        let location = PendingRawLocation {
+            reference: RawReference {
+                doc_id: 0,
+                location: ArchiveLocation {
+                    segment: "segment-000000.arc".into(),
+                    offset: 0,
+                    frame_bytes: 32,
+                },
+                blake3: *blake3::hash(b"").as_bytes(),
+            },
+            batch_id: 0,
+            ordinal: 0,
         };
 
         let gmail_failure = insert_gmail_metadata_with_hook(
@@ -4411,7 +5307,7 @@ mod tests {
             location,
         };
         assert!(writer.durable_barrier().is_err());
-        assert!(read_record(&root.join("archive"), &record.location).is_ok());
+        assert!(read_record(&root.join("archive"), &record.location.reference.location).is_ok());
         assert_eq!(
             connection
                 .query_row("SELECT COUNT(*) FROM gmail_messages", [], |row| row
@@ -4695,7 +5591,7 @@ mod tests {
         reopened.durable_barrier().unwrap();
         let final_length = fs::metadata(root.join("segment-000000.arc")).unwrap().len();
         assert!(final_length > length_after_failure);
-        let (record_id, raw) = read_record(&root, &later.location).unwrap();
+        let (record_id, raw) = read_record(&root, &later.reference.location).unwrap();
         assert_eq!(record_id, 3);
         assert_eq!(raw, b"later");
         let _ = fs::remove_dir_all(root);
@@ -4943,6 +5839,273 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_read_checks_catalogue_blake3_after_restart_and_corruption() {
+        let root = raw_read_test_root("blake3-linkage");
+        let archive = root.join("archive");
+        fs::create_dir_all(&archive).unwrap();
+        let raw_a = b"same-size-A";
+        let raw_b = b"same-size-B";
+        let mut writer = ArchiveWriter::open(&archive, 4096).unwrap();
+        let location_a = writer.append_raw(7, raw_a).unwrap();
+        writer.durable_barrier().unwrap();
+        drop(writer);
+
+        // A is durable but unpublished. After restart, B is the legitimate
+        // publication for the same document identity.
+        let mut writer = ArchiveWriter::open(&archive, 4096).unwrap();
+        let location_b = writer.append_raw(7, raw_b).unwrap();
+        writer.durable_barrier().unwrap();
+        let location_c = writer.append_raw(7, b"different-size-C").unwrap();
+        writer.durable_barrier().unwrap();
+        let catalog = create_metadata(&root.join("metadata.sqlite")).unwrap();
+        let message = Message {
+            id: 7,
+            message_id: "fixture-7".into(),
+            timestamp: 0,
+            sender: String::new(),
+            recipients: Vec::new(),
+            subject: String::new(),
+            text_body: String::new(),
+            html_body: None,
+            account: String::new(),
+            folder: String::new(),
+            thread: String::new(),
+            attachments: Vec::new(),
+            raw: raw_b.to_vec(),
+        };
+        insert_metadata(&catalog, &message, &location_b).unwrap();
+
+        catalog
+            .execute(
+                "UPDATE messages SET segment=?1, archive_offset=?2, frame_bytes=?3 WHERE doc_id=7",
+                params![
+                    location_a.segment,
+                    location_a.offset as i64,
+                    location_a.frame_bytes as i64
+                ],
+            )
+            .unwrap();
+        drop(catalog);
+        assert!(read_archived_raw(&root, 7)
+            .unwrap_err()
+            .to_string()
+            .contains("BLAKE3"));
+
+        let catalog = open_catalogue(&root.join("metadata.sqlite")).unwrap();
+        catalog
+            .execute(
+                "UPDATE messages SET segment=?1, archive_offset=?2, frame_bytes=?3 WHERE doc_id=7",
+                params![
+                    location_c.segment,
+                    location_c.offset as i64,
+                    location_c.frame_bytes as i64
+                ],
+            )
+            .unwrap();
+        assert!(read_archived_raw(&root, 7)
+            .unwrap_err()
+            .to_string()
+            .contains("BLAKE3"));
+        catalog
+            .execute(
+                "UPDATE messages SET segment=?1, archive_offset=?2, frame_bytes=?3 WHERE doc_id=7",
+                params![
+                    location_b.segment,
+                    location_b.offset as i64,
+                    location_b.frame_bytes as i64
+                ],
+            )
+            .unwrap();
+        assert_eq!(read_archived_raw(&root, 7).unwrap(), raw_b);
+
+        catalog
+            .execute(
+                "UPDATE messages SET raw_blake3=?1 WHERE doc_id=7",
+                [vec![0u8; 32]],
+            )
+            .unwrap();
+        assert!(read_archived_raw(&root, 7)
+            .unwrap_err()
+            .to_string()
+            .contains("BLAKE3"));
+        catalog
+            .execute(
+                "UPDATE messages SET raw_blake3=?1 WHERE doc_id=7",
+                [&location_b.reference.blake3[..]],
+            )
+            .unwrap();
+        let segment_path = archive.join(&location_b.segment);
+        let mut bytes = fs::read(&segment_path).unwrap();
+        let payload_offset = location_b.offset as usize + FRAME_HEADER_BYTES as usize;
+        bytes[payload_offset] ^= 1;
+        fs::write(&segment_path, &bytes).unwrap();
+        assert!(read_archived_raw(&root, 7)
+            .unwrap_err()
+            .to_string()
+            .contains("checksum"));
+        let checksum = fnv64(&bytes[payload_offset..payload_offset + raw_b.len()]);
+        bytes[location_b.offset as usize + 24..location_b.offset as usize + 32]
+            .copy_from_slice(&checksum.to_le_bytes());
+        fs::write(&segment_path, &bytes).unwrap();
+        assert!(read_archived_raw(&root, 7)
+            .unwrap_err()
+            .to_string()
+            .contains("BLAKE3"));
+        drop(catalog);
+        drop(writer);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_catalogue_is_rejected_without_modification() {
+        let root = raw_read_test_root("legacy-catalogue");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("metadata.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("PRAGMA application_id=0; PRAGMA user_version=0; CREATE TABLE messages (doc_id INTEGER PRIMARY KEY, message_id TEXT NOT NULL, segment TEXT NOT NULL, archive_offset INTEGER NOT NULL, frame_bytes INTEGER NOT NULL);").unwrap();
+        drop(connection);
+        let before = fs::read(&path).unwrap();
+        assert!(open_catalogue(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn incompatible_catalogues_are_rejected_read_only_by_all_authoritative_openers() {
+        for variant in [
+            "bad-application-id",
+            "future-version",
+            "missing-table",
+            "missing-raw-column",
+            "extra-column",
+            "partial-index",
+            "wrong-index-order",
+            "missing-message-unique",
+            "extra-table",
+        ] {
+            let root = raw_read_test_root(variant);
+            fs::create_dir_all(root.join("archive")).unwrap();
+            let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+            let raw = b"catalogue validation fixture";
+            let location = writer.append_raw(0, raw).unwrap();
+            writer.sync().unwrap();
+            let catalog = create_catalogue(&root.join("metadata.sqlite")).unwrap();
+            let message = Message {
+                id: 0,
+                message_id: "validation-fixture".into(),
+                timestamp: 0,
+                sender: String::new(),
+                recipients: Vec::new(),
+                subject: String::new(),
+                text_body: String::new(),
+                html_body: None,
+                account: String::new(),
+                folder: String::new(),
+                thread: String::new(),
+                attachments: Vec::new(),
+                raw: raw.to_vec(),
+            };
+            insert_metadata(&catalog, &message, &location).unwrap();
+            drop(catalog);
+            drop(writer);
+            let catalog = Connection::open(root.join("metadata.sqlite")).unwrap();
+            match variant {
+                "bad-application-id" => catalog.execute_batch("PRAGMA application_id=1234;").unwrap(),
+                "future-version" => catalog.execute_batch("PRAGMA user_version=2;").unwrap(),
+                "missing-table" => catalog.execute_batch("DROP TABLE imap_mailboxes;").unwrap(),
+                "missing-raw-column" => catalog.execute_batch("DROP TABLE messages; CREATE TABLE messages (doc_id INTEGER PRIMARY KEY, message_id TEXT NOT NULL UNIQUE, timestamp INTEGER NOT NULL, sender TEXT NOT NULL, recipients TEXT NOT NULL, subject TEXT NOT NULL, account TEXT NOT NULL, folder TEXT NOT NULL, thread TEXT NOT NULL, segment TEXT NOT NULL, archive_offset INTEGER NOT NULL, frame_bytes INTEGER NOT NULL);").unwrap(),
+                "extra-column" => catalog.execute_batch("ALTER TABLE messages ADD COLUMN unexpected TEXT;").unwrap(),
+                "partial-index" => catalog.execute_batch("DROP INDEX messages_timestamp; CREATE INDEX messages_timestamp ON messages(timestamp) WHERE timestamp >= 0;").unwrap(),
+                "wrong-index-order" => catalog.execute_batch("DROP INDEX gmail_messages_state; CREATE INDEX gmail_messages_state ON gmail_messages(source_state, source_account);").unwrap(),
+                "missing-message-unique" => catalog.execute_batch("DROP INDEX messages_timestamp; DROP INDEX messages_sender; DROP INDEX messages_folder; ALTER TABLE messages RENAME TO messages_old; CREATE TABLE messages (doc_id INTEGER PRIMARY KEY, message_id TEXT NOT NULL, timestamp INTEGER NOT NULL, sender TEXT NOT NULL, recipients TEXT NOT NULL, subject TEXT NOT NULL, account TEXT NOT NULL, folder TEXT NOT NULL, thread TEXT NOT NULL, segment TEXT NOT NULL, archive_offset INTEGER NOT NULL, frame_bytes INTEGER NOT NULL, raw_blake3 BLOB NOT NULL CHECK(length(raw_blake3)=32)); CREATE INDEX messages_timestamp ON messages(timestamp); CREATE INDEX messages_sender ON messages(sender); CREATE INDEX messages_folder ON messages(folder); DROP TABLE messages_old;").unwrap(),
+                "extra-table" => catalog.execute_batch("CREATE TABLE unexpected_table (id INTEGER);").unwrap(),
+                _ => unreachable!(),
+            }
+            drop(catalog);
+            let path = root.join("metadata.sqlite");
+            let before = fs::read(&path).unwrap();
+            let sidecars = [
+                path.with_file_name("metadata.sqlite-wal"),
+                path.with_file_name("metadata.sqlite-shm"),
+                path.with_file_name("metadata.sqlite-journal"),
+            ];
+            let sidecars_before: Vec<_> = sidecars.iter().map(|path| fs::read(path).ok()).collect();
+            assert!(validate_existing_catalogue(&path).is_err());
+            assert_eq!(fs::read(&path).unwrap(), before);
+            assert!(read_archived_raw(&root, 0).is_err());
+            assert_eq!(fs::read(&path).unwrap(), before);
+            assert_eq!(
+                sidecars
+                    .iter()
+                    .map(|path| fs::read(path).ok())
+                    .collect::<Vec<_>>(),
+                sidecars_before
+            );
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn correct_application_id_with_legacy_version_zero_is_rejected_unchanged() {
+        let root = raw_read_test_root("version-zero");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("metadata.sqlite");
+        let connection = create_catalogue(&path).unwrap();
+        drop(connection);
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch("PRAGMA user_version=0;").unwrap();
+        drop(connection);
+        let before = fs::read(&path).unwrap();
+        assert!(open_catalogue(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        for suffix in ["-wal", "-shm", "-journal"] {
+            assert!(!root.join(format!("metadata.sqlite{suffix}")).exists());
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn divergent_raw_blake3_ddl_is_rejected_against_canonical_schema() {
+        for (variant, check) in [
+            ("none", "1"),
+            ("lower-bound", "length(raw_blake3)>=32"),
+            ("even", "length(raw_blake3)%2=0"),
+            ("wrong-column", "length(doc_id)=32"),
+            (
+                "comment",
+                "raw_blake3 IS NOT NULL /* length(raw_blake3)=32 */",
+            ),
+        ] {
+            let root = raw_read_test_root(&format!("raw-check-{variant}"));
+            fs::create_dir_all(&root).unwrap();
+            let path = root.join("metadata.sqlite");
+            drop(create_catalogue(&path).unwrap());
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(&format!(
+                    "DROP INDEX messages_timestamp;
+                 DROP INDEX messages_sender;
+                 DROP INDEX messages_folder;
+                 ALTER TABLE messages RENAME TO messages_old;
+                 CREATE TABLE messages (doc_id INTEGER PRIMARY KEY, message_id TEXT NOT NULL UNIQUE, timestamp INTEGER NOT NULL, sender TEXT NOT NULL, recipients TEXT NOT NULL, subject TEXT NOT NULL, account TEXT NOT NULL, folder TEXT NOT NULL, thread TEXT NOT NULL, segment TEXT NOT NULL, archive_offset INTEGER NOT NULL, frame_bytes INTEGER NOT NULL, raw_blake3 BLOB NOT NULL CHECK({check}));
+                 CREATE INDEX messages_timestamp ON messages(timestamp);
+                 CREATE INDEX messages_sender ON messages(sender);
+                 CREATE INDEX messages_folder ON messages(folder);
+                 DROP TABLE messages_old;"
+                ))
+                .unwrap();
+            drop(connection);
+            let before = fs::read(&path).unwrap();
+            assert!(validate_existing_catalogue(&path).is_err(), "{variant}");
+            assert_eq!(fs::read(&path).unwrap(), before);
+            for suffix in ["-wal", "-shm", "-journal"] {
+                assert!(!root.join(format!("metadata.sqlite{suffix}")).exists());
+            }
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
     fn record_read_rejects_inconsistent_coordinates() {
         let root = raw_read_test_root("coordinates");
         let archive = root.join("archive");
@@ -4952,7 +6115,7 @@ mod tests {
         writer.sync().unwrap();
         drop(writer);
 
-        let mut wrong_frame_bytes = location.location.clone();
+        let mut wrong_frame_bytes = location.reference.location.clone();
         wrong_frame_bytes.frame_bytes -= 1;
         assert_eq!(
             read_record(&archive, &wrong_frame_bytes)
@@ -4961,14 +6124,14 @@ mod tests {
             io::ErrorKind::InvalidData
         );
 
-        let mut outside = location.location.clone();
+        let mut outside = location.reference.location.clone();
         outside.offset = u64::MAX;
         assert_eq!(
             read_record(&archive, &outside).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
 
-        let mut invalid_segment = location.location;
+        let mut invalid_segment = location.reference.location;
         invalid_segment.segment = "../segment-000000.arc".into();
         assert_eq!(
             read_record(&archive, &invalid_segment).unwrap_err().kind(),
@@ -5028,7 +6191,7 @@ mod tests {
                 raw: raw.clone(),
             };
             insert_metadata(&catalog, &message, &location).unwrap();
-            locations.push(location.location);
+            locations.push(location.reference.location);
         }
         writer.sync().unwrap();
         drop(catalog);
@@ -5300,7 +6463,7 @@ mod tests {
                 &location,
             )
             .unwrap();
-            locations.push(location.location);
+            locations.push(location.reference.location);
         }
         writer.sync().unwrap();
         drop(catalog);

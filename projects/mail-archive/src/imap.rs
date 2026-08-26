@@ -262,7 +262,7 @@ fn batch_full(batch: &[crate::ImapBatchRecord]) -> bool {
     batch.len() >= IMPORT_BATCH_RECORD_LIMIT
         || batch
             .iter()
-            .map(|record| record.location.frame_bytes)
+            .map(|record| record.location.reference.location.frame_bytes)
             .sum::<u64>()
             >= IMPORT_BATCH_BYTES_LIMIT
 }
@@ -353,7 +353,7 @@ fn flush_batch(
     let records = staged.len() as u64;
     let frame_bytes = staged
         .iter()
-        .map(|record| record.location.frame_bytes)
+        .map(|record| record.location.reference.location.frame_bytes)
         .sum::<u64>();
     crate::publish_imap_batch(connection, staged, &durable)
         .map_err(|error| ImapError::Io(error.to_string()))?;
