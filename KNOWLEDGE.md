@@ -702,3 +702,16 @@ résultats d'expérience locale :
 - **Limite :** Gmail et IMAP publient encore SQLite selon leur ordre actuel et
   n’utilisent pas encore un group commit RAW/catalogue; A3.2a ne résout donc
   pas A3.
+
+## 2026-08-26 — Tier A3.2b : group commit RAW → catalogue
+
+- Les imports Gmail et IMAP allouent les `doc_id` localement après une seule
+  lecture de SQLite, dédupliquent les identités pending et publient chaque lot
+  après un `DurableRawBatch` couvrant exactement ses records et ses octets.
+- Chaque lot est publié par une transaction SQLite unique ; une erreur de
+  barrière ou de transaction ne publie aucune nouvelle identité du lot. Les
+  RAW déjà durables restent volontairement orphelins et ne sont ni supprimés
+  ni réparés. A3 global reste ouvert jusqu’à A3.3.
+- Chaque `PendingRawLocation` porte aussi son ordinal dans le lot et le
+  `doc_id` écrit par `append_raw`; le publisher exige une couverture exacte,
+  unique et complète des ordinaux ainsi que la concordance du `doc_id`.

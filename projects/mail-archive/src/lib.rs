@@ -192,6 +192,8 @@ pub struct ArchiveLocation {
 pub struct PendingRawLocation {
     pub location: ArchiveLocation,
     pub batch_id: u64,
+    pub ordinal: u64,
+    pub doc_id: u64,
 }
 
 impl std::ops::Deref for PendingRawLocation {
@@ -207,6 +209,30 @@ pub struct DurableRawBatch {
     pub batch_id: u64,
     pub records: u64,
     pub frame_bytes: u64,
+}
+
+pub(crate) struct GmailBatchRecord {
+    pub source_account: String,
+    pub gmail_id: String,
+    pub doc_id: i64,
+    pub thread_id: String,
+    pub label_ids_json: String,
+    pub internal_date_ms: Option<i64>,
+    pub message_history_id: Option<String>,
+    pub location: PendingRawLocation,
+}
+
+pub(crate) struct ImapBatchRecord {
+    pub source_account: String,
+    pub mailbox: String,
+    pub uid_validity: u32,
+    pub uid: u32,
+    pub flags_json: String,
+    pub internal_date: Option<String>,
+    pub internal_date_ms: Option<i64>,
+    pub rfc822_size: Option<u32>,
+    pub doc_id: i64,
+    pub location: PendingRawLocation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1489,6 +1515,7 @@ pub struct ArchiveWriter {
     batch_id: u64,
     pending_records: u64,
     pending_frame_bytes: u64,
+    pending_next_ordinal: u64,
     file_dirty: bool,
     namespace_sync_pending: bool,
     current_segment_created: bool,
@@ -1551,6 +1578,7 @@ impl ArchiveWriter {
             batch_id: 0,
             pending_records: 0,
             pending_frame_bytes: 0,
+            pending_next_ordinal: 0,
             file_dirty: false,
             namespace_sync_pending: false,
             current_segment_created: segment_created,
@@ -1613,6 +1641,8 @@ impl ArchiveWriter {
         self.offset += frame_bytes;
         self.pending_records += 1;
         self.pending_frame_bytes += frame_bytes;
+        let ordinal = self.pending_next_ordinal;
+        self.pending_next_ordinal += 1;
         if self.current_segment_created {
             self.namespace_sync_pending = true;
         }
@@ -1623,6 +1653,8 @@ impl ArchiveWriter {
                 frame_bytes,
             },
             batch_id: self.batch_id,
+            ordinal,
+            doc_id: id,
         })
     }
 
@@ -1643,6 +1675,7 @@ impl ArchiveWriter {
         self.batch_id += 1;
         self.pending_records = 0;
         self.pending_frame_bytes = 0;
+        self.pending_next_ordinal = 0;
         Ok(receipt)
     }
 
@@ -2345,8 +2378,9 @@ pub fn insert_gmail_metadata(
     message_history_id: Option<&str>,
     location: &ArchiveLocation,
 ) -> rusqlite::Result<()> {
-    insert_gmail_metadata_with_hook(
-        connection,
+    let transaction = connection.unchecked_transaction()?;
+    insert_gmail_metadata_in_transaction(
+        &transaction,
         source_account,
         gmail_id,
         doc_id,
@@ -2355,11 +2389,12 @@ pub fn insert_gmail_metadata(
         internal_date_ms,
         message_history_id,
         location,
-        || Ok(()),
-    )
+    )?;
+    transaction.commit()
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn insert_gmail_metadata_with_hook<F>(
     connection: &Connection,
     source_account: &str,
@@ -2376,17 +2411,43 @@ where
     F: FnOnce() -> rusqlite::Result<()>,
 {
     let transaction = connection.unchecked_transaction()?;
+    insert_gmail_metadata_in_transaction(
+        &transaction,
+        source_account,
+        gmail_id,
+        doc_id,
+        thread_id,
+        label_ids_json,
+        internal_date_ms,
+        message_history_id,
+        location,
+    )?;
+    after_messages()?;
+    transaction.commit()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_gmail_metadata_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    source_account: &str,
+    gmail_id: &str,
+    doc_id: i64,
+    thread_id: &str,
+    label_ids_json: &str,
+    internal_date_ms: Option<i64>,
+    message_history_id: Option<&str>,
+    location: &ArchiveLocation,
+) -> rusqlite::Result<()> {
     transaction.execute(
         "INSERT INTO messages(doc_id,message_id,timestamp,sender,recipients,subject,account,folder,thread,segment,archive_offset,frame_bytes) VALUES (?1,?2,0,'','','',?3,'','',?4,?5,?6)",
         params![doc_id, format!("gmail:{source_account}:{gmail_id}"), source_account, location.segment, location.offset as i64, location.frame_bytes as i64],
     )?;
-    after_messages()?;
     let now = chrono_like_now();
     transaction.execute(
         "INSERT INTO gmail_messages(source_account,gmail_message_id,doc_id,thread_id,label_ids,internal_date_ms,message_history_id,source_state,first_seen_unix,last_seen_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,'present',?8,?8)",
         params![source_account, gmail_id, doc_id, thread_id, label_ids_json, internal_date_ms, message_history_id, now],
     )?;
-    transaction.commit()
+    Ok(())
 }
 
 pub fn imap_message_exists(
@@ -2502,8 +2563,9 @@ pub fn insert_imap_metadata(
     doc_id: i64,
     location: &ArchiveLocation,
 ) -> rusqlite::Result<()> {
-    insert_imap_metadata_with_hook(
-        connection,
+    let transaction = connection.unchecked_transaction()?;
+    insert_imap_metadata_in_transaction(
+        &transaction,
         source_account,
         mailbox,
         uid_validity,
@@ -2514,11 +2576,12 @@ pub fn insert_imap_metadata(
         rfc822_size,
         doc_id,
         location,
-        || Ok(()),
-    )
+    )?;
+    transaction.commit()
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn insert_imap_metadata_with_hook<F>(
     connection: &Connection,
     source_account: &str,
@@ -2536,8 +2599,39 @@ fn insert_imap_metadata_with_hook<F>(
 where
     F: FnOnce() -> rusqlite::Result<()>,
 {
-    let message_id = format!("imap:{source_account}:{mailbox}:{uid_validity}:{uid}");
     let transaction = connection.unchecked_transaction()?;
+    insert_imap_metadata_in_transaction(
+        &transaction,
+        source_account,
+        mailbox,
+        uid_validity,
+        uid,
+        flags_json,
+        internal_date,
+        internal_date_ms,
+        rfc822_size,
+        doc_id,
+        location,
+    )?;
+    after_messages()?;
+    transaction.commit()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_imap_metadata_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    source_account: &str,
+    mailbox: &str,
+    uid_validity: u32,
+    uid: u32,
+    flags_json: &str,
+    internal_date: Option<&str>,
+    internal_date_ms: Option<i64>,
+    rfc822_size: Option<u32>,
+    doc_id: i64,
+    location: &ArchiveLocation,
+) -> rusqlite::Result<()> {
+    let message_id = format!("imap:{source_account}:{mailbox}:{uid_validity}:{uid}");
     transaction.execute(
         "INSERT INTO messages(doc_id,message_id,timestamp,sender,recipients,subject,account,folder,thread,segment,archive_offset,frame_bytes) VALUES (?1,?2,?3,'','','',?4,?5,'',?6,?7,?8)",
         params![
@@ -2551,7 +2645,6 @@ where
             location.frame_bytes as i64
         ],
     )?;
-    after_messages()?;
     transaction.execute(
         "INSERT INTO imap_messages(source_account,mailbox,uid_validity,uid,doc_id,flags,internal_date,internal_date_ms,rfc822_size,source_state,first_seen_unix,last_seen_unix) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'present',?10,?10)",
         params![
@@ -2567,6 +2660,104 @@ where
             chrono_like_now()
         ],
     )?;
+    Ok(())
+}
+
+fn batch_mismatch(message: &'static str) -> rusqlite::Error {
+    rusqlite::Error::InvalidParameterName(message.into())
+}
+
+fn validate_pending_batch<'a, I>(durable: &DurableRawBatch, entries: I) -> rusqlite::Result<u64>
+where
+    I: IntoIterator<Item = (&'a PendingRawLocation, i64)>,
+{
+    let mut ordinals = HashSet::new();
+    let mut frame_bytes = 0u64;
+    let mut count = 0u64;
+    for (location, doc_id) in entries {
+        if location.batch_id != durable.batch_id
+            || i64::try_from(location.doc_id).ok() != Some(doc_id)
+            || location.ordinal >= durable.records
+            || !ordinals.insert(location.ordinal)
+        {
+            return Err(batch_mismatch(
+                "staged RAW locations do not cover the durable batch exactly",
+            ));
+        }
+        frame_bytes = frame_bytes
+            .checked_add(location.location.frame_bytes)
+            .ok_or_else(|| batch_mismatch("batch frame byte count overflow"))?;
+        count += 1;
+    }
+    if count != durable.records || ordinals.len() as u64 != durable.records {
+        return Err(batch_mismatch(
+            "staged RAW locations do not cover the durable batch exactly",
+        ));
+    }
+    if (0..durable.records).any(|ordinal| !ordinals.contains(&ordinal)) {
+        return Err(batch_mismatch(
+            "staged RAW locations do not cover the durable batch exactly",
+        ));
+    }
+    if frame_bytes != durable.frame_bytes {
+        return Err(batch_mismatch(
+            "durable RAW batch has a different frame byte count",
+        ));
+    }
+    Ok(frame_bytes)
+}
+
+pub(crate) fn publish_gmail_batch(
+    connection: &Connection,
+    batch: &[GmailBatchRecord],
+    durable: &DurableRawBatch,
+) -> rusqlite::Result<()> {
+    validate_pending_batch(
+        durable,
+        batch.iter().map(|record| (&record.location, record.doc_id)),
+    )?;
+    let transaction = connection.unchecked_transaction()?;
+    for record in batch {
+        insert_gmail_metadata_in_transaction(
+            &transaction,
+            &record.source_account,
+            &record.gmail_id,
+            record.doc_id,
+            &record.thread_id,
+            &record.label_ids_json,
+            record.internal_date_ms,
+            record.message_history_id.as_deref(),
+            &record.location,
+        )?;
+    }
+    transaction.commit()
+}
+
+pub(crate) fn publish_imap_batch(
+    connection: &Connection,
+    batch: &[ImapBatchRecord],
+    durable: &DurableRawBatch,
+) -> rusqlite::Result<()> {
+    validate_pending_batch(
+        durable,
+        batch.iter().map(|record| (&record.location, record.doc_id)),
+    )?;
+    let transaction = connection.unchecked_transaction()?;
+    for record in batch {
+        insert_imap_metadata_in_transaction(
+            &transaction,
+            &record.source_account,
+            &record.mailbox,
+            record.uid_validity,
+            record.uid,
+            &record.flags_json,
+            record.internal_date.as_deref(),
+            record.internal_date_ms,
+            record.rfc822_size,
+            record.doc_id,
+            &record.location,
+        )?;
+    }
     transaction.commit()
 }
 
@@ -4047,6 +4238,207 @@ mod tests {
                 .unwrap(),
             1
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn raw_batch_publication_requires_exact_receipt_and_retries_after_sqlite_failure() {
+        let root = raw_read_test_root("raw-batch");
+        let _ = fs::remove_dir_all(&root);
+        let connection = create_metadata(&root.join("metadata.sqlite")).unwrap();
+        let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        let first = writer.append_raw(0, b"first").unwrap();
+        let second = writer.append_raw(1, b"second").unwrap();
+        let durable = writer.durable_barrier().unwrap();
+        let gmail_record =
+            |id: i64, gmail_id: &str, location: PendingRawLocation| GmailBatchRecord {
+                source_account: "account".into(),
+                gmail_id: gmail_id.into(),
+                doc_id: id,
+                thread_id: format!("thread-{id}"),
+                label_ids_json: "[]".into(),
+                internal_date_ms: None,
+                message_history_id: None,
+                location,
+            };
+        let mut records = vec![gmail_record(0, "g0", first), gmail_record(1, "g1", second)];
+        records[1].location.ordinal = 0;
+        assert!(publish_gmail_batch(&connection, &records, &durable).is_err());
+        records[1].location.ordinal = 2;
+        assert!(publish_gmail_batch(&connection, &records, &durable).is_err());
+        records[1].location.ordinal = 1;
+        records[1].doc_id = 9;
+        assert!(publish_gmail_batch(&connection, &records, &durable).is_err());
+        records[1].doc_id = 1;
+        let mut wrong_receipt = durable.clone();
+        wrong_receipt.records -= 1;
+        assert!(publish_gmail_batch(&connection, &records, &wrong_receipt).is_err());
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM messages", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        let duplicate_first = writer.append_raw(2, b"retry").unwrap();
+        let duplicate_second = writer.append_raw(3, b"retry-again").unwrap();
+        let retry_receipt = writer.durable_barrier().unwrap();
+        let duplicate_batch = vec![
+            gmail_record(2, "same", duplicate_first),
+            gmail_record(3, "same", duplicate_second),
+        ];
+        assert!(publish_gmail_batch(&connection, &duplicate_batch, &retry_receipt).is_err());
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM messages", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert!(read_record(&root.join("archive"), &duplicate_batch[0].location).is_ok());
+        assert!(read_record(&root.join("archive"), &duplicate_batch[1].location).is_ok());
+
+        let repaired_location = writer.append_raw(4, b"repaired").unwrap();
+        let repaired_receipt = writer.durable_barrier().unwrap();
+        let repaired_batch = vec![gmail_record(4, "same", repaired_location)];
+        publish_gmail_batch(&connection, &repaired_batch, &repaired_receipt).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM messages", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM gmail_messages", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(writer);
+        drop(connection);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn raw_batch_barrier_failure_publishes_no_identity() {
+        let root = raw_read_test_root("raw-batch-barrier-failure");
+        let _ = fs::remove_dir_all(&root);
+        let connection = create_metadata(&root.join("metadata.sqlite")).unwrap();
+        let mut writer = ArchiveWriter::open_with_faults(
+            &root.join("archive"),
+            4096,
+            ArchiveWriterFaultInjection {
+                fail_sync_remaining: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let location = writer.append_raw(0, b"pending").unwrap();
+        let record = GmailBatchRecord {
+            source_account: "account".into(),
+            gmail_id: "g0".into(),
+            doc_id: 0,
+            thread_id: "thread".into(),
+            label_ids_json: "[]".into(),
+            internal_date_ms: None,
+            message_history_id: None,
+            location,
+        };
+        assert!(writer.durable_barrier().is_err());
+        assert!(read_record(&root.join("archive"), &record.location).is_ok());
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM gmail_messages", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        drop(writer);
+        drop(connection);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn imap_raw_batch_publishes_multiple_records_in_one_catalogue_unit() {
+        let root = raw_read_test_root("imap-raw-batch");
+        let _ = fs::remove_dir_all(&root);
+        let connection = create_metadata(&root.join("metadata.sqlite")).unwrap();
+        let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        let first = writer.append_raw(0, b"imap-first").unwrap();
+        let second = writer.append_raw(1, b"imap-second").unwrap();
+        let durable = writer.durable_barrier().unwrap();
+        let record = |uid: u32, doc_id: i64, location: PendingRawLocation| ImapBatchRecord {
+            source_account: "account".into(),
+            mailbox: "INBOX".into(),
+            uid_validity: 7,
+            uid,
+            flags_json: "[]".into(),
+            internal_date: None,
+            internal_date_ms: None,
+            rfc822_size: None,
+            doc_id,
+            location,
+        };
+        let records = vec![record(10, 0, first), record(11, 1, second)];
+        publish_imap_batch(&connection, &records, &durable).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM messages", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM imap_messages", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        drop(writer);
+        drop(connection);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn raw_batch_rejects_batch_id_record_and_byte_mismatches() {
+        let root = raw_read_test_root("raw-batch-mismatch");
+        let _ = fs::remove_dir_all(&root);
+        let connection = create_metadata(&root.join("metadata.sqlite")).unwrap();
+        let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        let location = writer.append_raw(0, b"mismatch").unwrap();
+        let durable = writer.durable_barrier().unwrap();
+        let record = GmailBatchRecord {
+            source_account: "account".into(),
+            gmail_id: "g0".into(),
+            doc_id: 0,
+            thread_id: "thread".into(),
+            label_ids_json: "[]".into(),
+            internal_date_ms: None,
+            message_history_id: None,
+            location,
+        };
+        let records = vec![record];
+        let mut wrong_batch = durable.clone();
+        wrong_batch.batch_id += 1;
+        assert!(publish_gmail_batch(&connection, &records, &wrong_batch).is_err());
+        let mut wrong_bytes = durable.clone();
+        wrong_bytes.frame_bytes += 1;
+        assert!(publish_gmail_batch(&connection, &records, &wrong_bytes).is_err());
+        let wrong_count = Vec::new();
+        assert!(publish_gmail_batch(&connection, &wrong_count, &durable).is_err());
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM messages", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        drop(writer);
+        drop(connection);
         let _ = fs::remove_dir_all(root);
     }
 

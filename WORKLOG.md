@@ -797,3 +797,18 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
   rotation, le namespace, les barrières vides et la réouverture.
 - Gmail/IMAP, SQLite, le format et l’ordre de publication restent inchangés ;
   A3.2b est nécessaire pour leur coordination.
+
+## 2026-08-26 — Implémentation A3.2b : group commit RAW → catalogue
+
+- Les chemins d’import Gmail et IMAP initialisent `next_doc_id` une seule fois,
+  dédupliquent les identités pending et regroupent les métadonnées après
+  `append_raw`.
+- `durable_barrier()` précède chaque transaction SQLite de lot ; le publisher
+  vérifie le `batch_id`, le nombre de records et la somme des `frame_bytes`
+  avant d’insérer `messages` et la ligne source correspondante.
+- Les erreurs avant/pendant la barrière ou dans la transaction ne publient pas
+  le lot ; les RAW durables restent orphelins. Les curseurs et frontières
+  restent hors périmètre ; A3 global reste ouvert jusqu’à A3.3.
+- La liaison runtime est maintenant exacte : chaque location contient un
+  ordinal et le `doc_id` écrit ; les publishers refusent les doublons, trous,
+  ordinaux hors plage et identités discordantes, sans relire les RAW.

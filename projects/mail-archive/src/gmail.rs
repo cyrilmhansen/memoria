@@ -14,6 +14,9 @@ use url::form_urlencoded;
 
 pub const GMAIL_READONLY_SCOPE: &str = "https://www.googleapis.com/auth/gmail.readonly";
 
+const IMPORT_BATCH_RECORD_LIMIT: usize = 64;
+const IMPORT_BATCH_BYTES_LIMIT: u64 = 8 * 1024 * 1024;
+
 #[derive(Debug)]
 pub enum GmailError {
     Config(String),
@@ -97,6 +100,20 @@ fn progress_snapshot(stats: &SyncStats, total: Option<u64>) -> SyncProgress {
         archive_bytes_added: stats.archive_bytes_added,
         full_sync: stats.full_sync,
     }
+}
+
+fn progress_snapshot_with_batch(
+    stats: &SyncStats,
+    total: Option<u64>,
+    staged: &[crate::GmailBatchRecord],
+) -> SyncProgress {
+    let mut snapshot = progress_snapshot(stats, total);
+    snapshot.new_messages += staged.len() as u64;
+    snapshot.archive_bytes_added += staged
+        .iter()
+        .map(|record| record.location.frame_bytes)
+        .sum::<u64>();
+    snapshot
 }
 
 #[cfg(test)]
@@ -1000,11 +1017,16 @@ fn full_sync<T: GmailTransport>(
     let total = Some(listed_messages.len() as u64);
     stats.total = total;
     let mut seen = HashSet::new();
+    let mut next_doc_id =
+        crate::next_doc_id(connection).map_err(|error| GmailError::Other(error.to_string()))?;
+    let mut staged = Vec::new();
+    let mut pending_ids = HashSet::new();
     for listed in listed_messages {
         stats.examined += 1;
         seen.insert(listed.id.clone());
-        if crate::gmail_message_exists(connection, source, &listed.id)
-            .map_err(|error| GmailError::Other(error.to_string()))?
+        if pending_ids.contains(&listed.id)
+            || crate::gmail_message_exists(connection, source, &listed.id)
+                .map_err(|error| GmailError::Other(error.to_string()))?
         {
             if reconcile || stats.full_sync {
                 let metadata = transport.get_metadata(&listed.id)?;
@@ -1027,12 +1049,33 @@ fn full_sync<T: GmailTransport>(
             continue;
         }
         let raw = transport.get_raw(&listed.id)?;
-        import_raw(connection, &mut writer, source, &raw, stats, progress)?;
-        progress(&progress_snapshot(stats, total));
+        import_raw(
+            &mut writer,
+            source,
+            &raw,
+            stats,
+            &mut next_doc_id,
+            &mut staged,
+            &mut pending_ids,
+        )?;
+        if batch_full(&staged) {
+            flush_batch(
+                connection,
+                &mut writer,
+                &mut staged,
+                &mut pending_ids,
+                stats,
+            )?;
+        }
+        progress(&progress_snapshot_with_batch(stats, total, &staged));
     }
-    writer
-        .sync()
-        .map_err(|error| GmailError::Io(error.to_string()))?;
+    flush_batch_if_needed(
+        connection,
+        &mut writer,
+        &mut staged,
+        &mut pending_ids,
+        stats,
+    )?;
     let complete = max.is_none() && query.is_none();
     if complete {
         stats.deletions += crate::mark_gmail_missing_from_full_sync(connection, source, &seen)
@@ -1058,6 +1101,10 @@ fn incremental_sync<T: GmailTransport>(
     let mut page = None;
     let mut writer = crate::ArchiveWriter::open(&root.join("archive"), 64 * 1024 * 1024)
         .map_err(|error| GmailError::Io(error.to_string()))?;
+    let mut next_doc_id =
+        crate::next_doc_id(connection).map_err(|error| GmailError::Other(error.to_string()))?;
+    let mut staged = Vec::new();
+    let mut pending_ids = HashSet::new();
     let mut latest = Some(start.to_string());
     loop {
         let response = transport.history(start, page.as_deref())?;
@@ -1066,13 +1113,32 @@ fn incremental_sync<T: GmailTransport>(
         for record in response.history {
             for added in record.messages_added {
                 stats.examined += 1;
-                let raw = transport.get_raw(&added.message.id)?;
-                if !crate::gmail_message_exists(connection, source, &raw.id)
-                    .map_err(|error| GmailError::Other(error.to_string()))?
+                if pending_ids.contains(&added.message.id)
+                    || crate::gmail_message_exists(connection, source, &added.message.id)
+                        .map_err(|error| GmailError::Other(error.to_string()))?
                 {
-                    import_raw(connection, &mut writer, source, &raw, stats, progress)?;
-                    progress(&progress_snapshot(stats, None));
+                    continue;
                 }
+                let raw = transport.get_raw(&added.message.id)?;
+                import_raw(
+                    &mut writer,
+                    source,
+                    &raw,
+                    stats,
+                    &mut next_doc_id,
+                    &mut staged,
+                    &mut pending_ids,
+                )?;
+                if batch_full(&staged) {
+                    flush_batch(
+                        connection,
+                        &mut writer,
+                        &mut staged,
+                        &mut pending_ids,
+                        stats,
+                    )?;
+                }
+                progress(&progress_snapshot_with_batch(stats, None, &staged));
             }
             for deleted in record.messages_deleted {
                 stats.examined += 1;
@@ -1082,6 +1148,13 @@ fn incremental_sync<T: GmailTransport>(
             }
             for label in record.labels_added.into_iter().chain(record.labels_removed) {
                 stats.examined += 1;
+                flush_batch_if_needed(
+                    connection,
+                    &mut writer,
+                    &mut staged,
+                    &mut pending_ids,
+                    stats,
+                )?;
                 let raw = transport.get_raw(&label.message.id)?;
                 crate::update_gmail_labels(
                     connection,
@@ -1099,9 +1172,13 @@ fn incremental_sync<T: GmailTransport>(
             break;
         }
     }
-    writer
-        .sync()
-        .map_err(|error| GmailError::Io(error.to_string()))?;
+    flush_batch_if_needed(
+        connection,
+        &mut writer,
+        &mut staged,
+        &mut pending_ids,
+        stats,
+    )?;
     if let Some(history) = latest {
         crate::set_gmail_state(connection, source, &history, complete)
             .map_err(|error| GmailError::Other(error.to_string()))?;
@@ -1110,17 +1187,20 @@ fn incremental_sync<T: GmailTransport>(
 }
 
 fn import_raw(
-    connection: &Connection,
     writer: &mut crate::ArchiveWriter,
     source: &str,
     raw: &RawMessage,
     stats: &mut SyncStats,
-    _progress: &mut dyn FnMut(&SyncProgress),
+    next_doc_id: &mut i64,
+    staged: &mut Vec<crate::GmailBatchRecord>,
+    pending_ids: &mut HashSet<String>,
 ) -> Result<(), GmailError> {
     let bytes = decode_raw(&raw.raw)?;
     analyze_mime(&bytes, stats);
-    let doc_id =
-        crate::next_doc_id(connection).map_err(|error| GmailError::Other(error.to_string()))?;
+    let doc_id = *next_doc_id;
+    *next_doc_id = (*next_doc_id)
+        .checked_add(1)
+        .ok_or_else(|| GmailError::Other("document ID overflow".into()))?;
     let location = writer
         .append_raw(doc_id as u64, &bytes)
         .map_err(|error| GmailError::Io(error.to_string()))?;
@@ -1130,21 +1210,64 @@ fn import_raw(
         .internal_date
         .as_deref()
         .and_then(|value| value.parse::<i64>().ok());
-    crate::insert_gmail_metadata(
-        connection,
-        source,
-        &raw.id,
+    pending_ids.insert(raw.id.clone());
+    staged.push(crate::GmailBatchRecord {
+        source_account: source.into(),
+        gmail_id: raw.id.clone(),
         doc_id,
-        &raw.thread_id,
-        &labels,
-        date,
-        raw.history_id.as_deref(),
-        &location,
-    )
-    .map_err(|error| GmailError::Other(error.to_string()))?;
-    stats.new_messages += 1;
+        thread_id: raw.thread_id.clone(),
+        label_ids_json: labels,
+        internal_date_ms: date,
+        message_history_id: raw.history_id.clone(),
+        location,
+    });
     stats.network_bytes += raw.raw.len() as u64;
-    stats.archive_bytes_added += location.frame_bytes;
+    Ok(())
+}
+
+fn batch_full(batch: &[crate::GmailBatchRecord]) -> bool {
+    batch.len() >= IMPORT_BATCH_RECORD_LIMIT
+        || batch
+            .iter()
+            .map(|record| record.location.frame_bytes)
+            .sum::<u64>()
+            >= IMPORT_BATCH_BYTES_LIMIT
+}
+
+fn flush_batch_if_needed(
+    connection: &Connection,
+    writer: &mut crate::ArchiveWriter,
+    staged: &mut Vec<crate::GmailBatchRecord>,
+    pending_ids: &mut HashSet<String>,
+    stats: &mut SyncStats,
+) -> Result<(), GmailError> {
+    if staged.is_empty() {
+        return Ok(());
+    }
+    flush_batch(connection, writer, staged, pending_ids, stats)
+}
+
+fn flush_batch(
+    connection: &Connection,
+    writer: &mut crate::ArchiveWriter,
+    staged: &mut Vec<crate::GmailBatchRecord>,
+    pending_ids: &mut HashSet<String>,
+    stats: &mut SyncStats,
+) -> Result<(), GmailError> {
+    let durable = writer
+        .durable_barrier()
+        .map_err(|error| GmailError::Io(error.to_string()))?;
+    let records = staged.len() as u64;
+    let frame_bytes = staged
+        .iter()
+        .map(|record| record.location.frame_bytes)
+        .sum::<u64>();
+    crate::publish_gmail_batch(connection, staged, &durable)
+        .map_err(|error| GmailError::Other(error.to_string()))?;
+    stats.new_messages += records;
+    stats.archive_bytes_added += frame_bytes;
+    staged.clear();
+    pending_ids.clear();
     Ok(())
 }
 
@@ -1413,6 +1536,61 @@ mod tests {
                 .unwrap(),
             2
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn duplicate_gmail_id_before_flush_creates_one_raw_and_identity() {
+        let root =
+            std::env::temp_dir().join(format!("gmail-duplicate-fixture-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let message = RawMessage {
+            id: "duplicate".into(),
+            thread_id: "thread-duplicate".into(),
+            label_ids: vec!["INBOX".into()],
+            history_id: Some("10".into()),
+            internal_date: Some("1700000000000".into()),
+            raw: "RnJvbTogZml4dHVyZUBleGFtcGxlLnRlc3QNCg0KSGVsbG8=".into(),
+        };
+        let mut transport = Fixture {
+            pages: vec![ListPage {
+                messages: vec![
+                    ListedMessage {
+                        id: message.id.clone(),
+                        thread_id: message.thread_id.clone(),
+                    },
+                    ListedMessage {
+                        id: message.id.clone(),
+                        thread_id: message.thread_id.clone(),
+                    },
+                ],
+                next_page_token: None,
+            }],
+            messages: [(message.id.clone(), message)].into_iter().collect(),
+            history: vec![HistoryPage::default()],
+            expire_history: false,
+            raw_calls: 0,
+            metadata_calls: 0,
+        };
+        let stats = sync_account(&root, "fixture-account", &mut transport, None, None).unwrap();
+        assert_eq!(stats.new_messages, 1);
+        assert_eq!(transport.raw_calls, 1);
+        let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM messages", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM gmail_messages", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(connection);
         let _ = std::fs::remove_dir_all(&root);
     }
 

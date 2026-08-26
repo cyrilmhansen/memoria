@@ -1,7 +1,9 @@
 use crate::GmailIndexStats;
 use async_imap::types::{Fetch, NameAttribute};
 use futures::TryStreamExt;
+use rusqlite::Connection;
 use rustls::pki_types::{pem::PemObject, CertificateDer, ServerName};
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -70,6 +72,9 @@ pub struct ImapSyncStats {
     pub index: Option<GmailIndexStats>,
 }
 
+const IMPORT_BATCH_RECORD_LIMIT: usize = 64;
+const IMPORT_BATCH_BYTES_LIMIT: u64 = 8 * 1024 * 1024;
+
 #[derive(Debug)]
 pub enum ImapError {
     Config(String),
@@ -134,6 +139,10 @@ pub fn sync_imap(root: &Path, config: &ImapConfig) -> Result<ImapSyncStats, Imap
         frontier_before,
         ..Default::default()
     };
+    let mut next_doc_id =
+        crate::next_doc_id(&metadata).map_err(|error| ImapError::Io(error.to_string()))?;
+    let mut staged = Vec::new();
+    let mut pending_ids = HashSet::new();
     let runtime = Builder::new_multi_thread()
         .enable_io()
         .enable_time()
@@ -163,27 +172,44 @@ pub fn sync_imap(root: &Path, config: &ImapConfig) -> Result<ImapSyncStats, Imap
             {
                 return Ok(());
             }
-            let doc_id = crate::next_doc_id(&metadata)
-                .map_err(|error| ImapError::Io(error.to_string()))? as u64;
-            let location = writer
-                .append_raw(doc_id, &message.raw)
-                .map_err(|error| ImapError::Io(error.to_string()))?;
-            crate::insert_imap_metadata(
-                &metadata,
-                &config.source_account,
-                &config.mailbox,
+            let identity = (
+                config.source_account.clone(),
+                config.mailbox.clone(),
                 message.uid_validity,
                 message.uid,
-                &message.flags_json,
-                message.internal_date.as_deref(),
-                message.internal_date_ms,
-                message.rfc822_size,
-                doc_id as i64,
-                &location,
-            )
-            .map_err(|error| ImapError::Io(error.to_string()))?;
-            stats.new_messages += 1;
-            stats.archive_bytes_added += location.frame_bytes;
+            );
+            if pending_ids.contains(&identity) {
+                return Ok(());
+            }
+            let doc_id = next_doc_id;
+            next_doc_id = next_doc_id
+                .checked_add(1)
+                .ok_or_else(|| ImapError::Io("document ID overflow".into()))?;
+            let location = writer
+                .append_raw(doc_id as u64, &message.raw)
+                .map_err(|error| ImapError::Io(error.to_string()))?;
+            pending_ids.insert(identity);
+            staged.push(crate::ImapBatchRecord {
+                source_account: config.source_account.clone(),
+                mailbox: config.mailbox.clone(),
+                uid_validity: message.uid_validity,
+                uid: message.uid,
+                flags_json: message.flags_json.clone(),
+                internal_date: message.internal_date.clone(),
+                internal_date_ms: message.internal_date_ms,
+                rfc822_size: message.rfc822_size,
+                doc_id,
+                location,
+            });
+            if batch_full(&staged) {
+                flush_batch(
+                    &metadata,
+                    &mut writer,
+                    &mut staged,
+                    &mut pending_ids,
+                    &mut stats,
+                )?;
+            }
             Ok(())
         },
     ));
@@ -192,9 +218,13 @@ pub fn sync_imap(root: &Path, config: &ImapConfig) -> Result<ImapSyncStats, Imap
     stats.uid_validity = fetch_result.uid_validity;
     stats.uid_next = fetch_result.uid_next;
     stats.examined = fetch_result.examined;
-    writer
-        .sync()
-        .map_err(|error| ImapError::Io(error.to_string()))?;
+    flush_batch_if_needed(
+        &metadata,
+        &mut writer,
+        &mut staged,
+        &mut pending_ids,
+        &mut stats,
+    )?;
     if let Some(scanned_through_uid) = fetch_result.scanned_through_uid {
         crate::upsert_imap_scan_state(
             &metadata,
@@ -217,6 +247,52 @@ pub fn sync_imap(root: &Path, config: &ImapConfig) -> Result<ImapSyncStats, Imap
             .map_err(|error| ImapError::Io(format!("update search index: {error}")))?,
     );
     Ok(stats)
+}
+
+fn batch_full(batch: &[crate::ImapBatchRecord]) -> bool {
+    batch.len() >= IMPORT_BATCH_RECORD_LIMIT
+        || batch
+            .iter()
+            .map(|record| record.location.frame_bytes)
+            .sum::<u64>()
+            >= IMPORT_BATCH_BYTES_LIMIT
+}
+
+fn flush_batch_if_needed(
+    connection: &Connection,
+    writer: &mut crate::ArchiveWriter,
+    staged: &mut Vec<crate::ImapBatchRecord>,
+    pending_ids: &mut HashSet<(String, String, u32, u32)>,
+    stats: &mut ImapSyncStats,
+) -> Result<(), ImapError> {
+    if staged.is_empty() {
+        return Ok(());
+    }
+    flush_batch(connection, writer, staged, pending_ids, stats)
+}
+
+fn flush_batch(
+    connection: &Connection,
+    writer: &mut crate::ArchiveWriter,
+    staged: &mut Vec<crate::ImapBatchRecord>,
+    pending_ids: &mut HashSet<(String, String, u32, u32)>,
+    stats: &mut ImapSyncStats,
+) -> Result<(), ImapError> {
+    let durable = writer
+        .durable_barrier()
+        .map_err(|error| ImapError::Io(error.to_string()))?;
+    let records = staged.len() as u64;
+    let frame_bytes = staged
+        .iter()
+        .map(|record| record.location.frame_bytes)
+        .sum::<u64>();
+    crate::publish_imap_batch(connection, staged, &durable)
+        .map_err(|error| ImapError::Io(error.to_string()))?;
+    stats.new_messages += records;
+    stats.archive_bytes_added += frame_bytes;
+    staged.clear();
+    pending_ids.clear();
+    Ok(())
 }
 
 pub fn sync_imap_mailboxes(
