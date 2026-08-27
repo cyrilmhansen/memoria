@@ -4053,9 +4053,18 @@ pub fn mark_gmail_deleted(
     source_account: &str,
     gmail_id: &str,
 ) -> rusqlite::Result<()> {
+    mark_gmail_deleted_at_history(connection, source_account, gmail_id, None)
+}
+
+pub fn mark_gmail_deleted_at_history(
+    connection: &Connection,
+    source_account: &str,
+    gmail_id: &str,
+    history_id: Option<&str>,
+) -> rusqlite::Result<()> {
     connection.execute(
-        "UPDATE gmail_messages SET source_state='deleted',last_seen_unix=?3 WHERE source_account=?1 AND gmail_message_id=?2",
-        params![source_account, gmail_id, chrono_like_now()],
+        "UPDATE gmail_messages SET source_state='deleted',message_history_id=COALESCE(?3,message_history_id),last_seen_unix=?4 WHERE source_account=?1 AND gmail_message_id=?2",
+        params![source_account, gmail_id, history_id, chrono_like_now()],
     )?;
     Ok(())
 }

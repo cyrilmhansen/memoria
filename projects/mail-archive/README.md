@@ -48,7 +48,13 @@ cargo run -p mail-archive-experiment --bin mail-archive-experiment -- gmail-sync
 est recommandée pour `--account`. La synchronisation incrémentale utilise le
 `historyId`; si Gmail ne conserve plus cet historique, le connecteur repart en
 full sync sans effacer l’archive. Une full sync complète marque les messages
-absents comme supprimés côté source, mais ne supprime jamais leurs frames.
+absents comme supprimés côté source, mais ne supprime jamais leurs frames. Sa
+frontière est capturée au début de l’énumération, depuis le `historyId` observé
+sur le premier message de la première page ; elle n’est publiée que si cette
+preuve existe. Les
+records d’historique sont ordonnés par `historyId`, sans priorité inventée
+entre les champs d’un même record. Une requête ou une limite restaure les
+messages effectivement observés, sans déduire d’absence hors périmètre.
 
 Configuration minimale : créer un projet Google Cloud, activer Gmail API,
 configurer l’écran de consentement, créer un client OAuth **Desktop app**, puis

@@ -831,3 +831,28 @@ résultats d'expérience locale :
 - **État :** le sealing A3.2 est fermé pour ces deux propriétés. Cette
   conclusion ne couvre toujours pas les suppressions Gmail, le full-sync,
   les orphelins, le namespace/multiwriter ni A4.
+
+## 2026-08-27 — A3.3 : cohérence Gmail et frontier
+
+- **Fait vérifié :** seule la full sync non bornée et sans `query` réconcilie
+  les absences, dans le même compte/source et le périmètre complet énuméré.
+  `max_messages` et `query` ne marquent jamais absents les IDs hors fenêtre.
+- **Fait vérifié :** suppression ou absence connue exige la validation A1 du
+  RAW autoritatif ; une corruption, substitution ou absence bloque et laisse
+  le frontier inchangé. Le RAW reste conservé. Une suppression inconnue est
+  un no-op.
+- **Décision :** history est collecté puis réduit par Gmail ID. Les records
+  distincts restent ordonnés par `historyId`; aucun ordre n’est inventé entre
+  `messagesAdded`, `messagesDeleted`, `labelsAdded` et `labelsRemoved` d’un
+  même record. Un conflit intra-record est résolu par lecture Gmail
+  autoritative (présent ou HTTP 404 supprimé) ; toute autre ambiguïté bloque la
+  publication du frontier.
+- **Fait vérifié :** le frontier d’une full sync complète est capturé au début
+  de l’énumération sur le premier message de la première page `list`, et n’est publié qu’après les
+  transitions et barrières RAW. Une première page sans message/historyId ne
+  fabrique aucun frontier. Le `profile.historyId` terminal n’est pas utilisé.
+  Une erreur avant publication ne fait pas avancer le curseur ; un retry peut
+  rejouer la fenêtre avec des RAW surnuméraires.
+- **Décision :** une full sync `query` ou `max` restaure une identité locale
+  `deleted` effectivement observée et rafraîchit ses métadonnées, sans déduire
+  d’absence hors périmètre.

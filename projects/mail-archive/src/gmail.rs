@@ -4,7 +4,7 @@ use mailparse::{body::Body, parse_mail, DispositionType, MailHeaderMap};
 use reqwest::blocking::Client;
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -456,6 +456,23 @@ pub struct HistoryRecord {
     pub labels_added: Vec<HistoryLabels>,
     #[serde(default)]
     pub labels_removed: Vec<HistoryLabels>,
+}
+
+#[derive(Clone, Debug)]
+enum HistoryEvent {
+    Added {
+        message: ListedMessage,
+        record_id: String,
+    },
+    Deleted {
+        message: ListedMessage,
+        history_id: String,
+        record_id: String,
+    },
+    Labels {
+        message: ListedMessage,
+        record_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1004,25 +1021,16 @@ fn full_sync<T: GmailTransport>(
     let mut listed_messages = Vec::new();
     let reconcile = max.is_none() && query.is_none();
     let complete = reconcile;
-    let mut fence = None;
+    let mut full_frontier = None;
     loop {
         let response = transport.list(page.as_deref(), query)?;
-        if fence.is_none() {
-            fence = if let Some(first) = response.messages.first() {
-                let metadata = transport.get_metadata(&first.id)?;
-                Some(
-                    metadata
-                        .history_id
-                        .filter(|value| !value.is_empty())
-                        .ok_or_else(|| {
-                            GmailError::Other(
-                                "first listed Gmail message has no valid historyId".into(),
-                            )
-                        })?,
-                )
-            } else {
-                None
-            };
+        if page.is_none() {
+            if let Some(first) = response.messages.first() {
+                full_frontier = transport
+                    .get_metadata(&first.id)?
+                    .history_id
+                    .filter(|value| !value.trim().is_empty());
+            }
         }
         let next_page = response.next_page_token.clone();
         for listed in response.messages {
@@ -1059,22 +1067,20 @@ fn full_sync<T: GmailTransport>(
             continue;
         }
         if gmail_identity_is_valid(root, connection, source, &listed.id)? {
+            let source_state = gmail_source_state(connection, source, &listed.id)
+                .map_err(|error| GmailError::Other(error.to_string()))?;
+            if source_state.as_deref() == Some("deleted") {
+                // The bounded/query enumeration is authoritative only for messages
+                // it actually returned. Reuse the incremental revalidation path,
+                // without appending a second RAW frame.
+                let metadata = transport.get_metadata(&listed.id)?;
+                repair_gmail_metadata(connection, source, &metadata)?;
+                progress(&progress_snapshot(stats, total));
+                continue;
+            }
             if reconcile {
                 let metadata = transport.get_metadata(&listed.id)?;
-                crate::repair_gmail_metadata(
-                    connection,
-                    source,
-                    &metadata.id,
-                    &metadata.thread_id,
-                    &serde_json::to_string(&metadata.label_ids)
-                        .map_err(|error| GmailError::Json(error.to_string()))?,
-                    metadata
-                        .internal_date
-                        .as_deref()
-                        .and_then(|value| value.parse().ok()),
-                    metadata.history_id.as_deref(),
-                )
-                .map_err(|error| GmailError::Other(error.to_string()))?;
+                repair_gmail_metadata(connection, source, &metadata)?;
                 progress(&progress_snapshot(stats, total));
             }
             continue;
@@ -1109,11 +1115,23 @@ fn full_sync<T: GmailTransport>(
         stats,
     )?;
     if complete {
+        let missing = connection
+            .prepare("SELECT gmail_message_id FROM gmail_messages WHERE source_account=?1 AND source_state='present'")
+            .map_err(|error| GmailError::Other(error.to_string()))?
+            .query_map([source], |row| row.get::<_, String>(0))
+            .map_err(|error| GmailError::Other(error.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| GmailError::Other(error.to_string()))?;
+        for gmail_id in missing {
+            if !seen.contains(&gmail_id) {
+                gmail_identity_is_valid(root, connection, source, &gmail_id)?;
+            }
+        }
         stats.deletions += crate::mark_gmail_missing_from_full_sync(connection, source, &seen)
             .map_err(|error| GmailError::Other(error.to_string()))?;
     }
     if complete {
-        if let Some(history) = fence {
+        if let Some(history) = full_frontier {
             crate::set_gmail_state(connection, source, &history, true)
                 .map_err(|error| GmailError::Other(error.to_string()))?;
         }
@@ -1144,6 +1162,7 @@ fn incremental_sync<T: GmailTransport>(
     let mut staged = Vec::new();
     let mut pending_ids = HashSet::new();
     let mut terminal_history = None;
+    let mut events = Vec::new();
     loop {
         let response = transport.history(start, page.as_deref())?;
         let response_history_id = response.history_id.clone();
@@ -1151,68 +1170,33 @@ fn incremental_sync<T: GmailTransport>(
         for record in response.history {
             for added in record.messages_added {
                 stats.examined += 1;
-                if pending_ids.contains(&added.message.id) {
-                    continue;
-                }
-                if gmail_identity_is_valid(root, connection, source, &added.message.id)? {
-                    continue;
-                }
-                ensure_gmail_message_id_available(connection, source, &added.message.id)?;
-                let raw = transport.get_raw(&added.message.id)?;
-                import_raw(
-                    &mut writer,
-                    source,
-                    &raw,
-                    stats,
-                    &mut next_doc_id,
-                    &mut staged,
-                    &mut pending_ids,
-                )?;
-                if batch_full(&staged) {
-                    flush_batch(
-                        connection,
-                        &mut writer,
-                        &mut staged,
-                        &mut pending_ids,
-                        stats,
-                    )?;
-                }
-                progress(&progress_snapshot_with_batch(stats, None, &staged));
-            }
-            for deleted in record.messages_deleted {
-                stats.examined += 1;
-                crate::mark_gmail_deleted(connection, source, &deleted.message.id)
-                    .map_err(|error| GmailError::Other(error.to_string()))?;
-                stats.deletions += 1;
+                events.push(HistoryEvent::Added {
+                    message: added.message,
+                    record_id: record.id.clone(),
+                });
             }
             for label in record.labels_added.into_iter().chain(record.labels_removed) {
                 stats.examined += 1;
-                flush_batch_if_needed(
-                    connection,
-                    &mut writer,
-                    &mut staged,
-                    &mut pending_ids,
-                    stats,
-                )?;
-                if !gmail_identity_is_valid(root, connection, source, &label.message.id)? {
-                    return Err(GmailError::Other(format!(
-                        "label event references unknown Gmail identity {}",
-                        label.message.id
-                    )));
-                }
-                let raw = transport.get_raw(&label.message.id)?;
-                crate::update_gmail_labels(
-                    connection,
-                    source,
-                    &raw.id,
-                    &serde_json::to_string(&raw.label_ids).unwrap_or_else(|_| "[]".into()),
-                )
-                .map_err(|error| GmailError::Other(error.to_string()))?;
                 stats.label_changes += 1;
-                progress(&progress_snapshot(stats, None));
+                events.push(HistoryEvent::Labels {
+                    message: label.message,
+                    record_id: record.id.clone(),
+                });
+            }
+            // Gmail groups fields in a history record rather than exposing a
+            // total order. Preserve that ambiguity; records/pages themselves
+            // remain ordered.
+            for deleted in record.messages_deleted {
+                stats.examined += 1;
+                stats.deletions += 1;
+                events.push(HistoryEvent::Deleted {
+                    message: deleted.message,
+                    history_id: record.id.clone(),
+                    record_id: record.id.clone(),
+                });
             }
         }
-        if page.is_none() {
+        if next_page.is_none() {
             terminal_history = response_history_id;
         }
         page = next_page;
@@ -1220,12 +1204,18 @@ fn incremental_sync<T: GmailTransport>(
             break;
         }
     }
-    flush_batch_if_needed(
+    apply_history_events(
+        root,
         connection,
+        source,
+        transport,
         &mut writer,
+        &mut next_doc_id,
         &mut staged,
         &mut pending_ids,
         stats,
+        &mut *progress,
+        events,
     )?;
     let history = terminal_history
         .filter(|value| !value.is_empty())
@@ -1237,8 +1227,197 @@ fn incremental_sync<T: GmailTransport>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn apply_history_events<T: GmailTransport>(
+    root: &Path,
+    connection: &mut crate::CatalogueConnection,
+    source: &str,
+    transport: &mut T,
+    writer: &mut crate::ArchiveWriter,
+    next_doc_id: &mut i64,
+    staged: &mut Vec<crate::GmailBatchRecord>,
+    pending_ids: &mut HashSet<String>,
+    stats: &mut SyncStats,
+    progress: &mut dyn FnMut(&SyncProgress),
+    events: Vec<HistoryEvent>,
+) -> Result<(), GmailError> {
+    let mut by_id = BTreeMap::<String, Vec<HistoryEvent>>::new();
+    for event in events {
+        let id = match &event {
+            HistoryEvent::Added { message, .. }
+            | HistoryEvent::Deleted { message, .. }
+            | HistoryEvent::Labels { message, .. } => message.id.clone(),
+        };
+        by_id.entry(id).or_default().push(event);
+    }
+    for (gmail_id, id_events) in by_id {
+        let known = crate::gmail_message_exists(connection, source, &gmail_id)
+            .map_err(|error| GmailError::Other(error.to_string()))?;
+        if known {
+            gmail_identity_is_valid(root, connection, source, &gmail_id)?;
+        }
+        let mut final_present = false;
+        let mut final_delete_history = None;
+        let mut had_present_event = false;
+        let mut needs_raw_before_delete = false;
+        let mut last_present_raw = None;
+        let mut index = 0;
+        while index < id_events.len() {
+            let record_id = match &id_events[index] {
+                HistoryEvent::Added { record_id, .. }
+                | HistoryEvent::Deleted { record_id, .. }
+                | HistoryEvent::Labels { record_id, .. } => record_id,
+            };
+            let start = index;
+            while index < id_events.len()
+                && match &id_events[index] {
+                    HistoryEvent::Added { record_id: id, .. }
+                    | HistoryEvent::Deleted { record_id: id, .. }
+                    | HistoryEvent::Labels { record_id: id, .. } => id == record_id,
+                }
+            {
+                index += 1;
+            }
+            let same_record = &id_events[start..index];
+            let positive = same_record.iter().any(|event| {
+                matches!(
+                    event,
+                    HistoryEvent::Added { .. } | HistoryEvent::Labels { .. }
+                )
+            });
+            let negative = same_record
+                .iter()
+                .any(|event| matches!(event, HistoryEvent::Deleted { .. }));
+            if positive && negative {
+                had_present_event = true;
+                match transport.get_raw(&gmail_id) {
+                    Ok(raw) => {
+                        final_present = true;
+                        needs_raw_before_delete = true;
+                        last_present_raw = Some(raw);
+                    }
+                    Err(GmailError::Http(404)) => {
+                        final_present = false;
+                        needs_raw_before_delete = false;
+                        last_present_raw = None;
+                    }
+                    Err(error) => return Err(error),
+                }
+                final_delete_history = if final_present {
+                    None
+                } else {
+                    same_record.iter().find_map(|event| {
+                        if let HistoryEvent::Deleted { history_id, .. } = event {
+                            Some(history_id.clone())
+                        } else {
+                            None
+                        }
+                    })
+                };
+            } else if positive {
+                had_present_event = true;
+                final_present = true;
+                needs_raw_before_delete = true;
+                last_present_raw = None;
+                final_delete_history = None;
+            } else if negative {
+                final_present = false;
+                // Keep the preceding state: a later delete must not erase
+                // the fact that an earlier add may require a RAW import.
+                final_delete_history = same_record.iter().find_map(|event| {
+                    if let HistoryEvent::Deleted { history_id, .. } = event {
+                        Some(history_id.clone())
+                    } else {
+                        None
+                    }
+                });
+            }
+        }
+        if final_present || (had_present_event && needs_raw_before_delete && !known) {
+            let raw = match last_present_raw {
+                Some(raw) => raw,
+                None => transport.get_raw(&gmail_id)?,
+            };
+            if known {
+                crate::repair_gmail_metadata(
+                    connection,
+                    source,
+                    &raw.id,
+                    &raw.thread_id,
+                    &serde_json::to_string(&raw.label_ids)
+                        .map_err(|error| GmailError::Json(error.to_string()))?,
+                    raw.internal_date
+                        .as_deref()
+                        .and_then(|value| value.parse().ok()),
+                    raw.history_id.as_deref(),
+                )
+                .map_err(|error| GmailError::Other(error.to_string()))?;
+            } else {
+                ensure_gmail_message_id_available(connection, source, &gmail_id)?;
+                import_raw(
+                    writer,
+                    source,
+                    &raw,
+                    stats,
+                    next_doc_id,
+                    staged,
+                    pending_ids,
+                )?;
+            }
+        } else if !known {
+            continue;
+        }
+        if !final_present {
+            flush_batch_if_needed(connection, writer, staged, pending_ids, stats)?;
+            gmail_identity_is_valid(root, connection, source, &gmail_id)?;
+            let history_id = final_delete_history.as_deref();
+            crate::mark_gmail_deleted_at_history(connection, source, &gmail_id, history_id)
+                .map_err(|error| GmailError::Other(error.to_string()))?;
+        }
+        progress(&progress_snapshot_with_batch(stats, None, staged));
+    }
+    flush_batch_if_needed(connection, writer, staged, pending_ids, stats)?;
+    Ok(())
+}
+
 fn canonical_gmail_message_id(source: &str, gmail_id: &str) -> String {
     format!("gmail:{source}:{gmail_id}")
+}
+
+fn repair_gmail_metadata(
+    connection: &crate::CatalogueConnection,
+    source: &str,
+    metadata: &MetadataMessage,
+) -> Result<(), GmailError> {
+    crate::repair_gmail_metadata(
+        connection,
+        source,
+        &metadata.id,
+        &metadata.thread_id,
+        &serde_json::to_string(&metadata.label_ids)
+            .map_err(|error| GmailError::Json(error.to_string()))?,
+        metadata
+            .internal_date
+            .as_deref()
+            .and_then(|value| value.parse().ok()),
+        metadata.history_id.as_deref(),
+    )
+    .map_err(|error| GmailError::Other(error.to_string()))
+}
+
+fn gmail_source_state(
+    connection: &Connection,
+    source: &str,
+    gmail_id: &str,
+) -> Result<Option<String>, GmailError> {
+    connection
+        .query_row(
+            "SELECT source_state FROM gmail_messages WHERE source_account=?1 AND gmail_message_id=?2",
+            rusqlite::params![source, gmail_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| GmailError::Other(error.to_string()))
 }
 
 fn gmail_identity_is_valid(
@@ -1437,6 +1616,7 @@ mod tests {
         expire_history: bool,
         raw_calls: u64,
         metadata_calls: u64,
+        history_fail_page: Option<usize>,
     }
     impl GmailTransport for Fixture {
         fn list(
@@ -1452,10 +1632,10 @@ mod tests {
         }
         fn get_raw(&mut self, id: &str) -> Result<RawMessage, GmailError> {
             self.raw_calls += 1;
-            self.messages
-                .get(id)
-                .cloned()
-                .ok_or_else(|| GmailError::Other("fixture message missing".into()))
+            if id == "ambiguous-404" && self.raw_calls == 1 {
+                return Err(GmailError::Http(404));
+            }
+            self.messages.get(id).cloned().ok_or(GmailError::Http(404))
         }
         fn get_metadata(&mut self, id: &str) -> Result<MetadataMessage, GmailError> {
             self.metadata_calls += 1;
@@ -1481,6 +1661,11 @@ mod tests {
         fn history(&mut self, _start: &str, page: Option<&str>) -> Result<HistoryPage, GmailError> {
             if self.expire_history {
                 return Err(GmailError::HistoryExpired);
+            }
+            if self.history_fail_page.is_some()
+                && self.history_fail_page == page.and_then(|value| value.parse().ok())
+            {
+                return Err(GmailError::Other("fixture history failure".into()));
             }
             Ok(self
                 .history
@@ -1562,6 +1747,7 @@ mod tests {
             expire_history: false,
             raw_calls: 0,
             metadata_calls: 0,
+            history_fail_page: None,
         };
         let first =
             sync_account(&root, "fixture-account", &mut transport, None, Some(1000)).unwrap();
@@ -1625,6 +1811,7 @@ mod tests {
             expire_history: false,
             raw_calls: 0,
             metadata_calls: 0,
+            history_fail_page: None,
         };
         let first = sync_account(&root, "fixture-account", &mut transport, None, None).unwrap();
         assert_eq!(first.new_messages, 2);
@@ -1680,6 +1867,7 @@ mod tests {
             expire_history: false,
             raw_calls: 0,
             metadata_calls: 0,
+            history_fail_page: None,
         };
         sync_account(
             &root,
@@ -1717,6 +1905,7 @@ mod tests {
             expire_history: false,
             raw_calls: 0,
             metadata_calls: 0,
+            history_fail_page: None,
         };
         sync_account(&root, "fixture-account", &mut transport, None, None).unwrap();
         let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
@@ -1759,6 +1948,7 @@ mod tests {
             expire_history: false,
             raw_calls: 0,
             metadata_calls: 0,
+            history_fail_page: None,
         };
         assert!(sync_account(&root, "fixture-account", &mut transport, None, None).is_err());
         let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
@@ -1826,6 +2016,7 @@ mod tests {
             expire_history: false,
             raw_calls: 0,
             metadata_calls: 0,
+            history_fail_page: None,
         };
         assert!(sync_account(&root, "fixture-account", &mut transport, None, None).is_err());
         let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
@@ -1869,6 +2060,7 @@ mod tests {
             expire_history: false,
             raw_calls: 0,
             metadata_calls: 0,
+            history_fail_page: None,
         };
         let stats = sync_account(&root, "fixture-account", &mut transport, None, None).unwrap();
         assert_eq!(stats.new_messages, 1);
@@ -1887,6 +2079,402 @@ mod tests {
                     .get::<_, i64>(0))
                 .unwrap(),
             1
+        );
+        drop(connection);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn history_add_then_delete_keeps_raw_and_publishes_terminal_state() {
+        let root = std::env::temp_dir().join(format!("gmail-add-delete-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
+        crate::set_gmail_state(&connection, "fixture-account", "7", true).unwrap();
+        drop(connection);
+        let message = RawMessage {
+            id: "m".into(),
+            thread_id: "t".into(),
+            label_ids: vec!["INBOX".into()],
+            history_id: Some("8".into()),
+            internal_date: None,
+            raw: "RnJvbTogbUBleGFtcGxlLnRlc3QNCg0KQg==".into(),
+        };
+        let mut transport = Fixture {
+            pages: vec![ListPage::default()],
+            messages: [("m".into(), message)].into_iter().collect(),
+            history: vec![HistoryPage {
+                history: vec![HistoryRecord {
+                    id: "8".into(),
+                    messages_added: vec![HistoryMessageAdded {
+                        message: ListedMessage {
+                            id: "m".into(),
+                            thread_id: "t".into(),
+                        },
+                    }],
+                    messages_deleted: vec![HistoryMessageDeleted {
+                        message: ListedMessage {
+                            id: "m".into(),
+                            thread_id: "t".into(),
+                        },
+                    }],
+                    ..Default::default()
+                }],
+                history_id: Some("9".into()),
+                ..Default::default()
+            }],
+            expire_history: false,
+            raw_calls: 0,
+            metadata_calls: 0,
+            history_fail_page: None,
+        };
+        sync_account(&root, "fixture-account", &mut transport, None, None).unwrap();
+        let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
+        assert_eq!(
+            crate::gmail_state(&connection, "fixture-account").unwrap(),
+            Some(("9".into(), true))
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT source_state FROM gmail_messages WHERE gmail_message_id='m'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "present"
+        );
+        assert_eq!(
+            crate::read_archived_raw(&root, 0).unwrap(),
+            b"From: m@example.test\r\n\r\nB"
+        );
+        drop(connection);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ambiguous_record_resolution_is_scoped_to_that_record() {
+        let make_transport = |id: &str, later_add: bool| {
+            let message = RawMessage {
+                id: id.into(),
+                thread_id: "t".into(),
+                label_ids: vec!["INBOX".into()],
+                history_id: Some("11".into()),
+                internal_date: None,
+                raw: "RnJvbTogYW1iaWd1b3VzQGV4YW1wbGUudGVzdA0KDQphZGQ=".into(),
+            };
+            let later = if later_add {
+                HistoryRecord {
+                    id: "9".into(),
+                    messages_added: vec![HistoryMessageAdded {
+                        message: ListedMessage {
+                            id: id.into(),
+                            thread_id: "t".into(),
+                        },
+                    }],
+                    ..Default::default()
+                }
+            } else {
+                HistoryRecord {
+                    id: "9".into(),
+                    messages_deleted: vec![HistoryMessageDeleted {
+                        message: ListedMessage {
+                            id: id.into(),
+                            thread_id: "t".into(),
+                        },
+                    }],
+                    ..Default::default()
+                }
+            };
+            Fixture {
+                pages: vec![ListPage::default()],
+                messages: [(id.into(), message)].into_iter().collect(),
+                history: vec![HistoryPage {
+                    history: vec![
+                        HistoryRecord {
+                            id: "8".into(),
+                            messages_added: vec![HistoryMessageAdded {
+                                message: ListedMessage {
+                                    id: id.into(),
+                                    thread_id: "t".into(),
+                                },
+                            }],
+                            messages_deleted: vec![HistoryMessageDeleted {
+                                message: ListedMessage {
+                                    id: id.into(),
+                                    thread_id: "t".into(),
+                                },
+                            }],
+                            ..Default::default()
+                        },
+                        later,
+                    ],
+                    history_id: Some("10".into()),
+                    ..Default::default()
+                }],
+                expire_history: false,
+                raw_calls: 0,
+                metadata_calls: 0,
+                history_fail_page: None,
+            }
+        };
+
+        for (id, later_add, expected) in [
+            ("ambiguous-404", true, "present"),
+            ("ambiguous-present", false, "deleted"),
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "gmail-ambiguous-sequence-{id}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
+            crate::set_gmail_state(&connection, "fixture-account", "7", true).unwrap();
+            drop(connection);
+            let mut transport = make_transport(id, later_add);
+            sync_account(&root, "fixture-account", &mut transport, None, None).unwrap();
+            let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT source_state FROM gmail_messages WHERE gmail_message_id=?1",
+                        [id],
+                        |row| row.get::<_, String>(0)
+                    )
+                    .unwrap(),
+                expected
+            );
+            assert_eq!(
+                crate::gmail_state(&connection, "fixture-account").unwrap(),
+                Some(("10".into(), true))
+            );
+            drop(connection);
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn history_delete_invalid_known_identity_does_not_advance_frontier() {
+        let root =
+            std::env::temp_dir().join(format!("gmail-delete-invalid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
+        let mut writer = crate::ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        let raw = b"From: known@example.test\r\n\r\nknown\r\n";
+        writer.append_raw(0, raw).unwrap();
+        let durable = writer.durable_barrier().unwrap();
+        crate::insert_gmail_metadata(
+            &connection,
+            "fixture-account",
+            "known",
+            0,
+            "t",
+            "[]",
+            None,
+            None,
+            &durable.entries()[0],
+        )
+        .unwrap();
+        crate::set_gmail_state(&connection, "fixture-account", "7", true).unwrap();
+        drop(writer);
+        drop(connection);
+        let path = root.join("archive/segment-000000.arc");
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[0] ^= 1;
+        std::fs::write(path, bytes).unwrap();
+        let mut transport = Fixture {
+            pages: vec![ListPage::default()],
+            messages: std::collections::HashMap::new(),
+            history: vec![HistoryPage {
+                history: vec![HistoryRecord {
+                    id: "8".into(),
+                    messages_deleted: vec![HistoryMessageDeleted {
+                        message: ListedMessage {
+                            id: "known".into(),
+                            thread_id: "t".into(),
+                        },
+                    }],
+                    ..Default::default()
+                }],
+                history_id: Some("8".into()),
+                ..Default::default()
+            }],
+            expire_history: false,
+            raw_calls: 0,
+            metadata_calls: 0,
+            history_fail_page: None,
+        };
+        assert!(sync_account(&root, "fixture-account", &mut transport, None, None).is_err());
+        let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
+        assert_eq!(
+            crate::gmail_state(&connection, "fixture-account").unwrap(),
+            Some(("7".into(), true))
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT source_state FROM gmail_messages WHERE gmail_message_id='known'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "present"
+        );
+        drop(connection);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn history_failure_before_apply_leaves_frontier_retryable() {
+        let root = std::env::temp_dir().join(format!("gmail-history-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
+        crate::set_gmail_state(&connection, "fixture-account", "7", true).unwrap();
+        drop(connection);
+        let message = RawMessage {
+            id: "retry".into(),
+            thread_id: "t".into(),
+            label_ids: vec![],
+            history_id: Some("8".into()),
+            internal_date: None,
+            raw: "SGk=".into(),
+        };
+        let mut transport = Fixture {
+            pages: vec![ListPage::default(), ListPage::default()],
+            messages: [("retry".into(), message)].into_iter().collect(),
+            history: vec![
+                HistoryPage {
+                    history: vec![HistoryRecord {
+                        id: "8".into(),
+                        messages_added: vec![HistoryMessageAdded {
+                            message: ListedMessage {
+                                id: "retry".into(),
+                                thread_id: "t".into(),
+                            },
+                        }],
+                        ..Default::default()
+                    }],
+                    next_page_token: Some("1".into()),
+                    ..Default::default()
+                },
+                HistoryPage {
+                    history: vec![HistoryRecord {
+                        id: "9".into(),
+                        messages_deleted: vec![HistoryMessageDeleted {
+                            message: ListedMessage {
+                                id: "retry".into(),
+                                thread_id: "t".into(),
+                            },
+                        }],
+                        ..Default::default()
+                    }],
+                    history_id: Some("9".into()),
+                    ..Default::default()
+                },
+            ],
+            expire_history: false,
+            raw_calls: 0,
+            metadata_calls: 0,
+            history_fail_page: Some(1),
+        };
+        assert!(sync_account(&root, "fixture-account", &mut transport, None, None).is_err());
+        let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
+        assert_eq!(
+            crate::gmail_state(&connection, "fixture-account").unwrap(),
+            Some(("7".into(), true))
+        );
+        drop(connection);
+        transport.history_fail_page = None;
+        sync_account(&root, "fixture-account", &mut transport, None, None).unwrap();
+        let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
+        assert_eq!(
+            crate::gmail_state(&connection, "fixture-account").unwrap(),
+            Some(("9".into(), true))
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT source_state FROM gmail_messages WHERE gmail_message_id='retry'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "deleted"
+        );
+        drop(connection);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn complete_full_marks_only_absent_same_source_and_bounded_does_not() {
+        let root = std::env::temp_dir().join(format!("gmail-absence-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
+        let mut writer = crate::ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        let raw = b"From: absent@example.test\r\n\r\nabsent\r\n";
+        writer.append_raw(0, raw).unwrap();
+        let durable = writer.durable_barrier().unwrap();
+        crate::insert_gmail_metadata(
+            &connection,
+            "fixture-account",
+            "absent",
+            0,
+            "t",
+            "[]",
+            None,
+            None,
+            &durable.entries()[0],
+        )
+        .unwrap();
+        drop(writer);
+        let mut transport = Fixture {
+            pages: vec![ListPage::default()],
+            messages: std::collections::HashMap::new(),
+            history: vec![HistoryPage::default()],
+            expire_history: false,
+            raw_calls: 0,
+            metadata_calls: 0,
+            history_fail_page: None,
+        };
+        sync_account(&root, "fixture-account", &mut transport, None, None).unwrap();
+        let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT source_state FROM gmail_messages WHERE gmail_message_id='absent'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "deleted"
+        );
+        drop(connection);
+
+        let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
+        connection
+            .execute(
+                "UPDATE gmail_messages SET source_state='present' WHERE gmail_message_id='absent'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        sync_account(
+            &root,
+            "fixture-account",
+            &mut transport,
+            Some("from:other"),
+            Some(1),
+        )
+        .unwrap();
+        let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT source_state FROM gmail_messages WHERE gmail_message_id='absent'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "present"
         );
         drop(connection);
         let _ = std::fs::remove_dir_all(&root);
@@ -1918,6 +2506,7 @@ mod tests {
             expire_history: false,
             raw_calls: 0,
             metadata_calls: 0,
+            history_fail_page: None,
         };
         let mut progress = Vec::new();
         let stats = sync_account_with_progress(
