@@ -963,18 +963,15 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
   borné/filtré mettent à jour les messages observés sans toucher aux absences.
   Les métadonnées connues sont rafraîchies par `METADATA`, les nouveaux RAW
   passent par append durable puis publication catalogue.
-- **Bug trouvé :** l’ancienne fence full provenait de l’history ID du premier
-  message, et l’incremental utilisait aussi la première page. Le code utilise
-  maintenant le `profile.historyId` observé après une full non vide et le
-  `historyId` de la page terminale pour history.
+- **Bug trouvé :** une tentative intermédiaire utilisait profile.historyId,
+  puis l’audit a conduit à revenir au historyId du premier message de la
+  première page comme frontier de full sync.
 - **Bug trouvé :** delete et absence ne validaient pas le RAW autoritatif.
   Toute identité connue est maintenant revalidée avant transition ; une
   corruption bloque sans avancer le frontier et sans supprimer le RAW.
-- **Bug trouvé :** les événements history étaient appliqués immédiatement,
-  donc une même identité `add/delete`, ou une identité déjà `deleted` puis
-  `add`, pouvait produire un état final incorrect. Les événements sont
-  réduits par Gmail ID avant application ; delete gagne dans un record Gmail,
-  et les pages restent ordonnées.
+- **Bug trouvé :** une tentative intermédiaire donnait priorité à delete
+  dans un record, puis l’audit a conduit à supprimer toute priorité
+  intra-record et à résoudre les ambiguïtés via Gmail.
 - **Tests adversariaux :** ajoutés pour `add+delete`, RAW conservé/état final
   deleted, delete sur RAW invalide, échec de page et retry, plus absence full
   contre parcours borné/filtré. Les tests existants couvrent la boîte vide et
