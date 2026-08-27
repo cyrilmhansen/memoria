@@ -186,14 +186,14 @@ enum CasPiece {
     Blob(String),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct ArchiveLocation {
     pub segment: String,
     pub offset: u64,
     pub frame_bytes: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct RawReference {
     pub doc_id: u64,
     pub location: ArchiveLocation,
@@ -437,6 +437,38 @@ pub struct RecordInventory {
     pub doc_id: i64,
     pub location: Option<ArchiveLocation>,
     pub status: RecordInventoryStatus,
+}
+
+/// Classification of one physically encountered frame or tail.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PhysicalFrameStatus {
+    CataloguedValidated,
+    CataloguedInconsistent,
+    OrphanValidated,
+    PhysicalCorruption { reason: String },
+    IncompleteTail { reason: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhysicalFrameInventory {
+    pub location: ArchiveLocation,
+    pub doc_id: Option<u64>,
+    pub blake3: Option<[u8; 32]>,
+    pub status: PhysicalFrameStatus,
+}
+
+/// Read-only physical archive inventory, joined to the authoritative catalogue
+/// by the complete frame identity. A doc_id alone is deliberately insufficient.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PhysicalInventory {
+    pub frames: Vec<PhysicalFrameInventory>,
+    pub catalogued_records: u64,
+    pub validated_catalogued_records: u64,
+    pub orphan_valid_frames: u64,
+    pub inconsistent_catalogued_records: u64,
+    pub catalogued_physically_missing: u64,
+    pub physical_corruptions: u64,
+    pub incomplete_tails: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -982,6 +1014,13 @@ impl GmailSearchIndex {
 #[derive(Clone, Debug, Default)]
 pub struct ArchiveSummary {
     pub messages: u64,
+    pub catalogued_records: u64,
+    pub validated_catalogued_records: u64,
+    pub orphan_valid_frames: u64,
+    pub inconsistent_catalogued_records: u64,
+    pub catalogued_physically_missing: u64,
+    pub physical_corruptions: u64,
+    pub incomplete_tails: u64,
     pub archive_bytes: u64,
     pub segments: u64,
     pub catalog_bytes: u64,
@@ -992,7 +1031,10 @@ pub struct ArchiveSummary {
 pub fn archive_summary(root: &Path) -> io::Result<ArchiveSummary> {
     let catalog_path = root.join("metadata.sqlite");
     let messages = if catalog_path.exists() {
-        let connection = open_catalogue(&catalog_path).map_err(sqlite_io)?;
+        validate_existing_catalogue(&catalog_path).map_err(sqlite_io)?;
+        let connection =
+            Connection::open_with_flags(&catalog_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(sqlite_io)?;
         connection
             .query_row("SELECT COUNT(*) FROM messages", [], |row| {
                 row.get::<_, i64>(0)
@@ -1000,6 +1042,11 @@ pub fn archive_summary(root: &Path) -> io::Result<ArchiveSummary> {
             .map_err(sqlite_io)? as u64
     } else {
         0
+    };
+    let physical = if catalog_path.exists() {
+        inventory_physical(root)?
+    } else {
+        PhysicalInventory::default()
     };
     let archive_root = root.join("archive");
     let mut segments = 0;
@@ -1014,6 +1061,13 @@ pub fn archive_summary(root: &Path) -> io::Result<ArchiveSummary> {
     let index_root = gmail_index_dir(root);
     Ok(ArchiveSummary {
         messages,
+        catalogued_records: physical.catalogued_records,
+        validated_catalogued_records: physical.validated_catalogued_records,
+        orphan_valid_frames: physical.orphan_valid_frames,
+        inconsistent_catalogued_records: physical.inconsistent_catalogued_records,
+        catalogued_physically_missing: physical.catalogued_physically_missing,
+        physical_corruptions: physical.physical_corruptions,
+        incomplete_tails: physical.incomplete_tails,
         archive_bytes: directory_bytes(&archive_root)?,
         segments,
         catalog_bytes: catalog_path
@@ -2049,7 +2103,7 @@ pub fn inventory_records(root: &Path) -> io::Result<Vec<RecordInventory>> {
     .map_err(sqlite_io)?;
     let mut statement = catalog
         .prepare(
-            "SELECT doc_id, segment, archive_offset, frame_bytes FROM messages ORDER BY doc_id",
+            "SELECT doc_id, segment, archive_offset, frame_bytes, raw_blake3 FROM messages ORDER BY doc_id",
         )
         .map_err(sqlite_io)?;
     let rows = statement
@@ -2061,16 +2115,28 @@ pub fn inventory_records(root: &Path) -> io::Result<Vec<RecordInventory>> {
                 row.get::<_, String>(1).map_err(|error| error.to_string()),
                 row.get::<_, i64>(2).map_err(|error| error.to_string()),
                 row.get::<_, i64>(3).map_err(|error| error.to_string()),
+                row.get::<_, Vec<u8>>(4).map_err(|error| error.to_string()),
             ))
         })
         .map_err(sqlite_io)?;
     let mut inventory = Vec::new();
     for row in rows {
-        let (doc_id, segment, offset, frame_bytes) = match row {
+        let (doc_id, segment, offset, frame_bytes, raw_blake3) = match row {
             Ok(value) => value,
             // A row whose primary key cannot be decoded cannot be represented
             // as a RecordInventory without inventing an identifier.
             Err(error) => return Err(sqlite_io(error)),
+        };
+        let raw_blake3 = match raw_blake3 {
+            Ok(value) => value,
+            Err(error) => {
+                inventory.push(inventory_inconsistent(
+                    doc_id,
+                    None,
+                    format!("catalogue BLAKE3 is invalid: {error}"),
+                ));
+                continue;
+            }
         };
         let segment = match segment {
             Ok(segment) => segment,
@@ -2192,11 +2258,23 @@ pub fn inventory_records(root: &Path) -> io::Result<Vec<RecordInventory>> {
             continue;
         }
         match read_record(&root.join("archive"), &location) {
-            Ok((record_id, _)) if record_id == doc_id as u64 => inventory.push(RecordInventory {
-                doc_id,
-                location: Some(location),
-                status: RecordInventoryStatus::AvailableValidated,
-            }),
+            Ok((record_id, raw)) if record_id == doc_id as u64 => {
+                let digest_matches = raw_blake3.len() == 32
+                    && raw_blake3.as_slice() == blake3::hash(&raw).as_bytes();
+                if digest_matches {
+                    inventory.push(RecordInventory {
+                        doc_id,
+                        location: Some(location),
+                        status: RecordInventoryStatus::AvailableValidated,
+                    });
+                } else {
+                    inventory.push(inventory_inconsistent(
+                        doc_id,
+                        Some(location),
+                        "catalogue/RAW BLAKE3 linkage mismatch",
+                    ));
+                }
+            }
             Ok((record_id, _)) => inventory.push(inventory_inconsistent(
                 doc_id,
                 Some(location),
@@ -2210,6 +2288,247 @@ pub fn inventory_records(root: &Path) -> io::Result<Vec<RecordInventory>> {
         }
     }
     Ok(inventory)
+}
+
+type CatalogueFrameClaims = (HashSet<(String, u64)>, HashSet<RawReference>);
+
+fn catalogue_frame_sets(root: &Path) -> io::Result<CatalogueFrameClaims> {
+    validate_existing_catalogue(&root.join("metadata.sqlite")).map_err(sqlite_io)?;
+    let catalog = Connection::open_with_flags(
+        root.join("metadata.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(sqlite_io)?;
+    let mut statement = catalog
+        .prepare("SELECT doc_id,segment,archive_offset,frame_bytes,raw_blake3 FROM messages")
+        .map_err(sqlite_io)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+            ))
+        })
+        .map_err(sqlite_io)?;
+    // Segment + offset is the minimum physical claim key. frame_bytes is
+    // intentionally excluded so a malformed catalogue length cannot make the
+    // real frame look like an orphan.
+    let mut locations = HashSet::new();
+    let mut references = HashSet::new();
+    for row in rows {
+        let (doc_id, segment, offset, frame_bytes, digest) = row.map_err(sqlite_io)?;
+        if archive_segment_path(&root.join("archive"), &segment).is_err() || offset < 0 {
+            continue;
+        }
+        // Establish the physical claim before validating any authoritative
+        // attribute. A negative doc_id/frame_bytes still claims this segment
+        // and offset and must prevent the candidate from becoming an orphan.
+        let physical_claim = (segment.clone(), offset as u64);
+        locations.insert(physical_claim);
+        if doc_id < 0 || frame_bytes < 0 {
+            continue;
+        }
+        let location = ArchiveLocation {
+            segment: segment.clone(),
+            offset: offset as u64,
+            frame_bytes: frame_bytes as u64,
+        };
+        if digest.len() == 32 {
+            let mut blake3 = [0u8; 32];
+            blake3.copy_from_slice(&digest);
+            references.insert(RawReference {
+                doc_id: doc_id as u64,
+                location,
+                blake3,
+            });
+        }
+    }
+    Ok((locations, references))
+}
+
+/// Scan every named archive segment without changing any archive or catalogue
+/// file. The scanner advances only over structurally bounded frames; after a
+/// bad magic or an unsafe length it stops that segment instead of guessing a
+/// new boundary. A valid frame is catalogued only on an exact physical
+/// identity match, including its BLAKE3 digest.
+fn allocate_frame_body(body_len: u64) -> io::Result<Vec<u8>> {
+    let body_len = usize::try_from(body_len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "archive frame body length does not fit in memory",
+        )
+    })?;
+    let mut body = Vec::new();
+    body.try_reserve_exact(body_len)
+        .map_err(|error| io::Error::other(format!("archive frame allocation failed: {error}")))?;
+    body.resize(body_len, 0);
+    Ok(body)
+}
+
+pub fn inventory_physical(root: &Path) -> io::Result<PhysicalInventory> {
+    let (catalogue_locations, catalogue_references) = catalogue_frame_sets(root)?;
+    let catalogue_records = inventory_records(root)?;
+    let mut result = PhysicalInventory {
+        catalogued_records: catalogue_records.len() as u64,
+        validated_catalogued_records: catalogue_records
+            .iter()
+            .filter(|record| matches!(record.status, RecordInventoryStatus::AvailableValidated))
+            .count() as u64,
+        inconsistent_catalogued_records: catalogue_records
+            .iter()
+            .filter(|record| matches!(record.status, RecordInventoryStatus::Inconsistent { .. }))
+            .count() as u64,
+        catalogued_physically_missing: catalogue_records
+            .iter()
+            .filter(|record| matches!(record.status, RecordInventoryStatus::PhysicallyMissing))
+            .count() as u64,
+        ..Default::default()
+    };
+    let archive_root = root.join("archive");
+    let mut paths = fs::read_dir(&archive_root)
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                io::Error::new(io::ErrorKind::NotFound, "archive directory is missing")
+            } else {
+                error
+            }
+        })?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("arc"))
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    for path in paths {
+        let segment = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid segment name"))?
+            .to_string();
+        archive_segment_path(&archive_root, &segment)?;
+        let file_len = fs::metadata(&path)?.len();
+        let mut file = File::open(&path)?;
+        let mut offset = 0u64;
+        while offset < file_len {
+            let remaining = file_len - offset;
+            let mut header = [0u8; 32];
+            if remaining < FRAME_HEADER_BYTES {
+                result.incomplete_tails += 1;
+                result.frames.push(PhysicalFrameInventory {
+                    location: ArchiveLocation {
+                        segment: segment.clone(),
+                        offset,
+                        frame_bytes: remaining,
+                    },
+                    doc_id: None,
+                    blake3: None,
+                    status: PhysicalFrameStatus::IncompleteTail {
+                        reason: "fewer than 32 bytes remain for a frame header".into(),
+                    },
+                });
+                break;
+            }
+            file.read_exact(&mut header)?;
+            if &header[..8] != FRAME_MAGIC {
+                result.physical_corruptions += 1;
+                result.frames.push(PhysicalFrameInventory {
+                    location: ArchiveLocation {
+                        segment: segment.clone(),
+                        offset,
+                        frame_bytes: remaining,
+                    },
+                    doc_id: None,
+                    blake3: None,
+                    status: PhysicalFrameStatus::PhysicalCorruption {
+                        reason: "frame magic mismatch; no safe resynchronization boundary".into(),
+                    },
+                });
+                break;
+            }
+            let doc_id = u64::from_le_bytes(header[8..16].try_into().unwrap());
+            let body_len = u64::from_le_bytes(header[16..24].try_into().unwrap());
+            let checksum = u64::from_le_bytes(header[24..32].try_into().unwrap());
+            let frame_bytes = match FRAME_HEADER_BYTES.checked_add(body_len) {
+                Some(value) => value,
+                None => {
+                    result.physical_corruptions += 1;
+                    result.frames.push(PhysicalFrameInventory {
+                        location: ArchiveLocation {
+                            segment: segment.clone(),
+                            offset,
+                            frame_bytes: remaining,
+                        },
+                        doc_id: Some(doc_id),
+                        blake3: None,
+                        status: PhysicalFrameStatus::PhysicalCorruption {
+                            reason: "frame length overflows the archive coordinate".into(),
+                        },
+                    });
+                    break;
+                }
+            };
+            if frame_bytes > remaining {
+                result.physical_corruptions += 1;
+                result.frames.push(PhysicalFrameInventory {
+                    location: ArchiveLocation {
+                        segment: segment.clone(),
+                        offset,
+                        frame_bytes: remaining,
+                    },
+                    doc_id: Some(doc_id),
+                    blake3: None,
+                    status: PhysicalFrameStatus::PhysicalCorruption {
+                        reason: "declared body extends past EOF; length is unauthenticated".into(),
+                    },
+                });
+                break;
+            }
+            let mut body = allocate_frame_body(body_len)?;
+            file.read_exact(&mut body)?;
+            let location = ArchiveLocation {
+                segment: segment.clone(),
+                offset,
+                frame_bytes,
+            };
+            offset += frame_bytes;
+            if fnv64(&body) != checksum {
+                result.physical_corruptions += 1;
+                result.frames.push(PhysicalFrameInventory {
+                    location,
+                    doc_id: Some(doc_id),
+                    blake3: None,
+                    status: PhysicalFrameStatus::PhysicalCorruption {
+                        reason: "frame checksum mismatch".into(),
+                    },
+                });
+                break;
+            }
+            let digest = *blake3::hash(&body).as_bytes();
+            let reference = RawReference {
+                doc_id,
+                location: location.clone(),
+                blake3: digest,
+            };
+            let status = if catalogue_references.contains(&reference) {
+                PhysicalFrameStatus::CataloguedValidated
+            } else if catalogue_locations.contains(&(location.segment.clone(), location.offset)) {
+                PhysicalFrameStatus::CataloguedInconsistent
+            } else {
+                result.orphan_valid_frames += 1;
+                PhysicalFrameStatus::OrphanValidated
+            };
+            result.frames.push(PhysicalFrameInventory {
+                location,
+                doc_id: Some(doc_id),
+                blake3: Some(digest),
+                status,
+            });
+        }
+    }
+    Ok(result)
 }
 
 /// Validate and read one physical frame by coordinates.
@@ -6763,6 +7082,8 @@ mod tests {
             result[0].status,
             RecordInventoryStatus::PhysicallyMissing
         ));
+        let physical = inventory_physical(&root).unwrap();
+        assert_eq!(physical.catalogued_physically_missing, 1);
         assert!(matches!(
             result[1].status,
             RecordInventoryStatus::AvailableValidated
@@ -6858,6 +7179,283 @@ mod tests {
             .map(|path| fs::read(path).ok())
             .collect::<Vec<_>>();
         assert_eq!(after_sqlite, before_sqlite);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn physical_inventory_distinguishes_same_doc_id_orphan_and_continues() {
+        let (root, _, _) = inventory_fixture("physical-orphan-same-id");
+        let catalog = open_catalogue(&root.join("metadata.sqlite")).unwrap();
+        let mut writer =
+            ArchiveWriter::open_for_catalogue(&root.join("archive"), 64 * 1024, &catalog).unwrap();
+        let _orphan_pending = writer
+            .append_raw(1, b"not MIME and never published")
+            .unwrap();
+        writer.durable_barrier().unwrap();
+        let published_raw = b"From: sender@example.test\r\nSubject: published\r\n\r\npublished";
+        let published_pending = writer.append_raw(3, published_raw).unwrap();
+        let published_durable = writer.durable_barrier().unwrap();
+        let message = Message {
+            id: 3,
+            message_id: "inventory-published-3".into(),
+            timestamp: 0,
+            sender: "sender@example.test".into(),
+            recipients: Vec::new(),
+            subject: "published".into(),
+            text_body: "published".into(),
+            html_body: None,
+            account: "fixture".into(),
+            folder: "Inbox".into(),
+            thread: "thread".into(),
+            attachments: Vec::new(),
+            raw: published_raw.to_vec(),
+        };
+        publish_catalogue_batch(
+            &catalog,
+            &[CatalogueBatchRecord::new(message, published_pending)],
+            &published_durable,
+        )
+        .unwrap();
+        drop(writer);
+        drop(catalog);
+
+        let before = fs::read(root.join("archive/segment-000000.arc")).unwrap();
+        let inventory = inventory_physical(&root).unwrap();
+        assert_eq!(inventory.orphan_valid_frames, 1);
+        assert_eq!(inventory.validated_catalogued_records, 4);
+        assert_eq!(inventory.incomplete_tails, 0);
+        assert!(inventory.frames.iter().any(|frame| {
+            frame.doc_id == Some(1) && matches!(frame.status, PhysicalFrameStatus::OrphanValidated)
+        }));
+        assert!(inventory.frames.iter().any(|frame| {
+            frame.doc_id == Some(3)
+                && matches!(frame.status, PhysicalFrameStatus::CataloguedValidated)
+        }));
+        // The scanner is diagnostic only, including for an invalid MIME orphan.
+        assert_eq!(
+            fs::read(root.join("archive/segment-000000.arc")).unwrap(),
+            before
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn physical_inventory_reports_partial_tail_without_truncating() {
+        let (root, _, _) = inventory_fixture("physical-incomplete-tail");
+        let path = root.join("archive/segment-000000.arc");
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"MAARC001").unwrap();
+        drop(file);
+        let before = fs::read(&path).unwrap();
+        let inventory = inventory_physical(&root).unwrap();
+        assert_eq!(inventory.incomplete_tails, 1);
+        assert_eq!(inventory.orphan_valid_frames, 0);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rebuild_indexes_catalogue_only_and_ignores_valid_orphan() {
+        let (root, _) = gmail_inventory_fixture("rebuild-ignores-orphan");
+        let mut writer = ArchiveWriter::open(&root.join("archive"), 64 * 1024).unwrap();
+        writer
+            .append_raw(
+                1,
+                b"From: orphan@example.test\r\nSubject: orphan-only\r\n\r\nsecret-orphan-term",
+            )
+            .unwrap();
+        writer.durable_barrier().unwrap();
+        drop(writer);
+        let inventory = inventory_physical(&root).unwrap();
+        assert_eq!(inventory.orphan_valid_frames, 1);
+        let stats = rebuild_gmail_archive(&root).unwrap();
+        assert_eq!(stats.indexed, 3);
+        assert!(indexed_search_ids(&root, "orphan-only").is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn physical_inventory_keeps_catalogued_wrong_digest_inconsistent() {
+        let (root, locations, _) = inventory_fixture("physical-wrong-digest");
+        let catalog = Connection::open(root.join("metadata.sqlite")).unwrap();
+        catalog
+            .execute(
+                "UPDATE messages SET raw_blake3=?1 WHERE doc_id=1",
+                params![vec![0u8; 32]],
+            )
+            .unwrap();
+        drop(catalog);
+        let inventory = inventory_physical(&root).unwrap();
+        assert_eq!(inventory.orphan_valid_frames, 0);
+        assert_eq!(inventory.inconsistent_catalogued_records, 1);
+        let frame = inventory
+            .frames
+            .iter()
+            .find(|frame| frame.location == locations[1])
+            .unwrap();
+        assert!(matches!(
+            frame.status,
+            PhysicalFrameStatus::CataloguedInconsistent
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn physical_inventory_treats_wrong_catalogue_frame_bytes_as_claimed_inconsistent() {
+        let (root, locations, _) = inventory_fixture("physical-wrong-frame-bytes");
+        let catalog = Connection::open(root.join("metadata.sqlite")).unwrap();
+        catalog
+            .execute(
+                "UPDATE messages SET frame_bytes=frame_bytes+1 WHERE doc_id=1",
+                [],
+            )
+            .unwrap();
+        drop(catalog);
+        let inventory = inventory_physical(&root).unwrap();
+        assert_eq!(inventory.orphan_valid_frames, 0);
+        assert_eq!(inventory.inconsistent_catalogued_records, 1);
+        assert_eq!(inventory.catalogued_physically_missing, 0);
+        let frame = inventory
+            .frames
+            .iter()
+            .find(|frame| frame.location == locations[1])
+            .unwrap();
+        assert!(matches!(
+            frame.status,
+            PhysicalFrameStatus::CataloguedInconsistent
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn physical_inventory_keeps_claim_for_negative_catalogue_doc_id() {
+        let (root, locations, _) = inventory_fixture("physical-negative-doc-id");
+        let catalog = Connection::open(root.join("metadata.sqlite")).unwrap();
+        catalog
+            .execute("UPDATE messages SET doc_id=-1 WHERE doc_id=1", [])
+            .unwrap();
+        drop(catalog);
+        let inventory = inventory_physical(&root).unwrap();
+        assert_eq!(inventory.orphan_valid_frames, 0);
+        let frame = inventory
+            .frames
+            .iter()
+            .find(|frame| frame.location == locations[1])
+            .unwrap();
+        assert!(matches!(
+            frame.status,
+            PhysicalFrameStatus::CataloguedInconsistent
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn physical_inventory_keeps_claim_for_negative_catalogue_frame_bytes() {
+        let (root, locations, _) = inventory_fixture("physical-negative-frame-bytes");
+        let catalog = Connection::open(root.join("metadata.sqlite")).unwrap();
+        catalog
+            .execute("UPDATE messages SET frame_bytes=-1 WHERE doc_id=1", [])
+            .unwrap();
+        drop(catalog);
+        let inventory = inventory_physical(&root).unwrap();
+        assert_eq!(inventory.orphan_valid_frames, 0);
+        let frame = inventory
+            .frames
+            .iter()
+            .find(|frame| frame.location == locations[1])
+            .unwrap();
+        assert!(matches!(
+            frame.status,
+            PhysicalFrameStatus::CataloguedInconsistent
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn archive_summary_is_read_only_for_catalogue_and_sidecars() {
+        let (root, _, _) = inventory_fixture("summary-read-only");
+        let catalogue = root.join("metadata.sqlite");
+        let sidecars = [
+            root.join("metadata.sqlite-journal"),
+            root.join("metadata.sqlite-wal"),
+            root.join("metadata.sqlite-shm"),
+        ];
+        let before = fs::read(&catalogue).unwrap();
+        let before_sidecars = sidecars
+            .iter()
+            .map(|path| fs::read(path).ok())
+            .collect::<Vec<_>>();
+        let summary = archive_summary(&root).unwrap();
+        assert_eq!(summary.catalogued_records, 3);
+        assert_eq!(fs::read(&catalogue).unwrap(), before);
+        assert_eq!(
+            sidecars
+                .iter()
+                .map(|path| fs::read(path).ok())
+                .collect::<Vec<_>>(),
+            before_sidecars
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn physical_inventory_body_allocation_failure_is_an_error() {
+        let error = allocate_frame_body(u64::MAX).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::InvalidData | io::ErrorKind::Other
+        ));
+    }
+
+    #[test]
+    fn physical_inventory_stops_after_checksum_corruption_without_authentic_framing() {
+        let (root, locations, _) = inventory_fixture("physical-checksum-corruption");
+        let path = root.join("archive/segment-000000.arc");
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[locations[1].offset as usize + 24] ^= 1;
+        fs::write(&path, &bytes).unwrap();
+        let inventory = inventory_physical(&root).unwrap();
+        assert_eq!(inventory.physical_corruptions, 1);
+        assert_eq!(inventory.incomplete_tails, 0);
+        assert_eq!(inventory.validated_catalogued_records, 2);
+        assert!(!inventory
+            .frames
+            .iter()
+            .any(|frame| frame.location == locations[2]));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn physical_inventory_stops_on_untrusted_length_and_does_not_call_it_tail() {
+        let (root, locations, _) = inventory_fixture("physical-length-corruption");
+        let path = root.join("archive/segment-000000.arc");
+        let mut bytes = fs::read(&path).unwrap();
+        let body_len = locations[1].frame_bytes - FRAME_HEADER_BYTES + 1;
+        bytes[locations[1].offset as usize + 16..locations[1].offset as usize + 24]
+            .copy_from_slice(&body_len.to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+        let inventory = inventory_physical(&root).unwrap();
+        assert_eq!(inventory.physical_corruptions, 1);
+        assert_eq!(inventory.incomplete_tails, 0);
+        assert!(!inventory
+            .frames
+            .iter()
+            .any(|frame| frame.location == locations[2]));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn physical_inventory_classifies_terminal_body_overrun_as_corruption() {
+        let (root, locations, _) = inventory_fixture("physical-terminal-length-corruption");
+        let path = root.join("archive/segment-000000.arc");
+        let mut bytes = fs::read(&path).unwrap();
+        let offset = locations[2].offset as usize;
+        let body_len = locations[2].frame_bytes - FRAME_HEADER_BYTES + 1;
+        bytes[offset + 16..offset + 24].copy_from_slice(&body_len.to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+        let inventory = inventory_physical(&root).unwrap();
+        assert_eq!(inventory.physical_corruptions, 1);
+        assert_eq!(inventory.incomplete_tails, 0);
         let _ = fs::remove_dir_all(root);
     }
 

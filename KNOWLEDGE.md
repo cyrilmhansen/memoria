@@ -856,3 +856,32 @@ résultats d'expérience locale :
 - **Décision :** une full sync `query` ou `max` restaure une identité locale
   `deleted` effectivement observée et rafraîchit ses métadonnées, sans déduire
   d’absence hors périmètre.
+- **Réconciliation RAW — fait vérifié le 2026-08-27 :** `inventory_physical`
+  parcourt les segments en lecture seule et compare chaque frame valide par
+  identité physique complète (`segment`, `offset`, `frame_bytes`, `doc_id` et
+  BLAKE3) aux lignes `messages`. Un même `doc_id` ne suffit pas : une frame
+  durable restée sans publication est orphan même si une retry a publié une
+  autre frame avec le même ID.
+- **Réconciliation RAW — décision :** les frames valides non référencées sont
+  détectées et comptées, jamais supprimées, tronquées, déplacées, réassignées
+  ou insérées dans SQLite. Leur MIME éventuel ne détermine aucune identité
+  Gmail/IMAP. La checksum FNV ne couvre pas l’en-tête : magic, longueur
+  incohérente ou checksum invalide arrêtent donc le segment fail-closed. Seule
+  une queue terminale trop courte pour contenir l’en-tête est `IncompleteTail`.
+- **Réconciliation RAW — correction High :** une revendication catalogue est
+  associée à une frame candidate par `segment + offset`; `frame_bytes`,
+  `doc_id` et BLAKE3 servent ensuite à valider l’identité complète. Une frame
+  revendiquée mais mal décrite est `CataloguedInconsistent`, jamais orphan.
+  Cette revendication est enregistrée avant de rejeter un `doc_id` ou
+  `frame_bytes` négatif, dès que segment et offset sont sûrs.
+  Les records catalogue sans bytes physiques sont comptés séparément comme
+  `catalogued_physically_missing`. L’allocation du corps est faillible.
+- **Réconciliation RAW — observabilité :** `PhysicalInventory`,
+  `ArchiveSummary` et `archive-inventory` exposent records catalogués,
+  catalogués validés, frames orphelines valides, incohérences catalogue,
+  absences physiques, corruptions physiques et queues incomplètes. Toute cette
+  surface ouvre SQLite en lecture seule après validation et ne change ni
+  journal mode ni sidecars. Le rebuild Tantivy ne parcourt pas les orphelins
+  comme messages : il suit le catalogue autoritatif.
+- **État :** orphan detection closed; orphan recovery deliberately not
+  implemented.

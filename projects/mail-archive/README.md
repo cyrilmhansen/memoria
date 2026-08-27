@@ -22,6 +22,7 @@ cargo run -p mail-archive-experiment --bin mail-archive-experiment -- benchmark 
 cargo run -p mail-archive-experiment --bin mail-archive-experiment -- cas-benchmark --profile personal --messages 10000 --seed 42 --out /tmp/mail-archive-cas
 cargo test -p mail-archive-experiment
 cargo run -p mail-archive-experiment --bin mail-archive-experiment -- gmail-report --archive /chemin/archive
+cargo run -p mail-archive-experiment --bin mail-archive-experiment -- archive-inventory --archive /chemin/archive
 cargo run -p mail-archive-experiment --bin mail-archive-app
 cargo run -p mail-archive-experiment --bin mail-archive-app -- --archive /chemin/archive
 cargo run -p mail-archive-experiment --bin mail-archive-app -- --archive /chemin/archive --benchmark
@@ -165,6 +166,18 @@ active les mesures gzip/zstd, coûteuses sur les gros profils.
 - Une queue de segment incomplète peut être inventoriée en lecture seule par
   A2.1. Aucune opération de troncature physique n’est exposée ; la réparation
   destructive est différée jusqu’au chantier crash-consistency/publication.
+- `archive-inventory` réconcilie les frames physiques valides avec les lignes
+  `messages`. La revendication minimale est `segment + offset`, puis la
+  validation exige longueur, `doc_id` et BLAKE3. Une frame durable non publiée
+  est orphan, même avec un `doc_id` réutilisé par une retry ; une frame
+  revendiquée mais mal décrite est incohérente, y compris si `doc_id` ou
+  `frame_bytes` est négatif dès lors que `segment + offset` est exploitable.
+  Les records sans bytes sont
+  comptés comme physiquement manquants. Magic, longueur incohérente et
+  checksum invalide arrêtent le segment sans resynchronisation heuristique ;
+  seule une queue terminale trop courte pour un header est incomplète. Le scan
+  et `archive_summary` sont strictement read-only. Le rebuild Tantivy suit le
+  catalogue autoritatif et ignore les orphans.
 - L’export EML individuel et batch est disponible et copie les octets RAW ; la
   restauration complète et la migration vers un fournisseur ne sont pas
   implémentées.

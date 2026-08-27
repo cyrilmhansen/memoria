@@ -978,3 +978,24 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
   l’idempotence/pagination.
 - **État :** corrections A3.3 implémentées ; validation globale restante avant
   verdict. Aucun commit n’est créé.
+- 2026-08-27 — chantier RAW orphelins : ajout de `inventory_physical`, scan
+  séquentiel sans mutation et classification par identité physique complète.
+  Les frames valides sans référence exacte sont `OrphanValidated`, y compris
+  lorsque leur `doc_id` est réutilisé par une frame publiée. Les anomalies de
+  catalogue restent `Inconsistent`; corruption non resynchronisable et queue
+  partielle restent séparées. Ajout de compteurs à `ArchiveSummary`, de la
+  commande diagnostique `archive-inventory` et de tests same-`doc_id`, tail,
+  MIME invalide et rebuild Tantivy catalogue-only. Aucun recovery n’est
+  implémenté et aucun commit n’a été créé.
+- 2026-08-27 — correction Sol High : le scanner s’arrête désormais après toute
+  corruption de framing/checksum car l’en-tête n’est pas authentifié ; une
+  longueur au-delà de l’EOF est corruption, tandis qu’une queue trop courte
+  pour un header reste `IncompleteTail`. L’association catalogue minimale est
+  `segment + offset`, ce qui empêche le double classement orphan/inconsistent
+  sur un `frame_bytes` erroné. Ajout du compteur physically missing, d’une
+  allocation `try_reserve_exact` et d’une preuve summary strictement
+  read-only. Aucun recovery ni commit.
+- 2026-08-27 — correction finale de classification : `catalogue_frame_sets`
+  conserve maintenant la revendication `segment + offset` avant de valider
+  `doc_id` et `frame_bytes`. Une ligne négative mais physiquement localisable
+  empêche donc `OrphanValidated` et produit `CataloguedInconsistent`.
