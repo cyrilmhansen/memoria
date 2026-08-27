@@ -1,4 +1,5 @@
 use flate2::{write::GzEncoder, Compression};
+use fs4::fs_std::FileExt;
 use mailparse::{parse_mail, MailHeaderMap, ParsedMail};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::cmp::Ordering;
@@ -215,7 +216,9 @@ pub struct PendingRawLocation {
 struct RawBatchIdentity;
 
 #[derive(Debug)]
-struct ArchiveAuthority;
+struct ArchiveAuthority {
+    _lock: Option<ArchiveLock>,
+}
 
 pub(crate) struct CatalogueConnection {
     connection: Connection,
@@ -279,14 +282,48 @@ pub struct ArchiveSession {
 
 impl ArchiveSession {
     pub fn create(root: &Path, segment_bytes: u64) -> io::Result<Self> {
-        fs::create_dir_all(root)?;
-        let writer = ArchiveWriter::open(&root.join("archive"), segment_bytes)?;
-        let catalogue = create_catalogue_for_authority(
-            &root.join("metadata.sqlite"),
-            Arc::clone(&writer.authority),
-        )
-        .map_err(sqlite_io)?;
+        let authority = acquire_session_authority(root)?;
+        let writer = ArchiveWriter::open_with_authority(
+            &root.join("archive"),
+            segment_bytes,
+            Arc::clone(&authority),
+        )?;
+        let catalogue = create_catalogue_for_authority(&root.join("metadata.sqlite"), authority)
+            .map_err(sqlite_io)?;
         Ok(Self { writer, catalogue })
+    }
+
+    /// Recreates an archive while holding the same authority used for normal
+    /// creation. The rendezvous file is outside the directory being removed.
+    pub fn reset(root: &Path, segment_bytes: u64) -> io::Result<Self> {
+        let authority = acquire_session_authority(root)?;
+        if root.exists() {
+            fs::remove_dir_all(root)?;
+        }
+        let writer = ArchiveWriter::open_with_authority(
+            &root.join("archive"),
+            segment_bytes,
+            Arc::clone(&authority),
+        )?;
+        let catalogue = create_catalogue_for_authority(&root.join("metadata.sqlite"), authority)
+            .map_err(sqlite_io)?;
+        Ok(Self { writer, catalogue })
+    }
+
+    pub(crate) fn parts_mut(&mut self) -> (&mut ArchiveWriter, &mut CatalogueConnection) {
+        (&mut self.writer, &mut self.catalogue)
+    }
+
+    #[cfg(test)]
+    fn replace_writer_for_test(&mut self) {
+        let replacement = ArchiveWriter::open_with_authority(
+            &self.writer.root,
+            self.writer.segment_bytes,
+            Arc::clone(&self.catalogue.authority),
+        )
+        .unwrap();
+        let previous = std::mem::replace(&mut self.writer, replacement);
+        drop(previous);
     }
 
     pub fn writer_mut(&mut self) -> &mut ArchiveWriter {
@@ -1732,6 +1769,7 @@ pub fn run_cas(root: &Path, config: CorpusConfig, variant: CasVariant) -> io::Re
     Ok(stats)
 }
 
+#[derive(Debug)]
 pub struct ArchiveWriter {
     authority: Arc<ArchiveAuthority>,
     root: PathBuf,
@@ -1750,6 +1788,133 @@ pub struct ArchiveWriter {
     poisoned: Option<String>,
     #[cfg(test)]
     fault: ArchiveWriterFaultInjection,
+}
+
+/// OS-backed exclusive authority for the complete logical archive.
+///
+/// The file is only a stable rendezvous point; its contents and existence are
+/// not the proof of ownership. The OS lock is released when this handle is
+/// dropped, including process termination.
+#[derive(Debug)]
+struct ArchiveLock {
+    _file: File,
+}
+
+fn acquire_archive_authority(archive_root: &Path) -> io::Result<Arc<ArchiveAuthority>> {
+    let canonical_name = archive_root
+        .canonicalize()
+        .ok()
+        .and_then(|path| path.file_name().map(ToOwned::to_owned));
+    let requested_name = archive_root.file_name().and_then(|name| name.to_str());
+    let lock_path = if requested_name == Some("archive")
+        || canonical_name.as_deref().and_then(|name| name.to_str()) == Some("archive")
+    {
+        session_lock_path(archive_root.parent().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "archive path has no parent")
+        })?)?
+    } else {
+        archive_lock_path(archive_root)?
+    };
+    Ok(Arc::new(ArchiveAuthority {
+        _lock: Some(ArchiveLock::acquire_at(&lock_path)?),
+    }))
+}
+
+fn acquire_session_authority(root: &Path) -> io::Result<Arc<ArchiveAuthority>> {
+    Ok(Arc::new(ArchiveAuthority {
+        _lock: Some(ArchiveLock::acquire_at(&session_lock_path(root)?)?),
+    }))
+}
+
+impl ArchiveLock {
+    fn acquire_at(lock_path: &Path) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        match file.try_lock_exclusive()? {
+            true => Ok(Self { _file: file }),
+            false => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "ArchiveAlreadyLocked: another writer owns this archive",
+            )),
+        }
+    }
+}
+
+fn session_lock_path(root: &Path) -> io::Result<PathBuf> {
+    let parent = root
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "archive root has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let canonical_parent = fs::canonicalize(parent)?;
+    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| {
+        canonical_parent.join(
+            root.file_name()
+                .expect("root parent implies a final component"),
+        )
+    });
+    let rendezvous_parent = canonical_root.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "canonical archive root has no parent",
+        )
+    })?;
+    let root_name = canonical_root.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "canonical archive root has no name",
+        )
+    })?;
+    Ok(rendezvous_parent.join(format!(
+        ".memoria-{}-archive.writer.lock",
+        root_name.to_string_lossy()
+    )))
+}
+
+fn archive_lock_path(archive_root: &Path) -> io::Result<PathBuf> {
+    let parent = archive_root
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "archive path has no parent"))?;
+    fs::create_dir_all(parent)?;
+    let canonical_parent = fs::canonicalize(parent)?;
+    let parent_name = parent.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "archive parent has no final component",
+        )
+    })?;
+    let requested_archive_name = archive_root.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "archive path has no final component",
+        )
+    })?;
+    let requested_parent = canonical_parent.clone();
+    let canonical_archive = if archive_root.exists() {
+        fs::canonicalize(archive_root)?
+    } else {
+        requested_parent.join(requested_archive_name)
+    };
+    let canonical_parent = canonical_archive
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "archive has no parent"))?;
+    let archive_name = canonical_archive.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "archive has no final component",
+        )
+    })?;
+    Ok(canonical_parent.join(format!(
+        ".memoria-{}-{}.writer.lock",
+        canonical_parent
+            .file_name()
+            .unwrap_or(parent_name)
+            .to_string_lossy(),
+        archive_name.to_string_lossy()
+    )))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1822,9 +1987,11 @@ impl ArchiveWriter {
     }
 
     pub fn open(root: &Path, segment_bytes: u64) -> io::Result<Self> {
-        Self::open_with_authority(root, segment_bytes, Arc::new(ArchiveAuthority))
+        let authority = acquire_archive_authority(root)?;
+        Self::open_with_authority(root, segment_bytes, authority)
     }
 
+    #[cfg(test)]
     pub(crate) fn open_for_catalogue(
         root: &Path,
         segment_bytes: u64,
@@ -2991,12 +3158,9 @@ fn create_catalogue_with_authority(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn create_catalogue(path: &Path) -> rusqlite::Result<CatalogueConnection> {
-    create_catalogue_with_authority(path, Arc::new(ArchiveAuthority))
-}
-
-pub fn initialize_catalogue(path: &Path) -> rusqlite::Result<()> {
-    create_catalogue(path).map(|_| ())
+    create_catalogue_with_authority(path, Arc::new(ArchiveAuthority { _lock: None }))
 }
 
 #[derive(Clone, Copy)]
@@ -3788,7 +3952,7 @@ pub(crate) fn open_catalogue(path: &Path) -> rusqlite::Result<CatalogueConnectio
     configure_catalogue_runtime(&connection)?;
     Ok(CatalogueConnection {
         connection,
-        authority: Arc::new(ArchiveAuthority),
+        authority: Arc::new(ArchiveAuthority { _lock: None }),
     })
 }
 
@@ -3809,8 +3973,9 @@ fn create_catalogue_for_authority(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn create_metadata(path: &Path) -> rusqlite::Result<CatalogueConnection> {
-    create_catalogue_for_authority(path, Arc::new(ArchiveAuthority))
+    create_catalogue_for_authority(path, Arc::new(ArchiveAuthority { _lock: None }))
 }
 
 fn insert_metadata(
@@ -4024,7 +4189,7 @@ pub fn imap_known_uid_validity(
         .map(|value| value.map(|value| value as u32))
 }
 
-pub fn upsert_imap_scan_state(
+pub(crate) fn upsert_imap_scan_state(
     connection: &Connection,
     source_account: &str,
     mailbox: &str,
@@ -4046,7 +4211,7 @@ pub fn upsert_imap_scan_state(
     Ok(())
 }
 
-pub fn upsert_imap_mailbox(
+pub(crate) fn upsert_imap_mailbox(
     connection: &Connection,
     source_account: &str,
     mailbox: &str,
@@ -4338,20 +4503,7 @@ pub(crate) fn publish_catalogue_batch(
     transaction.commit()
 }
 
-pub fn update_gmail_labels(
-    connection: &Connection,
-    source_account: &str,
-    gmail_id: &str,
-    labels_json: &str,
-) -> rusqlite::Result<()> {
-    connection.execute(
-        "UPDATE gmail_messages SET label_ids=?3,last_seen_unix=?4,source_state='present' WHERE source_account=?1 AND gmail_message_id=?2",
-        params![source_account, gmail_id, labels_json, chrono_like_now()],
-    )?;
-    Ok(())
-}
-
-pub fn repair_gmail_metadata(
+pub(crate) fn repair_gmail_metadata(
     connection: &Connection,
     source_account: &str,
     gmail_id: &str,
@@ -4367,15 +4519,7 @@ pub fn repair_gmail_metadata(
     Ok(())
 }
 
-pub fn mark_gmail_deleted(
-    connection: &Connection,
-    source_account: &str,
-    gmail_id: &str,
-) -> rusqlite::Result<()> {
-    mark_gmail_deleted_at_history(connection, source_account, gmail_id, None)
-}
-
-pub fn mark_gmail_deleted_at_history(
+pub(crate) fn mark_gmail_deleted_at_history(
     connection: &Connection,
     source_account: &str,
     gmail_id: &str,
@@ -4388,7 +4532,7 @@ pub fn mark_gmail_deleted_at_history(
     Ok(())
 }
 
-pub fn mark_gmail_missing_from_full_sync(
+pub(crate) fn mark_gmail_missing_from_full_sync(
     connection: &Connection,
     source_account: &str,
     seen_ids: &std::collections::HashSet<String>,
@@ -4423,7 +4567,7 @@ pub fn gmail_state(
         .transpose()
 }
 
-pub fn set_gmail_state(
+pub(crate) fn set_gmail_state(
     connection: &Connection,
     source_account: &str,
     history_id: &str,
@@ -5574,12 +5718,8 @@ pub fn build_archive(
     config: CorpusConfig,
     segment_bytes: u64,
 ) -> io::Result<(DatasetStats, u64)> {
-    fs::create_dir_all(root)?;
-    let archive_root = root.join("archive");
-    let metadata_path = root.join("metadata.sqlite");
-    let mut writer = ArchiveWriter::open(&archive_root, segment_bytes)?;
-    let metadata = create_catalogue_for_authority(&metadata_path, Arc::clone(&writer.authority))
-        .map_err(sqlite_io)?;
+    let mut session = ArchiveSession::create(root, segment_bytes)?;
+    let (writer, metadata) = session.parts_mut();
     let mut staged = Vec::new();
     let mut sizes = Vec::with_capacity(config.messages.min(1_000_000) as usize);
     let mut bytes = 0u64;
@@ -5632,13 +5772,13 @@ pub fn build_archive(
             || writer.pending_raw().1 >= CATALOGUE_BATCH_BYTES_LIMIT
         {
             let durable = writer.durable_barrier()?;
-            publish_catalogue_batch(&metadata, &staged, &durable).map_err(sqlite_io)?;
+            publish_catalogue_batch(metadata, &staged, &durable).map_err(sqlite_io)?;
             staged.clear();
         }
     }
     if !staged.is_empty() {
         let durable = writer.durable_barrier()?;
-        publish_catalogue_batch(&metadata, &staged, &durable).map_err(sqlite_io)?;
+        publish_catalogue_batch(metadata, &staged, &durable).map_err(sqlite_io)?;
     }
     sizes.sort_unstable();
     let duplicate_sizes = duplicate_sizes(&attachment_counts, &unique_attachment_sizes);
@@ -6206,6 +6346,20 @@ mod tests {
                 .unwrap(),
             1
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn session_authority_survives_writer_replacement() {
+        let root = raw_read_test_root("session-authority-lifetime");
+        let _ = fs::remove_dir_all(&root);
+        let mut session = ArchiveSession::create(&root, 4096).unwrap();
+        session.replace_writer_for_test();
+        let error = ArchiveWriter::open(&root.join("archive"), 4096).unwrap_err();
+        assert!(error.to_string().contains("ArchiveAlreadyLocked"));
+        drop(session);
+        let writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        drop(writer);
         let _ = fs::remove_dir_all(root);
     }
 

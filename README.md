@@ -80,6 +80,12 @@ line tools; it does not start a CLI subprocess.
   identities and provenance needed for lookup and reconciliation, alongside
   mutable source state and derived navigation metadata. It is not itself the
   byte authority and is not wholly disposable in the current design.
+- Tier A writing is single-writer enforced. `ArchiveWriter` acquires one
+  exclusive OS file lock for the logical archive before opening or creating
+  RAW segments or the RW catalogue; a competing writer fails with
+  `ArchiveAlreadyLocked`. The lock is released automatically on normal drop or
+  process crash, and belongs to the session authority rather than only the
+  RAW writer. Multiwriter is deliberately unsupported.
 - Tantivy stores a derived, reconstructible search index. Its schema may evolve
   independently from the RAW archive.
 - MIME parsing, text extraction, attachment listing and HTML rendering are
@@ -228,6 +234,17 @@ The archive is intentionally not a mirror that destructively follows Gmail.
 Content-addressed attachment storage was evaluated separately and is not
 adopted in the current RAW-inline authority path.
 
+Readers do not acquire the archive writer lock and may run while a writer
+exists. `archive_summary`, inventory and physical RAW inspection are strict
+read-only; some legacy catalogue-backed search/RAW helpers still open SQLite
+through the existing RW runtime configuration, but do not obtain RAW-write
+authority. The persistent lock file is only a rendezvous point; the OS lock is
+authoritative and remains outside the resettable archive subtree. Linux/Unix
+and macOS use the platform file-lock
+primitive through `fs4`, and Windows uses `LockFileEx` through the same crate.
+This is a local-filesystem guarantee, not a distributed NFS/SMB protocol, and
+rename of an archive while it is in use is outside the contract.
+
 ## Current platform status
 
 ### Linux / KDE Wayland
@@ -311,3 +328,6 @@ These are future directions, not current promises.
   open.
 - Memoria is not yet a stabilized release with a packaged installer or signed
   distribution.
+- The archive contract is `single-writer enforced; multiwriter deliberately
+  unsupported`. A second writer can reopen after the first writer drops or its
+  process exits; stale lock files do not require manual removal.

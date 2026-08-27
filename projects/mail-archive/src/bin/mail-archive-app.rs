@@ -509,10 +509,9 @@ fn initialize_archive(path: &std::path::Path) -> Result<(), String> {
             return Err("Le dossier choisi n’est pas vide ; choisissez un nouveau dossier".into());
         }
     }
-    fs::create_dir_all(path).map_err(|error| error.to_string())?;
-    fs::create_dir_all(path.join("archive")).map_err(|error| error.to_string())?;
-    mail_archive_experiment::initialize_catalogue(&path.join("metadata.sqlite"))
+    let session = mail_archive_experiment::ArchiveSession::create(path, 64 * 1024 * 1024)
         .map_err(|error| error.to_string())?;
+    drop(session);
     GmailSearchIndex::open(path).map_err(|error| error.to_string())?;
     index_gmail_archive(path).map_err(|error| error.to_string())?;
     Ok(())

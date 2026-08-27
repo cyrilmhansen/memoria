@@ -999,3 +999,49 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
   conserve maintenant la revendication `segment + offset` avant de valider
   `doc_id` et `frame_bytes`. Une ligne négative mais physiquement localisable
   empêche donc `OrphanValidated` et produit `CataloguedInconsistent`.
+
+## 2026-08-27 — Tier A : single-writer inter-processus
+
+- **Inventaire vérifié :** avant cette passe, `ArchiveWriter::open` créait ou
+  ouvrait le segment avant toute contention inter-processus. SQLite fournissait
+  seulement une contention indirecte sur le catalogue; elle ne protégeait pas
+  les segments RAW. Gmail et IMAP ouvraient aussi leur catalogue RW avant leur
+  writer. Aucun lockfile, `flock`, `fcntl`, `FileExt`, PID file ou `create_new`
+  ne constituait une autorité d’archive complète.
+- **Correction :** `fs4 0.13.1` est déclaré directement. Un lock exclusif OS
+  stable, hors du sous-arbre resettable de l’archive logique, est acquis avant
+  `create_dir_all(archive)`,
+  l’ouverture/création de segment et toute création/ouverture RW SQLite.
+  `ArchiveAuthority` garde le handle au-delà du lifetime de
+  `ArchiveWriter`; le fichier persistant est un rendez-vous uniquement et
+  l’OS porte l’autorité.
+- **Surface fermée :** `ArchiveSession`, création UI, Gmail, IMAP, corpus et
+  benchmark utilisent le même contrat. A3.2 reste intact : le lock complète,
+  sans la remplacer, l’association `DurableRawBatch`/catalogue et le refus
+  cross-archive.
+- **Faits vérifiés :** second writer intra-processus et inter-processus refusé
+  avant mutation observable; archives distinctes indépendantes; sortie normale
+  et kill brutal du processus enfant libèrent le lock; alias relatif et
+  symlink existant convergent par canonicalisation du rendez-vous. Les
+  lecteurs read-only ne prennent pas le lock.
+- **Limites :** protection des filesystems locaux uniquement; pas de verrou
+  distribué NFS/SMB ni d’identité préservée lors d’un rename en utilisation.
+  Aucun protocole PID stale n’est utilisé.
+- **Validation ciblée :** `cargo test -p mail-archive-experiment --test
+  archive_lock -- --nocapture` passe. Validation globale ci-dessous.
+- **Décision :** `single-writer enforced; multiwriter deliberately unsupported`.
+
+## 2026-08-28 — Correction Sol High du chantier single-writer
+
+- **Corrections vérifiées :** le guard a été déplacé dans `ArchiveAuthority`,
+  `ArchiveSession::reset` verrouille avant suppression, le rendez-vous est
+  sibling du conteneur supprimable, et le benchmark ne précrée plus
+  `archive/`. Les mutateurs catalogue acceptant une `Connection` arbitraire
+  sont désormais internes; les helpers de création restants sont `cfg(test)`.
+- **Tests ciblés :** remplacement du writer avec catalogue/session survivants,
+  drop order, reset refusé puis réussi après libération, reset CLI réel,
+  création concurrente d’une cible inexistante, sortie normale, kill brutal,
+  alias relatif/symlink et archives A/B indépendantes.
+- **Décision :** la propriété reste `single-writer enforced; multiwriter
+  deliberately unsupported`; NFS/SMB et rename concurrent restent hors
+  garantie.

@@ -7,8 +7,7 @@ use mail_archive_experiment::{
 use serde_json::json;
 use std::env;
 use std::fs;
-use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -45,11 +44,6 @@ fn option(args: &[String], name: &str) -> Option<String> {
     args.windows(2)
         .find(|pair| pair[0] == name)
         .map(|pair| pair[1].clone())
-}
-
-fn safe_archive(path: &Path) -> io::Result<()> {
-    fs::create_dir_all(path.join("archive"))?;
-    Ok(())
 }
 
 fn labels(hash: u64) -> Vec<String> {
@@ -387,7 +381,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if out.exists() && out.join("metadata.sqlite").exists() {
         return Err("refusing to overwrite an existing campaign directory".into());
     }
-    safe_archive(&out)?;
     let running = Arc::new(AtomicBool::new(true));
     let peak = Arc::new(AtomicU64::new(0));
     let sampler = {

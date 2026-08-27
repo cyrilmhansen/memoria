@@ -920,18 +920,18 @@ pub fn sync_account_with_progress<T: GmailTransport, P: FnMut(&SyncProgress)>(
     mut progress: P,
 ) -> Result<SyncStats, GmailError> {
     let started = std::time::Instant::now();
-    fs::create_dir_all(root).map_err(|error| GmailError::Io(error.to_string()))?;
-    let metadata_path = root.join("metadata.sqlite");
-    let mut connection = crate::create_metadata(&metadata_path)
-        .map_err(|error| GmailError::Other(error.to_string()))?;
-    let state = crate::gmail_state(&connection, source_account)
+    let mut session = crate::ArchiveSession::create(root, 64 * 1024 * 1024)
+        .map_err(|error| GmailError::Io(error.to_string()))?;
+    let (writer, connection) = session.parts_mut();
+    let state = crate::gmail_state(connection, source_account)
         .map_err(|error| GmailError::Other(error.to_string()))?;
     let mut stats = SyncStats::default();
     if query.is_some() || max_messages.is_some() {
         stats.full_sync = true;
         full_sync(
             root,
-            &mut connection,
+            connection,
+            writer,
             source_account,
             transport,
             query,
@@ -947,7 +947,8 @@ pub fn sync_account_with_progress<T: GmailTransport, P: FnMut(&SyncProgress)>(
             stats.full_sync = true;
             full_sync(
                 root,
-                &mut connection,
+                connection,
+                writer,
                 source_account,
                 transport,
                 query,
@@ -959,7 +960,8 @@ pub fn sync_account_with_progress<T: GmailTransport, P: FnMut(&SyncProgress)>(
             stats.full_sync = false;
             match incremental_sync(
                 root,
-                &mut connection,
+                connection,
+                writer,
                 source_account,
                 transport,
                 &history_id,
@@ -971,7 +973,8 @@ pub fn sync_account_with_progress<T: GmailTransport, P: FnMut(&SyncProgress)>(
                     stats.full_sync = true;
                     full_sync(
                         root,
-                        &mut connection,
+                        connection,
+                        writer,
                         source_account,
                         transport,
                         query,
@@ -987,7 +990,8 @@ pub fn sync_account_with_progress<T: GmailTransport, P: FnMut(&SyncProgress)>(
         stats.full_sync = true;
         full_sync(
             root,
-            &mut connection,
+            connection,
+            writer,
             source_account,
             transport,
             query,
@@ -1004,6 +1008,7 @@ pub fn sync_account_with_progress<T: GmailTransport, P: FnMut(&SyncProgress)>(
 fn full_sync<T: GmailTransport>(
     root: &Path,
     connection: &mut crate::CatalogueConnection,
+    writer: &mut crate::ArchiveWriter,
     source: &str,
     transport: &mut T,
     query: Option<&str>,
@@ -1011,12 +1016,6 @@ fn full_sync<T: GmailTransport>(
     stats: &mut SyncStats,
     progress: &mut dyn FnMut(&SyncProgress),
 ) -> Result<(), GmailError> {
-    let mut writer = crate::ArchiveWriter::open_for_catalogue(
-        &root.join("archive"),
-        64 * 1024 * 1024,
-        connection,
-    )
-    .map_err(|error| GmailError::Io(error.to_string()))?;
     let mut page = None;
     let mut listed_messages = Vec::new();
     let reconcile = max.is_none() && query.is_none();
@@ -1088,7 +1087,7 @@ fn full_sync<T: GmailTransport>(
         ensure_gmail_message_id_available(connection, source, &listed.id)?;
         let raw = transport.get_raw(&listed.id)?;
         import_raw(
-            &mut writer,
+            writer,
             source,
             &raw,
             stats,
@@ -1097,23 +1096,11 @@ fn full_sync<T: GmailTransport>(
             &mut pending_ids,
         )?;
         if batch_full(&staged) {
-            flush_batch(
-                connection,
-                &mut writer,
-                &mut staged,
-                &mut pending_ids,
-                stats,
-            )?;
+            flush_batch(connection, writer, &mut staged, &mut pending_ids, stats)?;
         }
         progress(&progress_snapshot_with_batch(stats, total, &staged));
     }
-    flush_batch_if_needed(
-        connection,
-        &mut writer,
-        &mut staged,
-        &mut pending_ids,
-        stats,
-    )?;
+    flush_batch_if_needed(connection, writer, &mut staged, &mut pending_ids, stats)?;
     if complete {
         let missing = connection
             .prepare("SELECT gmail_message_id FROM gmail_messages WHERE source_account=?1 AND source_state='present'")
@@ -1143,6 +1130,7 @@ fn full_sync<T: GmailTransport>(
 fn incremental_sync<T: GmailTransport>(
     root: &Path,
     connection: &mut crate::CatalogueConnection,
+    writer: &mut crate::ArchiveWriter,
     source: &str,
     transport: &mut T,
     start: &str,
@@ -1151,12 +1139,6 @@ fn incremental_sync<T: GmailTransport>(
     progress: &mut dyn FnMut(&SyncProgress),
 ) -> Result<(), GmailError> {
     let mut page = None;
-    let mut writer = crate::ArchiveWriter::open_for_catalogue(
-        &root.join("archive"),
-        64 * 1024 * 1024,
-        connection,
-    )
-    .map_err(|error| GmailError::Io(error.to_string()))?;
     let mut next_doc_id =
         crate::next_doc_id(connection).map_err(|error| GmailError::Other(error.to_string()))?;
     let mut staged = Vec::new();
@@ -1209,7 +1191,7 @@ fn incremental_sync<T: GmailTransport>(
         connection,
         source,
         transport,
-        &mut writer,
+        writer,
         &mut next_doc_id,
         &mut staged,
         &mut pending_ids,
@@ -2425,6 +2407,7 @@ mod tests {
             &durable.entries()[0],
         )
         .unwrap();
+        drop(durable);
         drop(writer);
         let mut transport = Fixture {
             pages: vec![ListPage::default()],

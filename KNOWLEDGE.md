@@ -22,6 +22,23 @@ applications. Les expériences détaillées, mesures et échecs restent dans
 
 Cette section sera enrichie uniquement par des expériences reproductibles.
 
+- **Memoria / single-writer — fait vérifié le 2026-08-27 :** `ArchiveWriter`
+  acquiert avant toute ouverture mutable de segment un lock exclusif OS sur un
+  fichier de rendez-vous stable, hors du sous-arbre supprimable de l’archive.
+  Le guard appartient à `ArchiveAuthority`, pas seulement à `ArchiveWriter`;
+  il survit donc à son remplacement tant que catalogue/session/reçus liés
+  existent. `ArchiveSession`, création UI, Gmail, IMAP, corpus et benchmark
+  utilisent cette autorité. Un second writer échoue avec
+  `ArchiveAlreadyLocked`, avant segment, catalogue RW, sidecar SQLite,
+  frontier ou `next_doc_id`; l’existence du fichier n’est jamais la preuve.
+  `fs4 0.13.1` utilise `flock` sur Unix/macOS et `LockFileEx` sur Windows.
+  Le handle vit avec l’autorité de session et l’OS libère le lock après drop
+  ou crash. `ArchiveSession::reset` prend le même lock avant de supprimer et
+  recréer l’archive.
+  Les lectures read-only restent concurrentes. Voir
+  [`archive_lock.rs`](projects/mail-archive/tests/archive_lock.rs).
+  **Décision :** single-writer enforced; multiwriter deliberately unsupported.
+
 - **Slint 1.17.1 — fait vérifié le 2026-08-20 :** le code Rust est généré
   depuis `ui/app.slint` par `slint-build`; la configuration retenue utilise
   le backend Winit, le renderer logiciel et l'accessibilité, sans WebView.

@@ -80,7 +80,7 @@ fn print_stats(
 }
 
 fn generate(
-    out: &PathBuf,
+    out: &Path,
     config: CorpusConfig,
     segment_bytes: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -327,15 +327,13 @@ fn search(args: &[String], default_out: &Path) -> Result<(), Box<dyn std::error:
 }
 
 fn benchmark(
-    out: &PathBuf,
+    out: &Path,
     config: CorpusConfig,
     query_repetitions: usize,
     segment_bytes: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if out.exists() {
-        fs::remove_dir_all(out)?;
-    }
-    fs::create_dir_all(out)?;
+    let reset = ArchiveSession::reset(out, segment_bytes)?;
+    drop(reset);
     let started = Instant::now();
     let (stats, archive_bytes) = build_archive(out, config, segment_bytes)?;
     let import_ms = started.elapsed().as_millis();

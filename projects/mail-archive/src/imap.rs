@@ -127,27 +127,22 @@ pub fn sync_imap(root: &Path, config: &ImapConfig) -> Result<ImapSyncStats, Imap
     if config.limit == Some(0) {
         return Err(ImapError::Config("limit must be greater than zero".into()));
     }
-    let metadata = crate::create_metadata(&root.join("metadata.sqlite"))
+    let mut session = crate::ArchiveSession::create(root, 64 * 1024 * 1024)
         .map_err(|error| ImapError::Io(error.to_string()))?;
+    let (writer, metadata) = session.parts_mut();
     let known_uid_validity =
-        crate::imap_known_uid_validity(&metadata, &config.source_account, &config.mailbox)
+        crate::imap_known_uid_validity(metadata, &config.source_account, &config.mailbox)
             .map_err(|error| ImapError::Io(error.to_string()))?;
-    let scan_state = crate::imap_scan_state(&metadata, &config.source_account, &config.mailbox)
+    let scan_state = crate::imap_scan_state(metadata, &config.source_account, &config.mailbox)
         .map_err(|error| ImapError::Io(error.to_string()))?;
     let frontier_before = scan_state.map(|(_, frontier)| frontier).unwrap_or(0);
 
-    let mut writer = crate::ArchiveWriter::open_for_catalogue(
-        &root.join("archive"),
-        64 * 1024 * 1024,
-        &metadata,
-    )
-    .map_err(|error| ImapError::Io(error.to_string()))?;
     let mut stats = ImapSyncStats {
         frontier_before,
         ..Default::default()
     };
     let mut next_doc_id =
-        crate::next_doc_id(&metadata).map_err(|error| ImapError::Io(error.to_string()))?;
+        crate::next_doc_id(metadata).map_err(|error| ImapError::Io(error.to_string()))?;
     let mut staged = Vec::new();
     let mut pending_ids = HashSet::new();
     let runtime = Builder::new_multi_thread()
@@ -170,7 +165,7 @@ pub fn sync_imap(root: &Path, config: &ImapConfig) -> Result<ImapSyncStats, Imap
             stats.network_bytes += message.raw.len() as u64;
             if imap_identity_is_valid(
                 root,
-                &metadata,
+                metadata,
                 &config.source_account,
                 &config.mailbox,
                 message.uid_validity,
@@ -188,7 +183,7 @@ pub fn sync_imap(root: &Path, config: &ImapConfig) -> Result<ImapSyncStats, Imap
                 return Ok(());
             }
             ensure_imap_message_id_available(
-                &metadata,
+                metadata,
                 &config.source_account,
                 &config.mailbox,
                 message.uid_validity,
@@ -215,13 +210,7 @@ pub fn sync_imap(root: &Path, config: &ImapConfig) -> Result<ImapSyncStats, Imap
                 location,
             ));
             if batch_full(&staged) {
-                flush_batch(
-                    &metadata,
-                    &mut writer,
-                    &mut staged,
-                    &mut pending_ids,
-                    &mut stats,
-                )?;
+                flush_batch(metadata, writer, &mut staged, &mut pending_ids, &mut stats)?;
             }
             Ok(())
         },
@@ -231,16 +220,10 @@ pub fn sync_imap(root: &Path, config: &ImapConfig) -> Result<ImapSyncStats, Imap
     stats.uid_validity = fetch_result.uid_validity;
     stats.uid_next = fetch_result.uid_next;
     stats.examined = fetch_result.examined;
-    flush_batch_if_needed(
-        &metadata,
-        &mut writer,
-        &mut staged,
-        &mut pending_ids,
-        &mut stats,
-    )?;
+    flush_batch_if_needed(metadata, writer, &mut staged, &mut pending_ids, &mut stats)?;
     if let Some(scanned_through_uid) = fetch_result.scanned_through_uid {
         crate::upsert_imap_scan_state(
-            &metadata,
+            metadata,
             &config.source_account,
             &config.mailbox,
             fetch_result.uid_validity,
@@ -252,9 +235,6 @@ pub fn sync_imap(root: &Path, config: &ImapConfig) -> Result<ImapSyncStats, Imap
     } else {
         stats.frontier_after = Some(frontier_before);
     }
-    drop(writer);
-    drop(metadata);
-
     stats.index = Some(
         crate::index_gmail_archive(root)
             .map_err(|error| ImapError::Io(format!("update search index: {error}")))?,
@@ -373,11 +353,12 @@ pub fn sync_imap_mailboxes(
     config: &ImapConfig,
 ) -> Result<ImapMultiSyncStats, ImapError> {
     let discovery = discover_mailboxes(config)?;
-    let metadata = crate::create_metadata(&root.join("metadata.sqlite"))
+    let mut session = crate::ArchiveSession::create(root, 64 * 1024 * 1024)
         .map_err(|error| ImapError::Io(error.to_string()))?;
+    let (_, metadata) = session.parts_mut();
     for mailbox in &discovery.mailboxes {
         crate::upsert_imap_mailbox(
-            &metadata,
+            metadata,
             &config.source_account,
             &mailbox.name,
             mailbox.delimiter.as_deref(),
@@ -389,7 +370,7 @@ pub fn sync_imap_mailboxes(
         )
         .map_err(|error| ImapError::Io(error.to_string()))?;
     }
-    drop(metadata);
+    drop(session);
     let selected = if config.all_mailboxes {
         discovery
             .mailboxes

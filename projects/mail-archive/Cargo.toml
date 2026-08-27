@@ -9,6 +9,7 @@ build = "build.rs"
 ammonia = "4.1.4"
 async-imap = { version = "0.11.3", default-features = false, features = ["runtime-tokio"] }
 flate2 = "1.1"
+fs4 = "0.13.1"
 futures = "0.3"
 blake3 = "1.8"
 base64 = "0.22"
