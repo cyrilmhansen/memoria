@@ -511,7 +511,7 @@ fn initialize_archive(path: &std::path::Path) -> Result<(), String> {
     }
     fs::create_dir_all(path).map_err(|error| error.to_string())?;
     fs::create_dir_all(path.join("archive")).map_err(|error| error.to_string())?;
-    mail_archive_experiment::create_catalogue(&path.join("metadata.sqlite"))
+    mail_archive_experiment::initialize_catalogue(&path.join("metadata.sqlite"))
         .map_err(|error| error.to_string())?;
     GmailSearchIndex::open(path).map_err(|error| error.to_string())?;
     index_gmail_archive(path).map_err(|error| error.to_string())?;
@@ -1784,10 +1784,7 @@ mod tests {
         ));
         let destination = root.join("exports");
         fs::create_dir_all(&destination).unwrap();
-        let catalog =
-            mail_archive_experiment::create_metadata(&root.join("metadata.sqlite")).unwrap();
-        let mut writer =
-            mail_archive_experiment::ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        let mut session = mail_archive_experiment::ArchiveSession::create(&root, 4096).unwrap();
         let mut raws = Vec::new();
         for (id, subject) in [
             (0_u64, "same subject"),
@@ -1813,13 +1810,19 @@ mod tests {
                 attachments: Vec::new(),
                 raw: raw.clone(),
             };
-            let location = writer.append(&message).unwrap();
-            mail_archive_experiment::insert_metadata(&catalog, &message, &location).unwrap();
-            raws.push(raw);
+            let pending = session.writer_mut().append(&message).unwrap();
+            raws.push((raw, message, pending));
         }
-        writer.sync().unwrap();
-        drop(writer);
-        drop(catalog);
+        let durable = session.writer_mut().durable_barrier().unwrap();
+        let batch = raws
+            .iter_mut()
+            .map(|(_, message, pending)| {
+                mail_archive_experiment::CatalogueBatchRecord::new(message.clone(), pending.clone())
+            })
+            .collect::<Vec<_>>();
+        session.publish_catalogue_batch(&batch, &durable).unwrap();
+        let raws = raws.into_iter().map(|(raw, _, _)| raw).collect::<Vec<_>>();
+        drop(session);
 
         let existing = destination.join("date-same subject.eml");
         fs::write(&existing, b"must-not-be-overwritten").unwrap();

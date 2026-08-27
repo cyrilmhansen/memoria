@@ -7,6 +7,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::ops::Bound;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tantivy::collector::TopDocs;
 use tantivy::indexer::{IndexWriterOptions, NoMergePolicy};
@@ -39,6 +40,8 @@ pub const MEMORIA_CATALOGUE_APPLICATION_ID: i64 = 0x4d_45_4d_31;
 pub const MEMORIA_CATALOGUE_VERSION: i64 = 1;
 const FRAME_MAGIC: &[u8; 8] = b"MAARC001";
 const FRAME_HEADER_BYTES: u64 = 32;
+const CATALOGUE_BATCH_RECORD_LIMIT: usize = 256;
+const CATALOGUE_BATCH_BYTES_LIMIT: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Attachment {
@@ -197,50 +200,213 @@ pub struct RawReference {
     pub blake3: [u8; 32],
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Opaque token for one RAW append that has not crossed a durable barrier.
+///
+/// It deliberately exposes neither archive coordinates nor a content digest.
+#[derive(Clone, Debug)]
 pub struct PendingRawLocation {
-    pub reference: RawReference,
-    pub batch_id: u64,
-    pub ordinal: u64,
+    batch: Arc<RawBatchIdentity>,
+    ordinal: usize,
+    doc_id: u64,
+    frame_bytes: u64,
 }
 
-impl std::ops::Deref for PendingRawLocation {
-    type Target = ArchiveLocation;
+#[derive(Debug)]
+struct RawBatchIdentity;
+
+#[derive(Debug)]
+struct ArchiveAuthority;
+
+pub(crate) struct CatalogueConnection {
+    connection: Connection,
+    authority: Arc<ArchiveAuthority>,
+}
+
+impl std::ops::Deref for CatalogueConnection {
+    type Target = Connection;
 
     fn deref(&self) -> &Self::Target {
-        &self.reference.location
+        &self.connection
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DurableRawBatch {
-    pub batch_id: u64,
-    pub records: u64,
-    pub frame_bytes: u64,
+impl std::ops::DerefMut for CatalogueConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
 }
 
-pub(crate) struct GmailBatchRecord {
-    pub source_account: String,
-    pub gmail_id: String,
-    pub doc_id: i64,
-    pub thread_id: String,
-    pub label_ids_json: String,
-    pub internal_date_ms: Option<i64>,
-    pub message_history_id: Option<String>,
-    pub location: PendingRawLocation,
+/// A publishable RAW reference created only by [`ArchiveWriter::durable_barrier`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DurableRawLocation {
+    reference: RawReference,
+}
+
+impl DurableRawLocation {
+    pub fn reference(&self) -> &RawReference {
+        &self.reference
+    }
+}
+
+/// Exact set of RAW entries covered by one successful durable barrier.
+#[derive(Clone, Debug)]
+pub struct DurableRawBatch {
+    batch: Arc<RawBatchIdentity>,
+    authority: Arc<ArchiveAuthority>,
+    entries: Vec<DurableRawLocation>,
+    frame_bytes: u64,
+}
+
+impl DurableRawBatch {
+    pub fn entries(&self) -> &[DurableRawLocation] {
+        &self.entries
+    }
+
+    pub fn records(&self) -> u64 {
+        self.entries.len() as u64
+    }
+
+    pub fn frame_bytes(&self) -> u64 {
+        self.frame_bytes
+    }
+}
+
+/// Opaque catalogue/archive pair for the safe public publication API.
+pub struct ArchiveSession {
+    writer: ArchiveWriter,
+    catalogue: CatalogueConnection,
+}
+
+impl ArchiveSession {
+    pub fn create(root: &Path, segment_bytes: u64) -> io::Result<Self> {
+        fs::create_dir_all(root)?;
+        let writer = ArchiveWriter::open(&root.join("archive"), segment_bytes)?;
+        let catalogue = create_catalogue_for_authority(
+            &root.join("metadata.sqlite"),
+            Arc::clone(&writer.authority),
+        )
+        .map_err(sqlite_io)?;
+        Ok(Self { writer, catalogue })
+    }
+
+    pub fn writer_mut(&mut self) -> &mut ArchiveWriter {
+        &mut self.writer
+    }
+
+    pub fn publish_catalogue_batch(
+        &self,
+        batch: &[CatalogueBatchRecord],
+        durable: &DurableRawBatch,
+    ) -> rusqlite::Result<()> {
+        publish_catalogue_batch(&self.catalogue, batch, durable)
+    }
+
+    pub fn publish_gmail_batch(
+        &self,
+        batch: &[GmailBatchRecord],
+        durable: &DurableRawBatch,
+    ) -> rusqlite::Result<()> {
+        publish_gmail_batch(&self.catalogue, batch, durable)
+    }
+}
+
+/// Gmail metadata staged before durability; it cannot expose a RAW location.
+pub struct GmailBatchRecord {
+    source_account: String,
+    gmail_id: String,
+    doc_id: i64,
+    thread_id: String,
+    label_ids_json: String,
+    internal_date_ms: Option<i64>,
+    message_history_id: Option<String>,
+    pending: PendingRawLocation,
+}
+
+impl GmailBatchRecord {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        source_account: String,
+        gmail_id: String,
+        doc_id: i64,
+        thread_id: String,
+        label_ids_json: String,
+        internal_date_ms: Option<i64>,
+        message_history_id: Option<String>,
+        pending: PendingRawLocation,
+    ) -> Self {
+        Self {
+            source_account,
+            gmail_id,
+            doc_id,
+            thread_id,
+            label_ids_json,
+            internal_date_ms,
+            message_history_id,
+            pending,
+        }
+    }
+
+    pub(crate) fn frame_bytes(&self) -> u64 {
+        self.pending.frame_bytes
+    }
 }
 
 pub(crate) struct ImapBatchRecord {
-    pub source_account: String,
-    pub mailbox: String,
-    pub uid_validity: u32,
-    pub uid: u32,
-    pub flags_json: String,
-    pub internal_date: Option<String>,
-    pub internal_date_ms: Option<i64>,
-    pub rfc822_size: Option<u32>,
-    pub doc_id: i64,
-    pub location: PendingRawLocation,
+    source_account: String,
+    mailbox: String,
+    uid_validity: u32,
+    uid: u32,
+    flags_json: String,
+    internal_date: Option<String>,
+    internal_date_ms: Option<i64>,
+    rfc822_size: Option<u32>,
+    doc_id: i64,
+    pending: PendingRawLocation,
+}
+
+impl ImapBatchRecord {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        source_account: String,
+        mailbox: String,
+        uid_validity: u32,
+        uid: u32,
+        flags_json: String,
+        internal_date: Option<String>,
+        internal_date_ms: Option<i64>,
+        rfc822_size: Option<u32>,
+        doc_id: i64,
+        pending: PendingRawLocation,
+    ) -> Self {
+        Self {
+            source_account,
+            mailbox,
+            uid_validity,
+            uid,
+            flags_json,
+            internal_date,
+            internal_date_ms,
+            rfc822_size,
+            doc_id,
+            pending,
+        }
+    }
+
+    pub(crate) fn frame_bytes(&self) -> u64 {
+        self.pending.frame_bytes
+    }
+}
+
+/// Corpus metadata staged before durability; publication requires its exact durable batch.
+pub struct CatalogueBatchRecord {
+    message: Message,
+    pending: PendingRawLocation,
+}
+
+impl CatalogueBatchRecord {
+    pub fn new(message: Message, pending: PendingRawLocation) -> Self {
+        Self { message, pending }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -663,7 +829,7 @@ pub struct GmailSearchIndex {
     index: Index,
     reader: IndexReader,
     fields: TantivyFields,
-    catalog: Connection,
+    catalog: CatalogueConnection,
 }
 
 impl GmailSearchIndex {
@@ -1513,16 +1679,17 @@ pub fn run_cas(root: &Path, config: CorpusConfig, variant: CasVariant) -> io::Re
 }
 
 pub struct ArchiveWriter {
+    authority: Arc<ArchiveAuthority>,
     root: PathBuf,
     segment_bytes: u64,
     file: File,
     segment_name: String,
     offset: u64,
     segment_number: u64,
-    batch_id: u64,
+    pending_batch: Arc<RawBatchIdentity>,
+    pending_references: Vec<RawReference>,
     pending_records: u64,
     pending_frame_bytes: u64,
-    pending_next_ordinal: u64,
     file_dirty: bool,
     namespace_sync_pending: bool,
     current_segment_created: bool,
@@ -1553,7 +1720,11 @@ struct ArchiveWriterFaultInjection {
 }
 
 impl ArchiveWriter {
-    pub fn open(root: &Path, segment_bytes: u64) -> io::Result<Self> {
+    fn open_with_authority(
+        root: &Path,
+        segment_bytes: u64,
+        authority: Arc<ArchiveAuthority>,
+    ) -> io::Result<Self> {
         fs::create_dir_all(root)?;
         let numbers = fs::read_dir(root)?
             .filter_map(Result::ok)
@@ -1576,16 +1747,17 @@ impl ArchiveWriter {
             .open(&path)?;
         let offset = file.seek(SeekFrom::End(0))?;
         Ok(Self {
+            authority,
             root: root.to_path_buf(),
             segment_bytes: segment_bytes.max(1024),
             file,
             segment_name,
             offset,
             segment_number,
-            batch_id: 0,
+            pending_batch: Arc::new(RawBatchIdentity),
+            pending_references: Vec::new(),
             pending_records: 0,
             pending_frame_bytes: 0,
-            pending_next_ordinal: 0,
             file_dirty: false,
             namespace_sync_pending: false,
             current_segment_created: segment_created,
@@ -1595,6 +1767,18 @@ impl ArchiveWriter {
         })
     }
 
+    pub fn open(root: &Path, segment_bytes: u64) -> io::Result<Self> {
+        Self::open_with_authority(root, segment_bytes, Arc::new(ArchiveAuthority))
+    }
+
+    pub(crate) fn open_for_catalogue(
+        root: &Path,
+        segment_bytes: u64,
+        catalogue: &CatalogueConnection,
+    ) -> io::Result<Self> {
+        Self::open_with_authority(root, segment_bytes, Arc::clone(&catalogue.authority))
+    }
+
     #[cfg(test)]
     fn open_with_faults(
         root: &Path,
@@ -1602,6 +1786,18 @@ impl ArchiveWriter {
         fault: ArchiveWriterFaultInjection,
     ) -> io::Result<Self> {
         let mut writer = Self::open(root, segment_bytes)?;
+        writer.fault = fault;
+        Ok(writer)
+    }
+
+    #[cfg(test)]
+    fn open_for_catalogue_with_faults(
+        root: &Path,
+        segment_bytes: u64,
+        catalogue: &CatalogueConnection,
+        fault: ArchiveWriterFaultInjection,
+    ) -> io::Result<Self> {
+        let mut writer = Self::open_for_catalogue(root, segment_bytes, catalogue)?;
         writer.fault = fault;
         Ok(writer)
     }
@@ -1648,25 +1844,26 @@ impl ArchiveWriter {
         )?;
         self.write_frame_component(ArchiveWriterWriteComponent::Payload, raw)?;
         self.offset += frame_bytes;
+        let ordinal = self.pending_references.len();
         self.pending_records += 1;
         self.pending_frame_bytes += frame_bytes;
-        let ordinal = self.pending_next_ordinal;
-        self.pending_next_ordinal += 1;
+        self.pending_references.push(RawReference {
+            doc_id: id,
+            location: ArchiveLocation {
+                segment: self.segment_name.clone(),
+                offset: start,
+                frame_bytes,
+            },
+            blake3,
+        });
         if self.current_segment_created {
             self.namespace_sync_pending = true;
         }
         Ok(PendingRawLocation {
-            reference: RawReference {
-                doc_id: id,
-                location: ArchiveLocation {
-                    segment: self.segment_name.clone(),
-                    offset: start,
-                    frame_bytes,
-                },
-                blake3,
-            },
-            batch_id: self.batch_id,
+            batch: Arc::clone(&self.pending_batch),
             ordinal,
+            doc_id: id,
+            frame_bytes,
         })
     }
 
@@ -1679,15 +1876,19 @@ impl ArchiveWriter {
             self.sync_namespace()?;
             self.namespace_sync_pending = false;
         }
+        let entries = std::mem::take(&mut self.pending_references)
+            .into_iter()
+            .map(|reference| DurableRawLocation { reference })
+            .collect();
         let receipt = DurableRawBatch {
-            batch_id: self.batch_id,
-            records: self.pending_records,
+            batch: Arc::clone(&self.pending_batch),
+            authority: Arc::clone(&self.authority),
+            entries,
             frame_bytes: self.pending_frame_bytes,
         };
-        self.batch_id += 1;
+        self.pending_batch = Arc::new(RawBatchIdentity);
         self.pending_records = 0;
         self.pending_frame_bytes = 0;
-        self.pending_next_ordinal = 0;
         Ok(receipt)
     }
 
@@ -2445,7 +2646,10 @@ CREATE TABLE imap_scan_state (source_account TEXT NOT NULL, mailbox TEXT NOT NUL
 CREATE TABLE imap_mailboxes (source_account TEXT NOT NULL, mailbox TEXT NOT NULL, delimiter TEXT, attributes TEXT NOT NULL, special_use TEXT NOT NULL, selectable INTEGER NOT NULL, last_seen_unix INTEGER NOT NULL, PRIMARY KEY(source_account, mailbox));
 ";
 
-pub fn create_catalogue(path: &Path) -> rusqlite::Result<Connection> {
+fn create_catalogue_with_authority(
+    path: &Path,
+    authority: Arc<ArchiveAuthority>,
+) -> rusqlite::Result<CatalogueConnection> {
     if path.exists() {
         return Err(rusqlite::Error::InvalidPath(path.to_path_buf()));
     }
@@ -2462,7 +2666,18 @@ pub fn create_catalogue(path: &Path) -> rusqlite::Result<Connection> {
     connection.execute_batch(&format!(
         "PRAGMA application_id={MEMORIA_CATALOGUE_APPLICATION_ID}; PRAGMA user_version={MEMORIA_CATALOGUE_VERSION}; PRAGMA journal_mode=DELETE; PRAGMA synchronous=EXTRA;"
     ))?;
-    Ok(connection)
+    Ok(CatalogueConnection {
+        connection,
+        authority,
+    })
+}
+
+pub(crate) fn create_catalogue(path: &Path) -> rusqlite::Result<CatalogueConnection> {
+    create_catalogue_with_authority(path, Arc::new(ArchiveAuthority))
+}
+
+pub fn initialize_catalogue(path: &Path) -> rusqlite::Result<()> {
+    create_catalogue(path).map(|_| ())
 }
 
 #[derive(Clone, Copy)]
@@ -3248,30 +3463,47 @@ fn configure_catalogue_runtime(connection: &Connection) -> rusqlite::Result<()> 
     Ok(())
 }
 
-pub fn open_catalogue(path: &Path) -> rusqlite::Result<Connection> {
+pub(crate) fn open_catalogue(path: &Path) -> rusqlite::Result<CatalogueConnection> {
     validate_existing_catalogue(path)?;
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     configure_catalogue_runtime(&connection)?;
-    Ok(connection)
+    Ok(CatalogueConnection {
+        connection,
+        authority: Arc::new(ArchiveAuthority),
+    })
 }
 
-fn create_or_open_catalogue(path: &Path) -> rusqlite::Result<Connection> {
+fn create_catalogue_for_authority(
+    path: &Path,
+    authority: Arc<ArchiveAuthority>,
+) -> rusqlite::Result<CatalogueConnection> {
     if path.exists() {
-        open_catalogue(path)
+        validate_existing_catalogue(path)?;
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        configure_catalogue_runtime(&connection)?;
+        Ok(CatalogueConnection {
+            connection,
+            authority,
+        })
     } else {
-        create_catalogue(path)
+        create_catalogue_with_authority(path, authority)
     }
 }
 
-pub fn create_metadata(path: &Path) -> rusqlite::Result<Connection> {
-    create_or_open_catalogue(path)
+pub(crate) fn create_metadata(path: &Path) -> rusqlite::Result<CatalogueConnection> {
+    create_catalogue_for_authority(path, Arc::new(ArchiveAuthority))
 }
 
-pub fn insert_metadata(
+fn insert_metadata(
     connection: &Connection,
     message: &Message,
-    location: &PendingRawLocation,
+    location: &DurableRawLocation,
 ) -> rusqlite::Result<()> {
+    if location.reference.doc_id != message.id {
+        return Err(batch_mismatch(
+            "catalogue message does not match durable RAW document ID",
+        ));
+    }
     connection.execute(
         "INSERT INTO messages VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
@@ -3326,7 +3558,8 @@ pub fn gmail_message_exists(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn insert_gmail_metadata(
+#[cfg(test)]
+pub(crate) fn insert_gmail_metadata(
     connection: &Connection,
     source_account: &str,
     gmail_id: &str,
@@ -3335,8 +3568,13 @@ pub fn insert_gmail_metadata(
     label_ids_json: &str,
     internal_date_ms: Option<i64>,
     message_history_id: Option<&str>,
-    location: &PendingRawLocation,
+    location: &DurableRawLocation,
 ) -> rusqlite::Result<()> {
+    if i64::try_from(location.reference.doc_id).ok() != Some(doc_id) {
+        return Err(batch_mismatch(
+            "Gmail identity does not match durable RAW document ID",
+        ));
+    }
     let transaction = connection.unchecked_transaction()?;
     insert_gmail_metadata_in_transaction(
         &transaction,
@@ -3363,7 +3601,7 @@ fn insert_gmail_metadata_with_hook<F>(
     label_ids_json: &str,
     internal_date_ms: Option<i64>,
     message_history_id: Option<&str>,
-    location: &PendingRawLocation,
+    location: &DurableRawLocation,
     after_messages: F,
 ) -> rusqlite::Result<()>
 where
@@ -3395,8 +3633,13 @@ fn insert_gmail_metadata_in_transaction(
     label_ids_json: &str,
     internal_date_ms: Option<i64>,
     message_history_id: Option<&str>,
-    location: &PendingRawLocation,
+    location: &DurableRawLocation,
 ) -> rusqlite::Result<()> {
+    if i64::try_from(location.reference.doc_id).ok() != Some(doc_id) {
+        return Err(batch_mismatch(
+            "Gmail identity does not match durable RAW document ID",
+        ));
+    }
     transaction.execute(
         "INSERT INTO messages(doc_id,message_id,timestamp,sender,recipients,subject,account,folder,thread,segment,archive_offset,frame_bytes,raw_blake3) VALUES (?1,?2,0,'','','',?3,'','',?4,?5,?6,?7)",
         params![doc_id, format!("gmail:{source_account}:{gmail_id}"), source_account, location.reference.location.segment, location.reference.location.offset as i64, location.reference.location.frame_bytes as i64, &location.reference.blake3[..]],
@@ -3509,7 +3752,8 @@ pub fn upsert_imap_mailbox(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn insert_imap_metadata(
+#[cfg(test)]
+pub(crate) fn insert_imap_metadata(
     connection: &Connection,
     source_account: &str,
     mailbox: &str,
@@ -3520,8 +3764,13 @@ pub fn insert_imap_metadata(
     internal_date_ms: Option<i64>,
     rfc822_size: Option<u32>,
     doc_id: i64,
-    location: &PendingRawLocation,
+    location: &DurableRawLocation,
 ) -> rusqlite::Result<()> {
+    if i64::try_from(location.reference.doc_id).ok() != Some(doc_id) {
+        return Err(batch_mismatch(
+            "IMAP identity does not match durable RAW document ID",
+        ));
+    }
     let transaction = connection.unchecked_transaction()?;
     insert_imap_metadata_in_transaction(
         &transaction,
@@ -3552,7 +3801,7 @@ fn insert_imap_metadata_with_hook<F>(
     internal_date_ms: Option<i64>,
     rfc822_size: Option<u32>,
     doc_id: i64,
-    location: &PendingRawLocation,
+    location: &DurableRawLocation,
     after_messages: F,
 ) -> rusqlite::Result<()>
 where
@@ -3588,8 +3837,13 @@ fn insert_imap_metadata_in_transaction(
     internal_date_ms: Option<i64>,
     rfc822_size: Option<u32>,
     doc_id: i64,
-    location: &PendingRawLocation,
+    location: &DurableRawLocation,
 ) -> rusqlite::Result<()> {
+    if i64::try_from(location.reference.doc_id).ok() != Some(doc_id) {
+        return Err(batch_mismatch(
+            "IMAP identity does not match durable RAW document ID",
+        ));
+    }
     let message_id = format!("imap:{source_account}:{mailbox}:{uid_validity}:{uid}");
     transaction.execute(
         "INSERT INTO messages(doc_id,message_id,timestamp,sender,recipients,subject,account,folder,thread,segment,archive_offset,frame_bytes,raw_blake3) VALUES (?1,?2,?3,'','','',?4,?5,'',?6,?7,?8,?9)",
@@ -3627,34 +3881,52 @@ fn batch_mismatch(message: &'static str) -> rusqlite::Error {
     rusqlite::Error::InvalidParameterName(message.into())
 }
 
-fn validate_pending_batch<'a, I>(durable: &DurableRawBatch, entries: I) -> rusqlite::Result<u64>
+fn validate_pending_batch<'a, I>(
+    catalogue: &CatalogueConnection,
+    durable: &DurableRawBatch,
+    entries: I,
+) -> rusqlite::Result<u64>
 where
     I: IntoIterator<Item = (&'a PendingRawLocation, i64)>,
 {
+    if !Arc::ptr_eq(&catalogue.authority, &durable.authority) {
+        return Err(batch_mismatch(
+            "durable RAW batch belongs to another archive authority",
+        ));
+    }
     let mut ordinals = HashSet::new();
     let mut frame_bytes = 0u64;
     let mut count = 0u64;
-    for (location, doc_id) in entries {
-        if location.batch_id != durable.batch_id
-            || i64::try_from(location.reference.doc_id).ok() != Some(doc_id)
-            || location.ordinal >= durable.records
-            || !ordinals.insert(location.ordinal)
+    for (pending, doc_id) in entries {
+        let durable_location = durable.entries.get(pending.ordinal);
+        if !Arc::ptr_eq(&pending.batch, &durable.batch)
+            || i64::try_from(pending.doc_id).ok() != Some(doc_id)
+            || durable_location.map(|location| location.reference.doc_id) != Some(pending.doc_id)
+            || !ordinals.insert(pending.ordinal)
         {
             return Err(batch_mismatch(
                 "staged RAW locations do not cover the durable batch exactly",
             ));
         }
         frame_bytes = frame_bytes
-            .checked_add(location.reference.location.frame_bytes)
+            .checked_add(pending.frame_bytes)
             .ok_or_else(|| batch_mismatch("batch frame byte count overflow"))?;
+        if durable_location.map(|location| location.reference.location.frame_bytes)
+            != Some(pending.frame_bytes)
+        {
+            return Err(batch_mismatch(
+                "staged RAW locations do not cover the durable batch exactly",
+            ));
+        }
         count += 1;
     }
-    if count != durable.records || ordinals.len() as u64 != durable.records {
+    let durable_records = durable.records();
+    if count != durable_records || ordinals.len() as u64 != durable_records {
         return Err(batch_mismatch(
             "staged RAW locations do not cover the durable batch exactly",
         ));
     }
-    if (0..durable.records).any(|ordinal| !ordinals.contains(&ordinal)) {
+    if (0..durable.entries.len()).any(|ordinal| !ordinals.contains(&ordinal)) {
         return Err(batch_mismatch(
             "staged RAW locations do not cover the durable batch exactly",
         ));
@@ -3667,17 +3939,20 @@ where
     Ok(frame_bytes)
 }
 
+/// Publishes an exact Gmail batch after its RAW entries are durable.
 pub(crate) fn publish_gmail_batch(
-    connection: &Connection,
+    connection: &CatalogueConnection,
     batch: &[GmailBatchRecord],
     durable: &DurableRawBatch,
 ) -> rusqlite::Result<()> {
     validate_pending_batch(
+        connection,
         durable,
-        batch.iter().map(|record| (&record.location, record.doc_id)),
+        batch.iter().map(|record| (&record.pending, record.doc_id)),
     )?;
     let transaction = connection.unchecked_transaction()?;
     for record in batch {
+        let durable_location = &durable.entries[record.pending.ordinal];
         insert_gmail_metadata_in_transaction(
             &transaction,
             &record.source_account,
@@ -3687,23 +3962,25 @@ pub(crate) fn publish_gmail_batch(
             &record.label_ids_json,
             record.internal_date_ms,
             record.message_history_id.as_deref(),
-            &record.location,
+            durable_location,
         )?;
     }
     transaction.commit()
 }
 
 pub(crate) fn publish_imap_batch(
-    connection: &Connection,
+    connection: &CatalogueConnection,
     batch: &[ImapBatchRecord],
     durable: &DurableRawBatch,
 ) -> rusqlite::Result<()> {
     validate_pending_batch(
+        connection,
         durable,
-        batch.iter().map(|record| (&record.location, record.doc_id)),
+        batch.iter().map(|record| (&record.pending, record.doc_id)),
     )?;
     let transaction = connection.unchecked_transaction()?;
     for record in batch {
+        let durable_location = &durable.entries[record.pending.ordinal];
         insert_imap_metadata_in_transaction(
             &transaction,
             &record.source_account,
@@ -3715,8 +3992,29 @@ pub(crate) fn publish_imap_batch(
             record.internal_date_ms,
             record.rfc822_size,
             record.doc_id,
-            &record.location,
+            durable_location,
         )?;
+    }
+    transaction.commit()
+}
+
+/// Publishes an exact corpus batch after its RAW entries are durable.
+pub(crate) fn publish_catalogue_batch(
+    connection: &CatalogueConnection,
+    batch: &[CatalogueBatchRecord],
+    durable: &DurableRawBatch,
+) -> rusqlite::Result<()> {
+    validate_pending_batch(
+        connection,
+        durable,
+        batch
+            .iter()
+            .map(|record| (&record.pending, record.message.id as i64)),
+    )?;
+    let transaction = connection.unchecked_transaction()?;
+    for record in batch {
+        let durable_location = &durable.entries[record.pending.ordinal];
+        insert_metadata(&transaction, &record.message, durable_location)?;
     }
     transaction.commit()
 }
@@ -3817,26 +4115,43 @@ fn chrono_like_now() -> i64 {
         .unwrap_or(0)
 }
 
-pub fn create_sqlite_fts(path: &Path) -> rusqlite::Result<Connection> {
+/// Opaque handle for the derived SQLite FTS index.
+///
+/// The underlying connection is intentionally not exposed: this index is not
+/// a catalogue-authority connection and must not become a route to arbitrary
+/// SQL against a caller-selected catalogue.
+pub struct SqliteFtsIndex {
+    connection: Connection,
+}
+
+impl SqliteFtsIndex {
+    pub fn open(path: &Path) -> rusqlite::Result<Self> {
+        Ok(Self {
+            connection: Connection::open(path)?,
+        })
+    }
+}
+
+pub fn create_sqlite_fts(path: &Path) -> rusqlite::Result<SqliteFtsIndex> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).ok();
     }
-    let connection = Connection::open(path)?;
-    connection.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL; CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(doc_id UNINDEXED, sender, recipients, subject, body, folder, account, tokenize='unicode61'); CREATE TABLE IF NOT EXISTS attrs (doc_id INTEGER PRIMARY KEY, timestamp INTEGER NOT NULL, sender TEXT NOT NULL, folder TEXT NOT NULL, account TEXT NOT NULL);")?;
-    Ok(connection)
+    let index = SqliteFtsIndex::open(path)?;
+    index.connection.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=NORMAL; CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(doc_id UNINDEXED, sender, recipients, subject, body, folder, account, tokenize='unicode61'); CREATE TABLE IF NOT EXISTS attrs (doc_id INTEGER PRIMARY KEY, timestamp INTEGER NOT NULL, sender TEXT NOT NULL, folder TEXT NOT NULL, account TEXT NOT NULL);")?;
+    Ok(index)
 }
 
-pub fn index_sqlite(connection: &mut Connection, config: CorpusConfig) -> rusqlite::Result<()> {
+pub fn index_sqlite(connection: &mut SqliteFtsIndex, config: CorpusConfig) -> rusqlite::Result<()> {
     index_sqlite_range(connection, config, 0, config.messages)
 }
 
 pub fn index_sqlite_range(
-    connection: &mut Connection,
+    connection: &mut SqliteFtsIndex,
     config: CorpusConfig,
     start: u64,
     count: u64,
 ) -> rusqlite::Result<()> {
-    let transaction = connection.transaction()?;
+    let transaction = connection.connection.transaction()?;
     {
         let mut statement =
             transaction.prepare("INSERT INTO docs VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?;
@@ -3871,12 +4186,12 @@ pub fn index_sqlite_range(
 }
 
 pub fn index_sqlite_archive(
-    connection: &mut Connection,
+    connection: &mut SqliteFtsIndex,
     archive_root: &Path,
     start_id: u64,
     end_id: u64,
 ) -> io::Result<PipelineStats> {
-    let transaction = connection.transaction().map_err(sqlite_io)?;
+    let transaction = connection.connection.transaction().map_err(sqlite_io)?;
     let mut statement = transaction
         .prepare("INSERT INTO docs VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")
         .map_err(sqlite_io)?;
@@ -4724,7 +5039,8 @@ pub fn export_message_eml(root: &Path, doc_id: u64, destination: &Path) -> io::R
     fs::write(destination, raw)
 }
 
-pub fn sqlite_search(connection: &Connection, query: &str) -> rusqlite::Result<Vec<SearchHit>> {
+pub fn sqlite_search(index: &SqliteFtsIndex, query: &str) -> rusqlite::Result<Vec<SearchHit>> {
+    let connection = &index.connection;
     let mut statement = connection.prepare(
         "SELECT doc_id, bm25(docs) FROM docs WHERE docs MATCH ?1 ORDER BY rank LIMIT 20",
     )?;
@@ -4770,7 +5086,8 @@ pub fn tantivy_search(
         .collect()
 }
 
-pub fn sqlite_date_count(connection: &Connection, start: i64, end: i64) -> rusqlite::Result<u64> {
+pub fn sqlite_date_count(index: &SqliteFtsIndex, start: i64, end: i64) -> rusqlite::Result<u64> {
+    let connection = &index.connection;
     connection.query_row(
         "SELECT COUNT(*) FROM attrs WHERE timestamp BETWEEN ?1 AND ?2",
         params![start, end],
@@ -4779,12 +5096,12 @@ pub fn sqlite_date_count(connection: &Connection, start: i64, end: i64) -> rusql
 }
 
 pub fn sqlite_text_date_search(
-    connection: &Connection,
+    index: &SqliteFtsIndex,
     text: &str,
     start: i64,
     end: i64,
 ) -> rusqlite::Result<Vec<SearchHit>> {
-    let mut statement = connection.prepare(
+    let mut statement = index.connection.prepare(
         "SELECT docs.doc_id, bm25(docs) FROM docs JOIN attrs ON attrs.doc_id = docs.doc_id WHERE docs MATCH ?1 AND attrs.timestamp BETWEEN ?2 AND ?3 ORDER BY rank LIMIT 20",
     )?;
     let rows = statement.query_map(params![text, start, end], |row| {
@@ -4933,8 +5250,9 @@ pub fn build_archive(
     let archive_root = root.join("archive");
     let metadata_path = root.join("metadata.sqlite");
     let mut writer = ArchiveWriter::open(&archive_root, segment_bytes)?;
-    let mut metadata = create_catalogue(&metadata_path).map_err(sqlite_io)?;
-    let transaction = metadata.transaction().map_err(sqlite_io)?;
+    let metadata = create_catalogue_for_authority(&metadata_path, Arc::clone(&writer.authority))
+        .map_err(sqlite_io)?;
+    let mut staged = Vec::new();
     let mut sizes = Vec::with_capacity(config.messages.min(1_000_000) as usize);
     let mut bytes = 0u64;
     let mut attachments = 0u64;
@@ -4951,8 +5269,7 @@ pub fn build_archive(
     let mut mime_text_bytes = 0u64;
     for id in 0..config.messages {
         let message = generate_message(config, id);
-        let location = writer.append(&message)?;
-        insert_metadata(&transaction, &message, &location).map_err(sqlite_io)?;
+        let pending = writer.append(&message)?;
         bytes += message.raw.len() as u64;
         sizes.push(message.raw.len());
         attachments += message.attachments.len() as u64;
@@ -4982,9 +5299,19 @@ pub fn build_archive(
             compressed_bytes += text_gzip + attachment_gzip;
             zstd_bytes += text_zstd + attachment_zstd;
         }
+        staged.push(CatalogueBatchRecord::new(message, pending));
+        if staged.len() >= CATALOGUE_BATCH_RECORD_LIMIT
+            || writer.pending_raw().1 >= CATALOGUE_BATCH_BYTES_LIMIT
+        {
+            let durable = writer.durable_barrier()?;
+            publish_catalogue_batch(&metadata, &staged, &durable).map_err(sqlite_io)?;
+            staged.clear();
+        }
     }
-    writer.sync()?;
-    transaction.commit().map_err(sqlite_io)?;
+    if !staged.is_empty() {
+        let durable = writer.durable_barrier()?;
+        publish_catalogue_batch(&metadata, &staged, &durable).map_err(sqlite_io)?;
+    }
     sizes.sort_unstable();
     let duplicate_sizes = duplicate_sizes(&attachment_counts, &unique_attachment_sizes);
     let unique_attachment_bytes: u64 = unique_attachment_sizes.values().sum();
@@ -5075,6 +5402,32 @@ mod tests {
         ))
     }
 
+    fn append_durable_raw(
+        writer: &mut ArchiveWriter,
+        doc_id: u64,
+        raw: &[u8],
+    ) -> DurableRawLocation {
+        writer.append_raw(doc_id, raw).unwrap();
+        writer
+            .durable_barrier()
+            .unwrap()
+            .entries
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    fn append_durable_message(writer: &mut ArchiveWriter, message: &Message) -> DurableRawLocation {
+        writer.append(message).unwrap();
+        writer
+            .durable_barrier()
+            .unwrap()
+            .entries
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
     #[test]
     fn tier_a_catalogue_uses_delete_journal_and_extra_synchronous() {
         let root = raw_read_test_root("catalogue-pragmas");
@@ -5107,19 +5460,11 @@ mod tests {
         let root = raw_read_test_root("catalogue-atomic");
         let _ = fs::remove_dir_all(&root);
         let connection = create_metadata(&root.join("metadata.sqlite")).unwrap();
-        let location = PendingRawLocation {
-            reference: RawReference {
-                doc_id: 0,
-                location: ArchiveLocation {
-                    segment: "segment-000000.arc".into(),
-                    offset: 0,
-                    frame_bytes: 32,
-                },
-                blake3: *blake3::hash(b"").as_bytes(),
-            },
-            batch_id: 0,
-            ordinal: 0,
-        };
+        let mut writer =
+            ArchiveWriter::open_for_catalogue(&root.join("archive"), 4096, &connection).unwrap();
+        writer.append_raw(0, b"gmail atomic").unwrap();
+        let gmail_durable = writer.durable_barrier().unwrap();
+        let gmail_location = &gmail_durable.entries()[0];
 
         let gmail_failure = insert_gmail_metadata_with_hook(
             &connection,
@@ -5130,7 +5475,7 @@ mod tests {
             "[]",
             None,
             None,
-            &location,
+            gmail_location,
             || Err(rusqlite::Error::InvalidQuery),
         );
         assert!(gmail_failure.is_err());
@@ -5157,10 +5502,13 @@ mod tests {
             "[]",
             None,
             None,
-            &location,
+            gmail_location,
         )
         .unwrap();
 
+        writer.append_raw(1, b"imap atomic").unwrap();
+        let imap_durable = writer.durable_barrier().unwrap();
+        let imap_location = &imap_durable.entries()[0];
         let imap_failure = insert_imap_metadata_with_hook(
             &connection,
             "account",
@@ -5172,7 +5520,7 @@ mod tests {
             None,
             None,
             1,
-            &location,
+            imap_location,
             || Err(rusqlite::Error::InvalidQuery),
         );
         assert!(imap_failure.is_err());
@@ -5202,7 +5550,7 @@ mod tests {
             None,
             None,
             1,
-            &location,
+            imap_location,
         )
         .unwrap();
         assert_eq!(
@@ -5223,32 +5571,50 @@ mod tests {
         let root = raw_read_test_root("raw-batch");
         let _ = fs::remove_dir_all(&root);
         let connection = create_metadata(&root.join("metadata.sqlite")).unwrap();
-        let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        let mut writer =
+            ArchiveWriter::open_for_catalogue(&root.join("archive"), 4096, &connection).unwrap();
         let first = writer.append_raw(0, b"first").unwrap();
         let second = writer.append_raw(1, b"second").unwrap();
         let durable = writer.durable_barrier().unwrap();
-        let gmail_record =
-            |id: i64, gmail_id: &str, location: PendingRawLocation| GmailBatchRecord {
-                source_account: "account".into(),
-                gmail_id: gmail_id.into(),
-                doc_id: id,
-                thread_id: format!("thread-{id}"),
-                label_ids_json: "[]".into(),
-                internal_date_ms: None,
-                message_history_id: None,
-                location,
-            };
+        assert_eq!(
+            durable
+                .entries()
+                .iter()
+                .map(|entry| entry.reference().doc_id)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            durable.entries()[0].reference().blake3,
+            *blake3::hash(b"first").as_bytes()
+        );
+        assert_eq!(
+            durable.entries()[1].reference().blake3,
+            *blake3::hash(b"second").as_bytes()
+        );
+        let gmail_record = |id: i64, gmail_id: &str, pending: PendingRawLocation| {
+            GmailBatchRecord::new(
+                "account".into(),
+                gmail_id.into(),
+                id,
+                format!("thread-{id}"),
+                "[]".into(),
+                None,
+                None,
+                pending,
+            )
+        };
         let mut records = vec![gmail_record(0, "g0", first), gmail_record(1, "g1", second)];
-        records[1].location.ordinal = 0;
+        records[1].pending.ordinal = 0;
         assert!(publish_gmail_batch(&connection, &records, &durable).is_err());
-        records[1].location.ordinal = 2;
+        records[1].pending.ordinal = 2;
         assert!(publish_gmail_batch(&connection, &records, &durable).is_err());
-        records[1].location.ordinal = 1;
+        records[1].pending.ordinal = 1;
         records[1].doc_id = 9;
         assert!(publish_gmail_batch(&connection, &records, &durable).is_err());
         records[1].doc_id = 1;
         let mut wrong_receipt = durable.clone();
-        wrong_receipt.records -= 1;
+        wrong_receipt.entries.pop();
         assert!(publish_gmail_batch(&connection, &records, &wrong_receipt).is_err());
         assert_eq!(
             connection
@@ -5273,8 +5639,16 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert!(read_record(&root.join("archive"), &duplicate_batch[0].location).is_ok());
-        assert!(read_record(&root.join("archive"), &duplicate_batch[1].location).is_ok());
+        assert!(read_record(
+            &root.join("archive"),
+            &retry_receipt.entries()[0].reference().location
+        )
+        .is_ok());
+        assert!(read_record(
+            &root.join("archive"),
+            &retry_receipt.entries()[1].reference().location
+        )
+        .is_ok());
 
         let repaired_location = writer.append_raw(4, b"repaired").unwrap();
         let repaired_receipt = writer.durable_barrier().unwrap();
@@ -5286,6 +5660,16 @@ mod tests {
                     .get::<_, i64>(0))
                 .unwrap(),
             1
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT raw_blake3 FROM messages WHERE doc_id=4",
+                    [],
+                    |row| { row.get::<_, Vec<u8>>(0) }
+                )
+                .unwrap(),
+            blake3::hash(b"repaired").as_bytes()
         );
         assert_eq!(
             connection
@@ -5304,28 +5688,28 @@ mod tests {
         let root = raw_read_test_root("raw-batch-barrier-failure");
         let _ = fs::remove_dir_all(&root);
         let connection = create_metadata(&root.join("metadata.sqlite")).unwrap();
-        let mut writer = ArchiveWriter::open_with_faults(
+        let mut writer = ArchiveWriter::open_for_catalogue_with_faults(
             &root.join("archive"),
             4096,
+            &connection,
             ArchiveWriterFaultInjection {
                 fail_sync_remaining: 1,
                 ..Default::default()
             },
         )
         .unwrap();
-        let location = writer.append_raw(0, b"pending").unwrap();
-        let record = GmailBatchRecord {
-            source_account: "account".into(),
-            gmail_id: "g0".into(),
-            doc_id: 0,
-            thread_id: "thread".into(),
-            label_ids_json: "[]".into(),
-            internal_date_ms: None,
-            message_history_id: None,
-            location,
-        };
+        let pending = writer.append_raw(0, b"pending").unwrap();
+        let record = GmailBatchRecord::new(
+            "account".into(),
+            "g0".into(),
+            0,
+            "thread".into(),
+            "[]".into(),
+            None,
+            None,
+            pending,
+        );
         assert!(writer.durable_barrier().is_err());
-        assert!(read_record(&root.join("archive"), &record.location.reference.location).is_ok());
         assert_eq!(
             connection
                 .query_row("SELECT COUNT(*) FROM gmail_messages", [], |row| row
@@ -5333,6 +5717,16 @@ mod tests {
                 .unwrap(),
             0
         );
+        let durable = writer.durable_barrier().unwrap();
+        publish_gmail_batch(&connection, &[record], &durable).unwrap();
+        let stored_blake3 = connection
+            .query_row(
+                "SELECT raw_blake3 FROM messages WHERE doc_id=0",
+                [],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .unwrap();
+        assert_eq!(stored_blake3, blake3::hash(b"pending").as_bytes());
         drop(writer);
         drop(connection);
         let _ = fs::remove_dir_all(root);
@@ -5343,21 +5737,24 @@ mod tests {
         let root = raw_read_test_root("imap-raw-batch");
         let _ = fs::remove_dir_all(&root);
         let connection = create_metadata(&root.join("metadata.sqlite")).unwrap();
-        let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        let mut writer =
+            ArchiveWriter::open_for_catalogue(&root.join("archive"), 4096, &connection).unwrap();
         let first = writer.append_raw(0, b"imap-first").unwrap();
         let second = writer.append_raw(1, b"imap-second").unwrap();
         let durable = writer.durable_barrier().unwrap();
-        let record = |uid: u32, doc_id: i64, location: PendingRawLocation| ImapBatchRecord {
-            source_account: "account".into(),
-            mailbox: "INBOX".into(),
-            uid_validity: 7,
-            uid,
-            flags_json: "[]".into(),
-            internal_date: None,
-            internal_date_ms: None,
-            rfc822_size: None,
-            doc_id,
-            location,
+        let record = |uid: u32, doc_id: i64, pending: PendingRawLocation| {
+            ImapBatchRecord::new(
+                "account".into(),
+                "INBOX".into(),
+                7,
+                uid,
+                "[]".into(),
+                None,
+                None,
+                None,
+                doc_id,
+                pending,
+            )
         };
         let records = vec![record(10, 0, first), record(11, 1, second)];
         publish_imap_batch(&connection, &records, &durable).unwrap();
@@ -5368,6 +5765,18 @@ mod tests {
                 .unwrap(),
             2
         );
+        let hashes = {
+            let mut statement = connection
+                .prepare("SELECT raw_blake3 FROM messages ORDER BY doc_id")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, Vec<u8>>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(hashes[0], blake3::hash(b"imap-first").as_bytes());
+        assert_eq!(hashes[1], blake3::hash(b"imap-second").as_bytes());
         assert_eq!(
             connection
                 .query_row("SELECT COUNT(*) FROM imap_messages", [], |row| row
@@ -5381,27 +5790,28 @@ mod tests {
     }
 
     #[test]
-    fn raw_batch_rejects_batch_id_record_and_byte_mismatches() {
+    fn raw_batch_rejects_another_batch_and_record_or_byte_mismatches() {
         let root = raw_read_test_root("raw-batch-mismatch");
         let _ = fs::remove_dir_all(&root);
         let connection = create_metadata(&root.join("metadata.sqlite")).unwrap();
-        let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        let mut writer =
+            ArchiveWriter::open_for_catalogue(&root.join("archive"), 4096, &connection).unwrap();
         let location = writer.append_raw(0, b"mismatch").unwrap();
         let durable = writer.durable_barrier().unwrap();
-        let record = GmailBatchRecord {
-            source_account: "account".into(),
-            gmail_id: "g0".into(),
-            doc_id: 0,
-            thread_id: "thread".into(),
-            label_ids_json: "[]".into(),
-            internal_date_ms: None,
-            message_history_id: None,
+        let record = GmailBatchRecord::new(
+            "account".into(),
+            "g0".into(),
+            0,
+            "thread".into(),
+            "[]".into(),
+            None,
+            None,
             location,
-        };
+        );
         let records = vec![record];
-        let mut wrong_batch = durable.clone();
-        wrong_batch.batch_id += 1;
-        assert!(publish_gmail_batch(&connection, &records, &wrong_batch).is_err());
+        writer.append_raw(1, b"another batch").unwrap();
+        let another_batch = writer.durable_barrier().unwrap();
+        assert!(publish_gmail_batch(&connection, &records, &another_batch).is_err());
         let mut wrong_bytes = durable.clone();
         wrong_bytes.frame_bytes += 1;
         assert!(publish_gmail_batch(&connection, &records, &wrong_bytes).is_err());
@@ -5420,35 +5830,87 @@ mod tests {
     }
 
     #[test]
+    fn durable_batch_can_publish_only_to_its_catalogue_authority() {
+        let root = raw_read_test_root("raw-batch-authority");
+        let _ = fs::remove_dir_all(&root);
+        let catalogue_a = create_metadata(&root.join("catalogue-a.sqlite")).unwrap();
+        let catalogue_b = create_metadata(&root.join("catalogue-b.sqlite")).unwrap();
+        let mut writer_a =
+            ArchiveWriter::open_for_catalogue(&root.join("archive-a"), 4096, &catalogue_a).unwrap();
+        let pending = writer_a.append_raw(7, b"authority-bound").unwrap();
+        let durable = writer_a.durable_barrier().unwrap();
+        let record = GmailBatchRecord::new(
+            "account".into(),
+            "authority-bound".into(),
+            7,
+            "thread".into(),
+            "[]".into(),
+            None,
+            None,
+            pending.clone(),
+        );
+
+        let error = publish_gmail_batch(&catalogue_b, &[record], &durable).unwrap_err();
+        assert!(error.to_string().contains("another archive authority"));
+        assert_eq!(
+            catalogue_b
+                .query_row("SELECT COUNT(*) FROM messages", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        let record = GmailBatchRecord::new(
+            "account".into(),
+            "authority-bound".into(),
+            7,
+            "thread".into(),
+            "[]".into(),
+            None,
+            None,
+            pending,
+        );
+        publish_gmail_batch(&catalogue_a, &[record], &durable).unwrap();
+        assert_eq!(
+            catalogue_a
+                .query_row("SELECT COUNT(*) FROM messages", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn archive_writer_pending_batches_and_empty_barriers_are_explicit() {
         let root = raw_read_test_root("writer-pending");
         let _ = fs::remove_dir_all(&root);
         let mut writer = ArchiveWriter::open(&root, 4096).unwrap();
 
         let empty = writer.durable_barrier().unwrap();
-        assert_eq!(empty.records, 0);
-        assert_eq!(empty.frame_bytes, 0);
+        assert_eq!(empty.records(), 0);
+        assert_eq!(empty.frame_bytes(), 0);
         assert!(!writer.file_dirty());
         assert!(!writer.namespace_sync_pending());
         assert_eq!(writer.fault.sync_calls, 0);
         assert_eq!(writer.fault.namespace_sync_calls, 0);
         let empty_again = writer.durable_barrier().unwrap();
-        assert_eq!(empty_again.records, 0);
-        assert_eq!(empty_again.frame_bytes, 0);
-        assert!(empty_again.batch_id > empty.batch_id);
+        assert_eq!(empty_again.records(), 0);
+        assert_eq!(empty_again.frame_bytes(), 0);
+        assert!(!Arc::ptr_eq(&empty_again.batch, &empty.batch));
         assert_eq!(writer.fault.sync_calls, 0);
         assert_eq!(writer.fault.namespace_sync_calls, 0);
 
         let pending = writer.append_raw(7, b"pending").unwrap();
-        assert_eq!(pending.batch_id, empty_again.batch_id + 1);
         assert_eq!(writer.pending_raw(), (1, pending.frame_bytes));
         assert_eq!(writer.state(), ArchiveWriterState::Ready);
         assert!(writer.file_dirty());
         assert!(writer.namespace_sync_pending());
         let durable = writer.durable_barrier().unwrap();
-        assert_eq!(durable.batch_id, pending.batch_id);
-        assert_eq!(durable.records, 1);
-        assert_eq!(durable.frame_bytes, pending.frame_bytes);
+        assert!(Arc::ptr_eq(&durable.batch, &pending.batch));
+        assert_eq!(durable.records(), 1);
+        assert_eq!(durable.frame_bytes(), pending.frame_bytes);
+        assert_eq!(durable.entries()[0].reference().doc_id, 7);
         assert_eq!(writer.pending_raw(), (0, 0));
         assert!(!writer.file_dirty());
         assert!(!writer.namespace_sync_pending());
@@ -5605,8 +6067,7 @@ mod tests {
         let length_after_failure = fs::metadata(root.join("segment-000000.arc")).unwrap().len();
 
         let mut reopened = ArchiveWriter::open(&root, 4096).unwrap();
-        let later = reopened.append_raw(3, b"later").unwrap();
-        reopened.durable_barrier().unwrap();
+        let later = append_durable_raw(&mut reopened, 3, b"later");
         let final_length = fs::metadata(root.join("segment-000000.arc")).unwrap().len();
         assert!(final_length > length_after_failure);
         let (record_id, raw) = read_record(&root, &later.reference.location).unwrap();
@@ -5670,8 +6131,7 @@ mod tests {
             attachments: Vec::new(),
             raw: raw.to_vec(),
         };
-        let location = writer.append(&message).unwrap();
-        writer.sync().unwrap();
+        let location = append_durable_message(&mut writer, &message);
         let connection = create_metadata(&root.join("metadata.sqlite")).unwrap();
         insert_metadata(&connection, &message, &location).unwrap();
         let attachments = list_attachments(&root, 7).unwrap();
@@ -5795,9 +6255,8 @@ mod tests {
             measure_compression: false,
         };
         let message = generate_message(config, 0);
-        let location = writer.append(&message).unwrap();
-        writer.sync().unwrap();
-        let (id, raw) = read_record(&archive, &location).unwrap();
+        let location = append_durable_message(&mut writer, &message);
+        let (id, raw) = read_record(&archive, &location.reference.location).unwrap();
         assert_eq!(id, message.id);
         assert_eq!(raw, message.raw);
         let _ = fs::remove_dir_all(&root);
@@ -5811,9 +6270,10 @@ mod tests {
         let first_raw = b"first raw";
         let second_raw = b"second raw";
         let mut writer = ArchiveWriter::open(&archive, 4096).unwrap();
-        let first_location = writer.append_raw(1, first_raw).unwrap();
-        let second_location = writer.append_raw(2, second_raw).unwrap();
-        writer.sync().unwrap();
+        writer.append_raw(1, first_raw).unwrap();
+        writer.append_raw(2, second_raw).unwrap();
+        let durable = writer.durable_barrier().unwrap();
+        let second_location = durable.entries()[1].reference().location.clone();
         let catalog = create_metadata(&root.join("metadata.sqlite")).unwrap();
         for (id, raw) in [(1, first_raw.as_slice()), (2, second_raw.as_slice())] {
             let message = Message {
@@ -5832,9 +6292,9 @@ mod tests {
                 raw: raw.to_vec(),
             };
             let location = if id == 1 {
-                &first_location
+                &durable.entries()[0]
             } else {
-                &second_location
+                &durable.entries()[1]
             };
             insert_metadata(&catalog, &message, location).unwrap();
         }
@@ -5864,17 +6324,17 @@ mod tests {
         let raw_a = b"same-size-A";
         let raw_b = b"same-size-B";
         let mut writer = ArchiveWriter::open(&archive, 4096).unwrap();
-        let location_a = writer.append_raw(7, raw_a).unwrap();
-        writer.durable_barrier().unwrap();
+        let durable_a = append_durable_raw(&mut writer, 7, raw_a);
+        let location_a = durable_a.reference.location.clone();
         drop(writer);
 
         // A is durable but unpublished. After restart, B is the legitimate
         // publication for the same document identity.
         let mut writer = ArchiveWriter::open(&archive, 4096).unwrap();
-        let location_b = writer.append_raw(7, raw_b).unwrap();
-        writer.durable_barrier().unwrap();
-        let location_c = writer.append_raw(7, b"different-size-C").unwrap();
-        writer.durable_barrier().unwrap();
+        let durable_b = append_durable_raw(&mut writer, 7, raw_b);
+        let location_b = durable_b.reference.location.clone();
+        let durable_c = append_durable_raw(&mut writer, 7, b"different-size-C");
+        let location_c = durable_c.reference.location.clone();
         let catalog = create_metadata(&root.join("metadata.sqlite")).unwrap();
         let message = Message {
             id: 7,
@@ -5891,7 +6351,7 @@ mod tests {
             attachments: Vec::new(),
             raw: raw_b.to_vec(),
         };
-        insert_metadata(&catalog, &message, &location_b).unwrap();
+        insert_metadata(&catalog, &message, &durable_b).unwrap();
 
         catalog
             .execute(
@@ -5949,7 +6409,7 @@ mod tests {
         catalog
             .execute(
                 "UPDATE messages SET raw_blake3=?1 WHERE doc_id=7",
-                [&location_b.reference.blake3[..]],
+                [&durable_b.reference.blake3[..]],
             )
             .unwrap();
         let segment_path = archive.join(&location_b.segment);
@@ -6005,8 +6465,7 @@ mod tests {
             fs::create_dir_all(root.join("archive")).unwrap();
             let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
             let raw = b"catalogue validation fixture";
-            let location = writer.append_raw(0, raw).unwrap();
-            writer.sync().unwrap();
+            let location = append_durable_raw(&mut writer, 0, raw);
             let catalog = create_catalogue(&root.join("metadata.sqlite")).unwrap();
             let message = Message {
                 id: 0,
@@ -6129,8 +6588,7 @@ mod tests {
         let archive = root.join("archive");
         fs::create_dir_all(&archive).unwrap();
         let mut writer = ArchiveWriter::open(&archive, 4096).unwrap();
-        let location = writer.append_raw(7, b"coordinate fixture").unwrap();
-        writer.sync().unwrap();
+        let location = append_durable_raw(&mut writer, 7, b"coordinate fixture");
         drop(writer);
 
         let mut wrong_frame_bytes = location.reference.location.clone();
@@ -6164,8 +6622,9 @@ mod tests {
         let archive = root.join("archive");
         fs::create_dir_all(&archive).unwrap();
         let mut writer = ArchiveWriter::open(&archive, 4096).unwrap();
-        let location = writer.append_raw(9, b"bounded fixture").unwrap();
-        writer.sync().unwrap();
+        let location = append_durable_raw(&mut writer, 9, b"bounded fixture")
+            .reference
+            .location;
         drop(writer);
 
         let path = archive.join(&location.segment);
@@ -6184,15 +6643,16 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("archive")).unwrap();
         let catalog = create_metadata(&root.join("metadata.sqlite")).unwrap();
-        let mut writer = ArchiveWriter::open(&root.join("archive"), 64 * 1024).unwrap();
+        let mut writer =
+            ArchiveWriter::open_for_catalogue(&root.join("archive"), 64 * 1024, &catalog).unwrap();
         let raws = vec![
             b"frame one payload".to_vec(),
             b"frame two payload".to_vec(),
             b"frame three payload".to_vec(),
         ];
-        let mut locations = Vec::new();
+        let mut batch = Vec::new();
         for (id, raw) in raws.iter().enumerate() {
-            let location = writer.append_raw(id as u64, raw).unwrap();
+            let pending = writer.append_raw(id as u64, raw).unwrap();
             let message = Message {
                 id: id as u64,
                 message_id: format!("inventory-{id}"),
@@ -6208,10 +6668,15 @@ mod tests {
                 attachments: Vec::new(),
                 raw: raw.clone(),
             };
-            insert_metadata(&catalog, &message, &location).unwrap();
-            locations.push(location.reference.location);
+            batch.push(CatalogueBatchRecord::new(message, pending));
         }
-        writer.sync().unwrap();
+        let durable = writer.durable_barrier().unwrap();
+        publish_catalogue_batch(&catalog, &batch, &durable).unwrap();
+        let locations = durable
+            .entries()
+            .iter()
+            .map(|entry| entry.reference().location.clone())
+            .collect();
         drop(catalog);
         drop(writer);
         (root, locations, raws)
@@ -6401,7 +6866,7 @@ mod tests {
             .into_bytes()
         };
         let first = raw("alpha");
-        let first_location = writer.append_raw(0, &first).unwrap();
+        let first_location = append_durable_raw(&mut writer, 0, &first);
         insert_gmail_metadata(
             &catalog,
             "fixture-account",
@@ -6414,7 +6879,6 @@ mod tests {
             &first_location,
         )
         .unwrap();
-        writer.sync().unwrap();
         index_gmail_archive(&root).unwrap();
         assert_eq!(
             GmailSearchIndex::open(&root)
@@ -6426,7 +6890,7 @@ mod tests {
         );
 
         let second = raw("beta");
-        let second_location = writer.append_raw(1, &second).unwrap();
+        let second_location = append_durable_raw(&mut writer, 1, &second);
         insert_gmail_metadata(
             &catalog,
             "fixture-account",
@@ -6439,7 +6903,6 @@ mod tests {
             &second_location,
         )
         .unwrap();
-        writer.sync().unwrap();
         let stats = index_gmail_archive(&root).unwrap();
         assert_eq!(stats.indexed, 1);
         assert_eq!(
@@ -6461,29 +6924,33 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         let catalog = create_metadata(&root.join("metadata.sqlite")).unwrap();
-        let mut writer = ArchiveWriter::open(&root.join("archive"), 64 * 1024).unwrap();
-        let mut locations = Vec::new();
+        let mut writer =
+            ArchiveWriter::open_for_catalogue(&root.join("archive"), 64 * 1024, &catalog).unwrap();
+        let mut batch = Vec::new();
         for (id, term) in ["a2-alpha", "a2-beta", "a2-gamma"].into_iter().enumerate() {
             let raw = format!(
                 "From: fixture@example.test\r\nTo: reader@example.test\r\nSubject: {term}\r\n\r\n{term}"
             )
             .into_bytes();
-            let location = writer.append_raw(id as u64, &raw).unwrap();
-            insert_gmail_metadata(
-                &catalog,
-                "fixture-account",
-                &format!("gmail-a2-{id}"),
+            let pending = writer.append_raw(id as u64, &raw).unwrap();
+            batch.push(GmailBatchRecord::new(
+                "fixture-account".into(),
+                format!("gmail-a2-{id}"),
                 id as i64,
-                &format!("thread-{id}"),
-                "[\"INBOX\"]",
+                format!("thread-{id}"),
+                "[\"INBOX\"]".into(),
                 Some(id as i64),
-                Some(&format!("{id}")),
-                &location,
-            )
-            .unwrap();
-            locations.push(location.reference.location);
+                Some(format!("{id}")),
+                pending,
+            ));
         }
-        writer.sync().unwrap();
+        let durable = writer.durable_barrier().unwrap();
+        publish_gmail_batch(&catalog, &batch, &durable).unwrap();
+        let locations = durable
+            .entries()
+            .iter()
+            .map(|entry| entry.reference().location.clone())
+            .collect();
         drop(catalog);
         drop(writer);
         (root, locations)
@@ -6663,8 +7130,9 @@ mod tests {
         index_gmail_archive(&root).unwrap();
         let mut writer = ArchiveWriter::open(&root.join("archive"), 64 * 1024).unwrap();
         let malformed = b"Content-Type: text/plain\r\nContent-Transfer-Encoding: base64\r\n\r\n%%%";
-        let malformed_location = writer.append_raw(1, malformed).unwrap();
-        writer.sync().unwrap();
+        let malformed_location = append_durable_raw(&mut writer, 1, malformed)
+            .reference
+            .location;
         drop(writer);
         let catalog = Connection::open(root.join("metadata.sqlite")).unwrap();
         catalog
@@ -6698,9 +7166,10 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         let catalog = create_metadata(&root.join("metadata.sqlite")).unwrap();
-        let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        let mut writer =
+            ArchiveWriter::open_for_catalogue(&root.join("archive"), 4096, &catalog).unwrap();
         let raw = b"From: fixture@example.test\r\nTo: reader@example.test\r\nSubject: hello\r\nContent-Type: multipart/mixed; boundary=part\r\n\r\n--part\r\nContent-Type: text/plain\r\n\r\nhello\r\n--part\r\nContent-Type: text/plain; charset=iso-8859-1\r\nContent-Disposition: attachment; filename=note.txt\r\n\r\ncaf\xe9 phrase-secrete-947\r\n--part--\r\n";
-        let location = writer.append_raw(0, raw).unwrap();
+        let location = append_durable_raw(&mut writer, 0, raw);
         insert_gmail_metadata(
             &catalog,
             "fixture-account",
@@ -6713,7 +7182,6 @@ mod tests {
             &location,
         )
         .unwrap();
-        writer.sync().unwrap();
         index_gmail_archive(&root).unwrap();
         let results = GmailSearchIndex::open(&root)
             .unwrap()
@@ -6759,7 +7227,7 @@ mod tests {
         let raw = format!(
             "From: fixture@example.test\r\nTo: reader@example.test\r\nSubject: hello\r\nContent-Type: multipart/mixed; boundary=part\r\n\r\n--part\r\nContent-Type: text/plain\r\n\r\nhello\r\n--part\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=note.pdf\r\nContent-Transfer-Encoding: base64\r\n\r\n{encoded}\r\n--part--\r\n"
         );
-        let location = writer.append_raw(0, raw.as_bytes()).unwrap();
+        let location = append_durable_raw(&mut writer, 0, raw.as_bytes());
         insert_gmail_metadata(
             &catalog,
             "fixture-account",
@@ -6772,7 +7240,6 @@ mod tests {
             &location,
         )
         .unwrap();
-        writer.sync().unwrap();
         index_gmail_archive(&root).unwrap();
         let results = GmailSearchIndex::open(&root)
             .unwrap()
@@ -6814,7 +7281,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         let catalog = create_metadata(&root.join("metadata.sqlite")).unwrap();
         let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
-        let location = writer.append_raw(0, raw.as_bytes()).unwrap();
+        let location = append_durable_raw(&mut writer, 0, raw.as_bytes());
         insert_gmail_metadata(
             &catalog,
             "fixture-account",
@@ -6827,7 +7294,6 @@ mod tests {
             &location,
         )
         .unwrap();
-        writer.sync().unwrap();
         index_gmail_archive(&root).unwrap();
         let results = GmailSearchIndex::open(&root)
             .unwrap()
@@ -6849,7 +7315,8 @@ mod tests {
             std::env::temp_dir().join(format!("mail-structured-search-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let catalog = create_metadata(&root.join("metadata.sqlite")).unwrap();
-        let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        let mut writer =
+            ArchiveWriter::open_for_catalogue(&root.join("archive"), 4096, &catalog).unwrap();
         let messages = [
             (
                 "From: Alice Example <alice@example.test>\r\nTo: reader@example.test\r\nSubject: Invoice alpha\r\nDate: Thu, 01 Jan 1970 00:00:01 +0000\r\n\r\nalpha",
@@ -6867,23 +7334,23 @@ mod tests {
                 3_000,
             ),
         ];
+        let mut batch = Vec::new();
         for (id, (raw, labels, timestamp)) in messages.into_iter().enumerate() {
             let raw = raw.as_bytes();
-            let location = writer.append_raw(id as u64, raw).unwrap();
-            insert_gmail_metadata(
-                &catalog,
-                "fixture-account",
-                &format!("gmail-{id}"),
+            let pending = writer.append_raw(id as u64, raw).unwrap();
+            batch.push(GmailBatchRecord::new(
+                "fixture-account".into(),
+                format!("gmail-{id}"),
                 id as i64,
-                &format!("thread-{id}"),
-                labels,
+                format!("thread-{id}"),
+                labels.into(),
                 Some(timestamp),
-                Some(&format!("{id}")),
-                &location,
-            )
-            .unwrap();
+                Some(format!("{id}")),
+                pending,
+            ));
         }
-        writer.sync().unwrap();
+        let durable = writer.durable_barrier().unwrap();
+        publish_gmail_batch(&catalog, &batch, &durable).unwrap();
         // The deliberately truncated PDF is provider-dependent: pdftotext
         // reports a failure on Linux, while Windows IFilter may accept it and
         // return no text. This test targets structured-search results, not
@@ -6993,8 +7460,7 @@ mod tests {
             raw: raw.to_vec(),
         };
         let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
-        let location = writer.append(&message).unwrap();
-        writer.sync().unwrap();
+        let location = append_durable_message(&mut writer, &message);
         let catalog = create_metadata(&root.join("metadata.sqlite")).unwrap();
         insert_metadata(&catalog, &message, &location).unwrap();
         drop(catalog);
@@ -7034,8 +7500,7 @@ mod tests {
             raw: raw.to_vec(),
         };
         let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
-        let location = writer.append(&message).unwrap();
-        writer.sync().unwrap();
+        let location = append_durable_message(&mut writer, &message);
         let catalog = create_metadata(&root.join("metadata.sqlite")).unwrap();
         insert_metadata(&catalog, &message, &location).unwrap();
         drop(catalog);
@@ -7076,8 +7541,7 @@ mod tests {
             raw: raw.to_vec(),
         };
         let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
-        let location = writer.append(&message).unwrap();
-        writer.sync().unwrap();
+        let location = append_durable_message(&mut writer, &message);
         insert_metadata(&catalog, &message, &location).unwrap();
         drop(writer);
         drop(catalog);

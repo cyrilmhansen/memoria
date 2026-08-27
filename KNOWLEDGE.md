@@ -787,3 +787,47 @@ résultats d'expérience locale :
 - **État :** A1 est fermé : tous les lecteurs autoritatifs identifiés dans
   l’inventaire sont maintenant liés ; `read_record`/`inventory_records` restent
   explicitement physiques et diagnostiques.
+
+## 2026-08-27 — A3.2 sealing : autorité RAW durable
+
+- **Fait vérifié :** les seuls chemins produit qui créent une ligne
+  `messages` sont les publishers de lots Gmail, IMAP et corpus. Gmail/IMAP,
+  `build_archive` et `structured-search-benchmark` suivent tous
+  `append(s) → durable_barrier → transaction SQLite → commit`; aucun SQL de
+  publication ne subsiste dans les générateurs avant la barrière.
+- **Frontière typée :** `PendingRawLocation` est un token opaque aux champs
+  privés, sans `Deref`, getter de coordonnées, `AsRef`, conversion ou BLAKE3.
+  Le writer conserve seul les `RawReference` avant la barrière. Une barrière
+  réussie émet le `DurableRawBatch` et ses `DurableRawLocation`, seule forme
+  acceptée par les insertions internes dans `messages`.
+- **Liaison de lot :** pending et reçu partagent un sceau de lot inforgeable
+  par l’API publique. Le publisher exige le même sceau, une couverture exacte
+  et unique des ordinaux, le même `doc_id`, le même nombre de records et la
+  même somme de `frame_bytes`. Les coordonnées et le BLAKE3 écrits dans SQLite
+  proviennent de l’entrée durable, jamais du token pending.
+- **Exceptions physiques :** `ArchiveWriter::sync` peut rendre des RAW
+  durables sans produire de valeur publiable pour le caller, et `read_record`/
+  `inventory_records` acceptent encore des coordonnées pour la lecture
+  physique/diagnostique. Ces chemins ne peuvent pas publier une identité
+  catalogue. Les helpers d’insertion unitaire ne sont compilés que dans les
+  tests et exigent eux-mêmes une `DurableRawLocation`.
+- **État :** A3.2 sealing est fermé. Cette conclusion ne couvre ni suppression
+  Gmail, absence en full sync, add+delete dans un même history traversal,
+  réconciliation d’orphelins, namespace/multiwriter, A4 ou plateformes hors
+  de cette modification.
+
+## 2026-08-27 — A3.2 sealing : liaison catalogue/writer
+
+- **Fait vérifié :** `create_catalogue`, `open_catalogue` et `create_metadata`
+  sont internes et leur `CatalogueConnection` opaque ne laisse échapper aucune
+  connexion catalogue RW à l’API publique. `create_sqlite_fts` retourne
+  également un `SqliteFtsIndex` opaque : les connexions publiques restantes
+  concernent les index/états dérivés, pas l’écriture arbitraire de `messages`.
+- **Fait vérifié :** chaque `ArchiveWriter` associé à un catalogue partage avec
+  lui une autorité process/session opaque. `DurableRawBatch` transporte cette
+  autorité privée et les publishers la vérifient avant toute transaction SQLite.
+  Un reçu produit pour A est donc refusé par le catalogue B avant tout `INSERT`;
+  le test vérifie aussi que B reste vide, tandis que A accepte le reçu.
+- **État :** le sealing A3.2 est fermé pour ces deux propriétés. Cette
+  conclusion ne couvre toujours pas les suppressions Gmail, le full-sync,
+  les orphelins, le namespace/multiwriter ni A4.

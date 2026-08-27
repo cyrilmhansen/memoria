@@ -111,7 +111,7 @@ fn progress_snapshot_with_batch(
     snapshot.new_messages += staged.len() as u64;
     snapshot.archive_bytes_added += staged
         .iter()
-        .map(|record| record.location.reference.location.frame_bytes)
+        .map(crate::GmailBatchRecord::frame_bytes)
         .sum::<u64>();
     snapshot
 }
@@ -986,7 +986,7 @@ pub fn sync_account_with_progress<T: GmailTransport, P: FnMut(&SyncProgress)>(
 #[allow(clippy::too_many_arguments)]
 fn full_sync<T: GmailTransport>(
     root: &Path,
-    connection: &mut Connection,
+    connection: &mut crate::CatalogueConnection,
     source: &str,
     transport: &mut T,
     query: Option<&str>,
@@ -994,8 +994,12 @@ fn full_sync<T: GmailTransport>(
     stats: &mut SyncStats,
     progress: &mut dyn FnMut(&SyncProgress),
 ) -> Result<(), GmailError> {
-    let mut writer = crate::ArchiveWriter::open(&root.join("archive"), 64 * 1024 * 1024)
-        .map_err(|error| GmailError::Io(error.to_string()))?;
+    let mut writer = crate::ArchiveWriter::open_for_catalogue(
+        &root.join("archive"),
+        64 * 1024 * 1024,
+        connection,
+    )
+    .map_err(|error| GmailError::Io(error.to_string()))?;
     let mut page = None;
     let mut listed_messages = Vec::new();
     let reconcile = max.is_none() && query.is_none();
@@ -1120,7 +1124,7 @@ fn full_sync<T: GmailTransport>(
 #[allow(clippy::too_many_arguments)]
 fn incremental_sync<T: GmailTransport>(
     root: &Path,
-    connection: &mut Connection,
+    connection: &mut crate::CatalogueConnection,
     source: &str,
     transport: &mut T,
     start: &str,
@@ -1129,8 +1133,12 @@ fn incremental_sync<T: GmailTransport>(
     progress: &mut dyn FnMut(&SyncProgress),
 ) -> Result<(), GmailError> {
     let mut page = None;
-    let mut writer = crate::ArchiveWriter::open(&root.join("archive"), 64 * 1024 * 1024)
-        .map_err(|error| GmailError::Io(error.to_string()))?;
+    let mut writer = crate::ArchiveWriter::open_for_catalogue(
+        &root.join("archive"),
+        64 * 1024 * 1024,
+        connection,
+    )
+    .map_err(|error| GmailError::Io(error.to_string()))?;
     let mut next_doc_id =
         crate::next_doc_id(connection).map_err(|error| GmailError::Other(error.to_string()))?;
     let mut staged = Vec::new();
@@ -1310,16 +1318,16 @@ fn import_raw(
         .as_deref()
         .and_then(|value| value.parse::<i64>().ok());
     pending_ids.insert(raw.id.clone());
-    staged.push(crate::GmailBatchRecord {
-        source_account: source.into(),
-        gmail_id: raw.id.clone(),
+    staged.push(crate::GmailBatchRecord::new(
+        source.into(),
+        raw.id.clone(),
         doc_id,
-        thread_id: raw.thread_id.clone(),
-        label_ids_json: labels,
-        internal_date_ms: date,
-        message_history_id: raw.history_id.clone(),
+        raw.thread_id.clone(),
+        labels,
+        date,
+        raw.history_id.clone(),
         location,
-    });
+    ));
     stats.network_bytes += raw.raw.len() as u64;
     Ok(())
 }
@@ -1328,13 +1336,13 @@ fn batch_full(batch: &[crate::GmailBatchRecord]) -> bool {
     batch.len() >= IMPORT_BATCH_RECORD_LIMIT
         || batch
             .iter()
-            .map(|record| record.location.reference.location.frame_bytes)
+            .map(crate::GmailBatchRecord::frame_bytes)
             .sum::<u64>()
             >= IMPORT_BATCH_BYTES_LIMIT
 }
 
 fn flush_batch_if_needed(
-    connection: &Connection,
+    connection: &crate::CatalogueConnection,
     writer: &mut crate::ArchiveWriter,
     staged: &mut Vec<crate::GmailBatchRecord>,
     pending_ids: &mut HashSet<String>,
@@ -1347,7 +1355,7 @@ fn flush_batch_if_needed(
 }
 
 fn flush_batch(
-    connection: &Connection,
+    connection: &crate::CatalogueConnection,
     writer: &mut crate::ArchiveWriter,
     staged: &mut Vec<crate::GmailBatchRecord>,
     pending_ids: &mut HashSet<String>,
@@ -1359,7 +1367,7 @@ fn flush_batch(
     let records = staged.len() as u64;
     let frame_bytes = staged
         .iter()
-        .map(|record| record.location.reference.location.frame_bytes)
+        .map(crate::GmailBatchRecord::frame_bytes)
         .sum::<u64>();
     crate::publish_gmail_batch(connection, staged, &durable)
         .map_err(|error| GmailError::Other(error.to_string()))?;
@@ -1769,8 +1777,8 @@ mod tests {
         let connection = crate::create_metadata(&root.join("metadata.sqlite")).unwrap();
         let mut writer = crate::ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
         let raw = b"From: known@example.test\r\n\r\nknown\r\n";
-        let location = writer.append_raw(0, raw).unwrap();
-        writer.durable_barrier().unwrap();
+        writer.append_raw(0, raw).unwrap();
+        let durable = writer.durable_barrier().unwrap();
         crate::insert_gmail_metadata(
             &connection,
             "fixture-account",
@@ -1780,7 +1788,7 @@ mod tests {
             "[]",
             None,
             None,
-            &location,
+            &durable.entries()[0],
         )
         .unwrap();
         crate::set_gmail_state(&connection, "fixture-account", "7", true).unwrap();

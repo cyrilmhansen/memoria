@@ -136,8 +136,12 @@ pub fn sync_imap(root: &Path, config: &ImapConfig) -> Result<ImapSyncStats, Imap
         .map_err(|error| ImapError::Io(error.to_string()))?;
     let frontier_before = scan_state.map(|(_, frontier)| frontier).unwrap_or(0);
 
-    let mut writer = crate::ArchiveWriter::open(&root.join("archive"), 64 * 1024 * 1024)
-        .map_err(|error| ImapError::Io(error.to_string()))?;
+    let mut writer = crate::ArchiveWriter::open_for_catalogue(
+        &root.join("archive"),
+        64 * 1024 * 1024,
+        &metadata,
+    )
+    .map_err(|error| ImapError::Io(error.to_string()))?;
     let mut stats = ImapSyncStats {
         frontier_before,
         ..Default::default()
@@ -198,18 +202,18 @@ pub fn sync_imap(root: &Path, config: &ImapConfig) -> Result<ImapSyncStats, Imap
                 .append_raw(doc_id as u64, &message.raw)
                 .map_err(|error| ImapError::Io(error.to_string()))?;
             pending_ids.insert(identity);
-            staged.push(crate::ImapBatchRecord {
-                source_account: config.source_account.clone(),
-                mailbox: config.mailbox.clone(),
-                uid_validity: message.uid_validity,
-                uid: message.uid,
-                flags_json: message.flags_json.clone(),
-                internal_date: message.internal_date.clone(),
-                internal_date_ms: message.internal_date_ms,
-                rfc822_size: message.rfc822_size,
+            staged.push(crate::ImapBatchRecord::new(
+                config.source_account.clone(),
+                config.mailbox.clone(),
+                message.uid_validity,
+                message.uid,
+                message.flags_json.clone(),
+                message.internal_date.clone(),
+                message.internal_date_ms,
+                message.rfc822_size,
                 doc_id,
                 location,
-            });
+            ));
             if batch_full(&staged) {
                 flush_batch(
                     &metadata,
@@ -262,7 +266,7 @@ fn batch_full(batch: &[crate::ImapBatchRecord]) -> bool {
     batch.len() >= IMPORT_BATCH_RECORD_LIMIT
         || batch
             .iter()
-            .map(|record| record.location.reference.location.frame_bytes)
+            .map(crate::ImapBatchRecord::frame_bytes)
             .sum::<u64>()
             >= IMPORT_BATCH_BYTES_LIMIT
 }
@@ -328,7 +332,7 @@ fn ensure_imap_message_id_available(
 }
 
 fn flush_batch_if_needed(
-    connection: &Connection,
+    connection: &crate::CatalogueConnection,
     writer: &mut crate::ArchiveWriter,
     staged: &mut Vec<crate::ImapBatchRecord>,
     pending_ids: &mut HashSet<(String, String, u32, u32)>,
@@ -341,7 +345,7 @@ fn flush_batch_if_needed(
 }
 
 fn flush_batch(
-    connection: &Connection,
+    connection: &crate::CatalogueConnection,
     writer: &mut crate::ArchiveWriter,
     staged: &mut Vec<crate::ImapBatchRecord>,
     pending_ids: &mut HashSet<(String, String, u32, u32)>,
@@ -353,7 +357,7 @@ fn flush_batch(
     let records = staged.len() as u64;
     let frame_bytes = staged
         .iter()
-        .map(|record| record.location.reference.location.frame_bytes)
+        .map(crate::ImapBatchRecord::frame_bytes)
         .sum::<u64>();
     crate::publish_imap_batch(connection, staged, &durable)
         .map_err(|error| ImapError::Io(error.to_string()))?;
@@ -717,7 +721,8 @@ mod tests {
         let mut writer =
             crate::ArchiveWriter::open(&root.join("archive"), 64 * 1024 * 1024).unwrap();
         let raw = b"From: imap@example.test\r\n\r\nfixture\r\n";
-        let location = writer.append_raw(0, raw).unwrap();
+        writer.append_raw(0, raw).unwrap();
+        let durable = writer.durable_barrier().unwrap();
         crate::insert_imap_metadata(
             &connection,
             "imap-test",
@@ -729,7 +734,7 @@ mod tests {
             None,
             Some(raw.len() as u32),
             0,
-            &location,
+            &durable.entries()[0],
         )
         .unwrap();
         assert!(crate::imap_message_exists(&connection, "imap-test", "INBOX", 17, 42).unwrap());

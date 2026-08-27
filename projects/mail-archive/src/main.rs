@@ -339,7 +339,7 @@ fn benchmark(
         let _ = tantivy_search(&tantivy, &reader, fields, query);
     });
     let sqlite_open_started = Instant::now();
-    let reopened_sqlite = rusqlite::Connection::open(&sqlite_path)?;
+    let reopened_sqlite = SqliteFtsIndex::open(&sqlite_path)?;
     let sqlite_open_us = sqlite_open_started.elapsed().as_micros();
     let sqlite_first_started = Instant::now();
     let _ = sqlite_search(&reopened_sqlite, "quartz");

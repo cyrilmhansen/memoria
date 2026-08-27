@@ -897,3 +897,60 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
   SQL trompeur et l’absence byte-à-byte de sidecars lors du refus.
 - **État corrigé :** la correction A1.2 ci-dessus a depuis propagé la
   référence liée aux lecteurs autoritatifs secondaires ; A1 global est fermé.
+
+## 2026-08-27 — A3.2 sealing : fermeture des API de publication
+
+- Inventaire exhaustif des écritures `messages` et des usages
+  `ArchiveLocation`/offset/length/doc_id sous `projects/mail-archive` : les
+  bypass produit retrouvés étaient les insertions unitaires acceptant un
+  `PendingRawLocation`, les champs publics et le `Deref<ArchiveLocation>` de
+  ce type, ainsi que les transactions corpus et
+  `structured-search-benchmark` ouvertes/alimentées avant `sync`.
+- `PendingRawLocation` ne transporte plus que l’association opaque
+  sceau/ordinal/doc_id/taille, tous champs privés. Le writer conserve les
+  coordonnées et le BLAKE3 jusqu’à `durable_barrier`, qui construit les seules
+  `DurableRawLocation` publiables. Aucun getter/conversion pending vers
+  `ArchiveLocation` ou `RawReference` n’existe.
+- `GmailBatchRecord`, `ImapBatchRecord` et `CatalogueBatchRecord` sont des
+  structures de staging à champs privés. Les publishers valident le sceau de
+  lot par identité, les ordinaux exacts et uniques, le `doc_id`, le compte de
+  records et les bytes, puis commencent seulement la transaction SQLite. Les
+  coordonnées et `raw_blake3` insérés viennent de l’entrée durable résolue.
+- Gmail et IMAP conservaient déjà l’ordre barrière puis publisher ; ils ont
+  été adaptés à la nouvelle API. Le corpus est maintenant publié par lots
+  bornés 256 records/16 MiB après chaque barrière. Le benchmark structuré
+  utilise le même publisher Gmail et ne contient plus de SQL `messages`
+  direct. Les outils physiques sans publication gardent `sync`, `read_record`
+  et `inventory_records` hors de cette frontière.
+- Tests adversariaux : batch exact, doublon/trou/mauvais ordinal, mauvais
+  `doc_id`, reçu d’un autre batch, compte/bytes divergents, rollback/retry,
+  erreur de sync sans identité, correspondance exacte des entrées durables et
+  BLAKE3 Gmail/IMAP issu de l’append. L’impossibilité de publier un pending
+  avant barrière est garantie par les types et la visibilité, plutôt que par
+  un test runtime artificiel.
+- Validation finale : `cargo test --workspace` (92 tests de bibliothèque
+  mail-archive, 8 tests de ses binaires et 2 tests workspace, tous passants),
+  `cargo check --workspace --all-targets`,
+  `cargo clippy --workspace --all-targets -- -D warnings`,
+  `cargo fmt --all -- --check` et `git diff --check` passent.
+- **Décision :** A3.2 sealing est fermé ; aucun bypass produit restant n’a été
+  retrouvé. Aucun commit n’est créé.
+
+## 2026-08-27 — A3.2 sealing : correction de la liaison catalogue/writer
+
+- La surface publique ne renvoie plus de connexion RW de catalogue : les
+  constructeurs de catalogue sont internes et `CatalogueConnection` garde sa
+  connexion derrière des champs privés. `create_sqlite_fts` expose maintenant
+  `SqliteFtsIndex`, un handle opaque dont la connexion est privée ; les APIs
+  publiques SQLite restantes servent aux index/états dérivés et ne constituent
+  pas une API SQL de publication `messages`.
+- Une autorité opaque process/session est maintenant partagée par le writer et
+  le catalogue associés. Le reçu `DurableRawBatch` conserve cette autorité et
+  chaque publisher la vérifie avant d’ouvrir sa transaction ; un batch durable
+  de A est refusé par B avant toute insertion.
+- Test adversarial ajouté : publication A→B refusée avec catalogue B inchangé,
+  puis publication A→A réussie. Les chemins Gmail, IMAP, corpus et benchmark
+  utilisent l’API liée existante.
+- **État corrigé :** après cette correction, le sealing A3.2 est fermé pour
+  l’échappement de connexion RW et la liaison reçu/catalogue. Cela ne clôt pas
+  les travaux hors périmètre A3.2 listés ci-dessus. Aucun commit n’est créé.

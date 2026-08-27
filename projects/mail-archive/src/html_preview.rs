@@ -435,10 +435,10 @@ mod tests {
             raw: raw.to_vec(),
         };
         let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
-        let location = writer.append(&message).unwrap();
-        writer.sync().unwrap();
+        writer.append(&message).unwrap();
+        let durable = writer.durable_barrier().unwrap();
         let connection = create_metadata(&root.join("metadata.sqlite")).unwrap();
-        insert_metadata(&connection, &message, &location).unwrap();
+        insert_metadata(&connection, &message, &durable.entries()[0]).unwrap();
 
         let server = HtmlPreviewServer::start().unwrap();
         let url = server.open_message(&root, 9).unwrap().unwrap();

@@ -1,10 +1,9 @@
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use mail_archive_experiment::{
-    create_catalogue, directory_bytes, index_gmail_archive_with_observer_and_config, latency_stats,
-    ArchiveWriter, AttachmentFilter, GmailIndexWriterConfig, GmailSearchIndex, SearchRequest,
+    directory_bytes, index_gmail_archive_with_observer_and_config, latency_stats, ArchiveSession,
+    AttachmentFilter, GmailBatchRecord, GmailIndexWriterConfig, GmailSearchIndex, SearchRequest,
 };
-use rusqlite::params;
 use serde_json::json;
 use std::env;
 use std::fs;
@@ -17,6 +16,8 @@ use std::time::{Duration, Instant};
 
 const DEFAULT_MESSAGES: u64 = 1_000_000;
 const SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
+const CATALOGUE_BATCH_RECORDS: usize = 256;
+const CATALOGUE_BATCH_BYTES: u64 = 16 * 1024 * 1024;
 const DAY_MS: i64 = 86_400_000;
 const END_MS: i64 = 1_767_225_600_000; // 2026-01-01 UTC
 
@@ -397,38 +398,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let phases = Arc::new(Mutex::new(Vec::new()));
     snapshot(&phases, "startup");
     let started = Instant::now();
-    let metadata = create_catalogue(&out.join("metadata.sqlite"))?;
+    let mut session = ArchiveSession::create(&out, SEGMENT_BYTES)?;
     snapshot(&phases, "catalog_opened");
-    let transaction = metadata.unchecked_transaction()?;
-    let mut message_insert = transaction.prepare("INSERT INTO messages(doc_id,message_id,timestamp,sender,recipients,subject,account,folder,thread,segment,archive_offset,frame_bytes,raw_blake3) VALUES (?1,?2,0,'','','',?3,'','',?4,?5,?6,?7)")?;
-    let mut gmail_insert = transaction.prepare("INSERT INTO gmail_messages(source_account,gmail_message_id,doc_id,thread_id,label_ids,internal_date_ms,message_history_id,source_state,first_seen_unix,last_seen_unix) VALUES ('synthetic','gmail-'||?1,?2,'thread-'||?1,?3,?4,?5,'present',0,0)")?;
-    let mut writer = ArchiveWriter::open(&out.join("archive"), SEGMENT_BYTES)?;
+    let mut staged = Vec::new();
     let mut population = Population::default();
     for id in 0..messages {
         let hash = seed.wrapping_add(id.wrapping_mul(0x9e37_79b9));
         let (raw, labels, timestamp) = raw_message(id, hash, &mut population);
-        let location = writer.append_raw(id, &raw)?;
-        message_insert.execute(params![
+        let pending = session.writer_mut().append_raw(id, &raw)?;
+        staged.push(GmailBatchRecord::new(
+            "synthetic".into(),
+            format!("gmail-{id}"),
             id as i64,
-            format!("gmail:synthetic:gmail-{id}"),
-            "synthetic",
-            location.segment,
-            location.offset as i64,
-            location.frame_bytes as i64,
-            &location.reference.blake3[..],
-        ])?;
-        gmail_insert.execute(params![
-            id as i64,
-            id as i64,
+            format!("thread-{id}"),
             json!(labels).to_string(),
-            timestamp,
-            format!("{id}"),
-        ])?;
+            Some(timestamp),
+            Some(format!("{id}")),
+            pending,
+        ));
+        if staged.len() >= CATALOGUE_BATCH_RECORDS
+            || session.writer_mut().pending_raw().1 >= CATALOGUE_BATCH_BYTES
+        {
+            let durable = session.writer_mut().durable_barrier()?;
+            session.publish_gmail_batch(&staged, &durable)?;
+            staged.clear();
+        }
     }
-    drop(message_insert);
-    drop(gmail_insert);
-    writer.sync()?;
-    transaction.commit()?;
+    if !staged.is_empty() {
+        let durable = session.writer_mut().durable_barrier()?;
+        session.publish_gmail_batch(&staged, &durable)?;
+    }
     snapshot(&phases, "after_archive_generation");
     let generate_ms = started.elapsed().as_millis();
     let index_started = Instant::now();
