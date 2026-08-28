@@ -902,3 +902,24 @@ résultats d'expérience locale :
   comme messages : il suit le catalogue autoritatif.
 - **État :** orphan detection closed; orphan recovery deliberately not
   implemented.
+
+## 2026-08-28 — Tier A R1 : implémentation candidate en audit
+
+- **Implémentation candidate :** `recovery::plan_recovery` est strictement read-only,
+  déterministe et sans accès réseau. Il ne prend pas le lock writer et ne
+  crée ni WAL/SHM, sidecar ni catalogue de remplacement.
+- **Décision :** `OrphanValidated` reste `SalvageOnly`, même si un autre
+  frame réutilise son `doc_id`. `CataloguedInconsistent` est
+  `UnsafeToRepairAutomatically`; `IncompleteTail` est seulement un
+  candidat de nettoyage futur.
+- **Décision :** une absence physique est `RecoverableWithSource` uniquement
+  avec une identité Gmail ou IMAP durable présente dans SQLite ; le re-fetch
+  reste une action future explicite. Sans identité, elle est
+  `UnrecoverableLocally`. Les frontiers ne bougent jamais par recovery.
+- **Précision :** `RecoverableWithSource` signifie seulement qu'une identité
+  forte permet de tenter un futur re-fetch ; cela ne garantit ni la
+  disponibilité de la source ni l'identité des octets retournés avec le RAW
+  historique perdu.
+- **Conclusion :** le schéma catalogue v1, avec provenance et identités
+  `NOT NULL`, ne représente pas honnêtement un RAW salvage dont la source est
+  perdue. Il faudra un modèle séparé ou une évolution explicite du schéma.

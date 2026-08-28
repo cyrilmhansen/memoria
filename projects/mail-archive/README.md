@@ -23,6 +23,7 @@ cargo run -p mail-archive-experiment --bin mail-archive-experiment -- cas-benchm
 cargo test -p mail-archive-experiment
 cargo run -p mail-archive-experiment --bin mail-archive-experiment -- gmail-report --archive /chemin/archive
 cargo run -p mail-archive-experiment --bin mail-archive-experiment -- archive-inventory --archive /chemin/archive
+cargo run -p mail-archive-experiment --bin mail-archive-experiment -- recovery-plan --archive /chemin/archive
 cargo run -p mail-archive-experiment --bin mail-archive-app
 cargo run -p mail-archive-experiment --bin mail-archive-app -- --archive /chemin/archive
 cargo run -p mail-archive-experiment --bin mail-archive-app -- --archive /chemin/archive --benchmark
@@ -178,6 +179,51 @@ active les mesures gzip/zstd, coûteuses sur les gros profils.
   seule une queue terminale trop courte pour un header est incomplète. Le scan
   et `archive_summary` sont strictement read-only. Le rebuild Tantivy suit le
   catalogue autoritatif et ignore les orphans.
+- `recovery-plan` produit un plan Tier A déterministe et explicable, sans
+  réseau, lock writer, écriture SQLite, sidecar, adoption d'orphelin, relink
+  ou troncature. Un plan ne vaut jamais autorisation d'exécuter l'action.
+
+## Politique de recovery Tier A (R1)
+
+Le RAW validé permet de conserver et d'exporter des octets byte-exacts, ainsi
+que son `doc_id` encodé et son BLAKE3 calculé. Il ne permet pas, à lui seul,
+d'inventer un compte, un Gmail ID, un thread, des labels ou une identité IMAP.
+
+| État | Automatique | Source | Choix utilisateur | Salvage / local |
+|---|---:|---:|---:|---|
+| AvailableValidated | non nécessaire | non | non | aucune action |
+| OrphanValidated | non | non | oui | oui, en place et byte-exact |
+| PhysicallyMissing + identité durable | non | oui | oui | non |
+| PhysicallyMissing sans identité | non | non | oui | non, irrécupérable localement |
+| CataloguedInconsistent | non | candidat seulement | oui | parfois, sans relink |
+| PhysicalCorruption | non | non | oui | irrécupérable localement ; frames indépendantes séparées seulement |
+| IncompleteTail | jamais en R1 | non | oui | cleanup candidate conditionnel seulement |
+| CatalogueLost + RAW valides | non | à étudier | oui | oui, catalogue de salvage uniquement |
+
+Une identité Gmail complète est `source_account + gmail_message_id` ; une
+identité IMAP complète est `source_account + mailbox + UIDVALIDITY + UID`.
+Un `Message-ID` MIME, un sujet, une date ou un expéditeur ne suffit pas pour
+un re-fetch automatique. Les frontiers Gmail history et IMAP ne bougent
+jamais pendant ce planner ni du seul fait d'un RAW retrouvé.
+
+Une `CataloguedInconsistent` reste une contradiction entre sources : même
+`doc_id` ailleurs, MIME similaire ou proximité physique ne sont pas des
+preuves. Tantivy/FTS, MIME analysé, HTML et thumbnails sont des dérivés ; ils
+peuvent aider à identifier un salvage mais ne peuvent ni réparer les octets
+ni fournir une provenance Tier A.
+
+Une `IncompleteTail` est seulement un candidat de nettoyage futur, jamais une
+autorisation de tronquer. Une troncature future devra vérifier que la zone est
+réellement terminale, qu'aucune revendication catalogue ne la concerne ou ne
+la chevauche, qu'aucune frame valide ultérieure n'existe, que l'autorité
+single-writer est détenue et que la destruction est explicitement demandée et
+autorisée par la politique de recovery. R1 ne contient aucun code destructif.
+
+Le schéma catalogue v1 impose des champs de provenance et d'identité `NOT
+NULL`. Il ne peut donc pas représenter honnêtement un RAW récupéré dont la
+source est perdue. Une future exécution devra choisir un modèle de salvage
+séparé ou une évolution explicite du schéma ; elle ne doit pas remplir ces
+champs avec `unknown`, une chaîne vide ou une heuristique.
 - L’export EML individuel et batch est disponible et copie les octets RAW ; la
   restauration complète et la migration vers un fournisseur ne sont pas
   implémentées.

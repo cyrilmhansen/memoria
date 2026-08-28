@@ -26,6 +26,7 @@ pub mod html_preview;
 pub mod html_remote_evidence;
 pub mod i18n;
 pub mod imap;
+pub mod recovery;
 
 pub use attachment_text::{
     discover_providers, providers_for_mime, selected_provider, AttachmentTextStats, BackendKind,
@@ -1067,7 +1068,12 @@ pub struct ArchiveSummary {
 
 pub fn archive_summary(root: &Path) -> io::Result<ArchiveSummary> {
     let catalog_path = root.join("metadata.sqlite");
-    let messages = if catalog_path.exists() {
+    let catalogue_present = match fs::metadata(&catalog_path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    let messages = if catalogue_present {
         validate_existing_catalogue(&catalog_path).map_err(sqlite_io)?;
         let connection =
             Connection::open_with_flags(&catalog_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -1080,7 +1086,7 @@ pub fn archive_summary(root: &Path) -> io::Result<ArchiveSummary> {
     } else {
         0
     };
-    let physical = if catalog_path.exists() {
+    let physical = if catalogue_present {
         inventory_physical(root)?
     } else {
         PhysicalInventory::default()
@@ -2536,8 +2542,20 @@ fn allocate_frame_body(body_len: u64) -> io::Result<Vec<u8>> {
 }
 
 pub fn inventory_physical(root: &Path) -> io::Result<PhysicalInventory> {
-    let (catalogue_locations, catalogue_references) = catalogue_frame_sets(root)?;
-    let catalogue_records = inventory_records(root)?;
+    let catalogue_path = root.join("metadata.sqlite");
+    let catalogue_present = match fs::metadata(&catalogue_path) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    let (catalogue_locations, catalogue_references, catalogue_records) = if catalogue_present {
+        let (locations, references) = catalogue_frame_sets(root)?;
+        (locations, references, inventory_records(root)?)
+    } else {
+        // A missing catalogue cannot establish any physical claim.  The
+        // scanner remains useful as an unlinked RAW salvage inventory.
+        (HashSet::new(), HashSet::new(), Vec::new())
+    };
     let mut result = PhysicalInventory {
         catalogued_records: catalogue_records.len() as u64,
         validated_catalogued_records: catalogue_records

@@ -54,6 +54,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "gmail-sync" => gmail_sync(&args, &out)?,
         "gmail-report" => gmail_report(&args, &out)?,
         "archive-inventory" => archive_inventory(&args, &out)?,
+        "recovery-plan" => recovery_plan(&args, &out)?,
         "gmail-index" => gmail_index(&args, &out)?,
         "search" => search(&args, &out)?,
         "help" | "--help" | "-h" => help(),
@@ -224,6 +225,31 @@ fn archive_inventory(
         inventory.physical_corruptions,
         inventory.incomplete_tails,
     );
+    Ok(())
+}
+
+fn recovery_plan(args: &[String], default_out: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let archive = PathBuf::from(
+        option(args, "--archive").unwrap_or_else(|| default_out.display().to_string()),
+    );
+    let plan = recovery::plan_recovery(&archive)?;
+    println!(
+        "command=recovery-plan\ncatalogue_state={}\narchive_state={}\nitems={}",
+        plan.catalogue_state,
+        plan.archive_state,
+        plan.items.len()
+    );
+    for item in plan.items {
+        println!(
+            "subject={}\nstatus={}\ndisposition={}\nautomatic={}\nproposed_action={}\nreason={}",
+            item.subject,
+            item.status,
+            item.disposition.label(),
+            item.automatic,
+            item.proposed_action,
+            item.evidence.facts.join("; ")
+        );
+    }
     Ok(())
 }
 
@@ -440,5 +466,5 @@ fn benchmark(
 }
 
 fn help() {
-    println!("mail-archive-experiment\n\ncommands: generate | benchmark | cas-benchmark | gmail-sync | gmail-report | archive-inventory | gmail-index | search\noptions: --messages N --seed N --profile light|personal|heavy --queries N --segment-bytes N --attachment-rate P --duplicate-rate P --max-attachment-bytes N --compression --out PATH\ngmail-sync: --archive PATH --credentials PATH --token-dir PATH --account KEY [--max-messages N] [--query GMAIL_QUERY]\ngmail-report: --archive PATH (offline aggregate MIME/checksum report)\narchive-inventory: --archive PATH (read-only physical/catalogue reconciliation)\ngmail-index: --archive PATH (offline Tantivy build and aggregate workload)\nsearch: --archive PATH QUERY (local Tantivy search)\nGmail sync requests only gmail.readonly and never writes to Gmail.");
+    println!("mail-archive-experiment\n\ncommands: generate | benchmark | cas-benchmark | gmail-sync | gmail-report | archive-inventory | recovery-plan | gmail-index | search\noptions: --messages N --seed N --profile light|personal|heavy --queries N --segment-bytes N --attachment-rate P --duplicate-rate P --max-attachment-bytes N --compression --out PATH\ngmail-sync: --archive PATH --credentials PATH --token-dir PATH --account KEY [--max-messages N] [--query GMAIL_QUERY]\ngmail-report: --archive PATH (offline aggregate MIME/checksum report)\narchive-inventory: --archive PATH (read-only physical/catalogue reconciliation)\nrecovery-plan: --archive PATH (strictly read-only Tier A recovery policy plan)\ngmail-index: --archive PATH (offline Tantivy build and aggregate workload)\nsearch: --archive PATH QUERY (local Tantivy search)\nGmail sync requests only gmail.readonly and never writes to Gmail.");
 }

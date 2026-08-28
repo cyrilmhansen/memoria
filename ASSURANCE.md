@@ -78,6 +78,47 @@ Les références manquantes doivent être représentées comme manquantes, et no
 
 ## 5. Modèle de panne Tier A
 
+### Politique R1 de recovery
+
+Le recovery Tier A commence par un plan de preuves en lecture seule. Les
+Les inventaires physique/catalogue fournissent l'état de conservation locale;
+les identités source durables peuvent fournir une preuve additionnelle pour
+classifier une possibilité de re-fetch. Une frame valide non publiée est
+`OrphanValidated` et
+reste un salvage, jamais une ligne `messages`. Une contradiction catalogue /
+RAW est `CataloguedInconsistent` et ne peut pas être relinkée par `doc_id`,
+MIME, proximité ou index dérivé. Les octets corrompus ne sont pas une source
+de reconstruction.
+
+Une absence physique est `RecoverableWithSource` seulement lorsqu'une
+identité durable Gmail (`source_account + gmail_message_id`) ou IMAP
+(`source_account + mailbox + UIDVALIDITY + UID`) est réellement présente.
+Cette classe autorise un futur choix explicite de re-fetch ; elle n'autorise
+pas le réseau ni l'avance d'un frontier dans le planner R1. Sans identité,
+l'absence est `UnrecoverableLocally`. Une queue terminale incomplète est un
+candidat de nettoyage futur, jamais une troncature R1. Cette disposition
+signifie seulement qu'une identité suffisamment forte permet de tenter un
+futur re-fetch; elle ne garantit ni la disponibilité actuelle de Gmail/IMAP,
+ni l'identité des octets retournés avec le RAW historique perdu.
+
+Une zone `PhysicalCorruption` n'est pas un salvage : sans payload et digest
+validés, elle est irrécupérable localement, ou unsafe si elle contredit une
+revendication catalogue. Seules les frames indépendantes validées peuvent
+être salvagées.
+
+`IncompleteTail` ne donne pas une autorisation de destruction. Une future
+troncature ne pourra être envisagée qu'après démonstration simultanée que la
+zone est réellement terminale, qu'aucune revendication catalogue ne la
+concerne ou ne la chevauche, qu'aucune frame valide ultérieure n'existe, que
+l'autorité single-writer est détenue pendant l'opération et que la destruction
+est explicitement demandée et autorisée par la politique de recovery. R1 ne
+tronque jamais.
+
+`recovery-plan` n'acquiert pas l'autorité single-writer, n'écrit ni SQLite ni
+RAW, ne crée pas de sidecar et n'avance aucun état source. Les index, MIME
+analysé, HTML et thumbnails sont Tier B/C et ne peuvent justifier une
+réparation Tier A.
+
 Les garanties Tier A doivent être définies par rapport à plusieurs classes de panne distinctes.
 
 ### Crash du processus

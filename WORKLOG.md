@@ -1045,3 +1045,36 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
 - **Décision :** la propriété reste `single-writer enforced; multiwriter
   deliberately unsupported`; NFS/SMB et rename concurrent restent hors
   garantie.
+
+## 2026-08-28 — Tier A R1 : recovery read-only
+
+- **Fait vérifié :** inspection des inventaires, lecteurs autoritatifs,
+  `ArchiveSession`, schéma SQLite v1 et identités Gmail/IMAP. Le join
+  physique est complet ; `doc_id` n'est pas une identité source.
+- **Implémentation :** ajout de `recovery::plan_recovery` et de la commande
+  `recovery-plan`. Les actions sont proposées, jamais automatiques : aucun
+  re-fetch, relink, adoption, truncation, frontier update ou écriture.
+- **Tests ciblés :** cible absente sans création, catalogue invalide
+  fail-closed et répétition déterministe ; les tests d'inventaire existants
+  couvrent same-`doc_id`, corruption, coordonnées/BLAKE3 incohérents, missing
+  segment et incomplete tail.
+- **Décision :** le catalogue v1 ne représente pas honnêtement un salvage
+  sans provenance ; future exécution = modèle séparé ou évolution explicite.
+  Aucun commit.
+
+## 2026-08-28 — R1 : corrections d’audit Sol High
+
+- **Correction :** `metadata.sqlite` est considéré absent uniquement sur
+  `NotFound`; toute autre erreur d’accès reste fail-closed. Catalogue perdu
+  et archive vide ne produisent aucun salvage fictif : chaque salvage vient
+  d’une frame RAW réellement validée.
+- **Correction :** les identités source sont exposées dans
+  `RecoveryEvidence` avec leurs valeurs observées. Compte/ID ou mailbox/UID
+  invalides, état source non interprétable, identité supprimée ou conflit
+  rendent la classification non optimiste.
+- **Correction :** une contradiction au même emplacement physique prime sur
+  `PhysicallyMissing`; une corruption n’est jamais `SalvageOnly`; une tail
+  revendiquée devient unsafe. Une archive RAW absente est traitée record par
+  record.
+- **État :** implémentation candidate corrigée, validations finales Sol High
+  en cours. Aucun recovery exécuté et aucun commit.

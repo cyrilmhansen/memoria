@@ -309,6 +309,10 @@ The next product questions are deliberately limited to durable archive use:
 - add additional local sources such as MBOX when their requirements are known;
 - improve long-term offline retention and recovery operations.
 
+Le chantier R1 dispose d'une politique de recovery conservatrice et d'une
+commande `recovery-plan` read-only ; aucune réparation physique ou
+reconstruction de provenance n'est encore promise.
+
 These are future directions, not current promises.
 
 ## Current limitations
