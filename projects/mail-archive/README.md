@@ -24,12 +24,24 @@ cargo test -p mail-archive-experiment
 cargo run -p mail-archive-experiment --bin mail-archive-experiment -- gmail-report --archive /chemin/archive
 cargo run -p mail-archive-experiment --bin mail-archive-experiment -- archive-inventory --archive /chemin/archive
 cargo run -p mail-archive-experiment --bin mail-archive-experiment -- recovery-plan --archive /chemin/archive
+cargo run -p mail-archive-experiment --bin mail-archive-experiment -- recover-gmail-raw --archive /chemin/archive --doc-id N --credentials /chemin/client_secret.json
 cargo run -p mail-archive-experiment --bin mail-archive-app
 cargo run -p mail-archive-experiment --bin mail-archive-app -- --archive /chemin/archive
 cargo run -p mail-archive-experiment --bin mail-archive-app -- --archive /chemin/archive --benchmark
 ```
 
 ## Synchronisation Gmail en lecture seule
+
+Une récupération expérimentale explicite est disponible pour un seul
+`doc_id` : `recover-gmail-raw` re-fetch uniquement l'identité Gmail durable,
+compare le BLAKE3 au digest historique et ne publie qu'en cas d'égalité
+exacte. Avant cette validation complète, elle ne crée ni segment RAW ni frame
+et ne modifie ni le catalogue, ni les métadonnées Gmail, ni la frontière
+d'historique.
+Cette capacité est une **implémentation candidate en audit**.
+Après append durable, un conflit du CAS catalogue peut volontairement laisser
+la nouvelle frame `OrphanValidated`; l'ancienne ligne `messages` reste alors
+non publiée.
 
 Le connecteur utilise exclusivement le scope
 `https://www.googleapis.com/auth/gmail.readonly`. Il appelle `list`, `get` en
@@ -42,12 +54,20 @@ restent dans le catalogue SQLite.
 cargo run -p mail-archive-experiment --bin mail-archive-experiment -- gmail-sync \
   --archive /chemin/archive \
   --credentials /chemin/client_secret.json \
-  --account compte-principal \
   --max-messages 100
 ```
 
-`--query` accepte une requête Gmail pour borner une expérience. Une clé opaque
-est recommandée pour `--account`. La synchronisation incrémentale utilise le
+La synchronisation dérive `source_account` depuis l'adresse renvoyée par le
+profil Gmail : c'est une identité locale opaque
+`gmail:<BLAKE3(email canonique)>`. `--account`, lorsqu'il est fourni, est une
+assertion sur l'adresse e-mail attendue ; il ne devient jamais l'identité
+persistée et l'utilisateur n'a pas à connaître la clé opaque.
+
+`--query` accepte une requête Gmail pour borner une expérience. Si `--account`
+est fourni, il doit correspondre à l'adresse du profil Gmail authentifié
+(trim et minuscules ASCII) ; la CLI dérive ensuite elle-même la clé opaque dans
+le parcours normal.
+La synchronisation incrémentale utilise le
 `historyId`; si Gmail ne conserve plus cet historique, le connecteur repart en
 full sync sans effacer l’archive. Une full sync complète marque les messages
 absents comme supprimés côté source, mais ne supprime jamais leurs frames. Sa
@@ -108,7 +128,7 @@ cargo run -p mail-archive-experiment --bin mail-archive-app -- \
   --archive /chemin/archive \
   --credentials ~/.config/mail-archive/gmail-client.json \
   --token-dir ~/.config/mail-archive/tokens \
-  --account compte-local
+  # --account est facultatif ; il sert seulement de contrôle de compatibilité
 ```
 
 Sans credentials, la consultation locale reste disponible et la vue Archive
@@ -193,7 +213,7 @@ d'inventer un compte, un Gmail ID, un thread, des labels ou une identité IMAP.
 |---|---:|---:|---:|---|
 | AvailableValidated | non nécessaire | non | non | aucune action |
 | OrphanValidated | non | non | oui | oui, en place et byte-exact |
-| PhysicallyMissing + identité durable | non | oui | oui | non |
+| PhysicallyMissing + identité durable | non | oui | oui | re-fetch exact seulement |
 | PhysicallyMissing sans identité | non | non | oui | non, irrécupérable localement |
 | CataloguedInconsistent | non | candidat seulement | oui | parfois, sans relink |
 | PhysicalCorruption | non | non | oui | irrécupérable localement ; frames indépendantes séparées seulement |

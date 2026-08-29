@@ -3,10 +3,268 @@
 //! This module deliberately has no executor.  A plan is evidence and a
 //! proposed next action, never permission to mutate the archive.
 
-use crate::{ArchiveLocation, PhysicalFrameStatus, RecordInventoryStatus};
+use crate::{gmail, ArchiveLocation, PhysicalFrameStatus, RecordInventoryStatus};
 use rusqlite::{Connection, OpenFlags};
 use std::io;
 use std::path::{Path, PathBuf};
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GmailRecoveryResult {
+    Recovered {
+        doc_id: i64,
+        location: ArchiveLocation,
+    },
+    AlreadyAvailable,
+    AccountMismatch,
+    UnsafeInconsistent(String),
+    RecoveryConflict,
+    SourceUnavailable,
+    SourceContentChanged {
+        expected: [u8; 32],
+        fetched: [u8; 32],
+    },
+}
+
+struct GmailRecoveryRecord {
+    location: ArchiveLocation,
+    source_account: String,
+    gmail_id: String,
+    expected_blake3: [u8; 32],
+}
+
+enum PreparationError {
+    Result(GmailRecoveryResult),
+    Error(gmail::GmailError),
+}
+
+fn preparation_error(error: impl Into<String>) -> PreparationError {
+    PreparationError::Result(GmailRecoveryResult::UnsafeInconsistent(error.into()))
+}
+
+fn recovery_record(root: &Path, doc_id: i64) -> Result<GmailRecoveryRecord, PreparationError> {
+    let inventory = crate::inventory_records(root)
+        .map_err(|error| PreparationError::Error(gmail::GmailError::Other(error.to_string())))?;
+    let physical = crate::inventory_physical(root)
+        .map_err(|error| PreparationError::Error(gmail::GmailError::Other(error.to_string())))?;
+    let record = inventory
+        .into_iter()
+        .find(|record| record.doc_id == doc_id)
+        .ok_or_else(|| preparation_error(format!("catalogue record {doc_id} not found")))?;
+    match record.status {
+        RecordInventoryStatus::AvailableValidated => {
+            return Err(PreparationError::Result(
+                GmailRecoveryResult::AlreadyAvailable,
+            ))
+        }
+        RecordInventoryStatus::Inconsistent { reason } => {
+            return Err(preparation_error(format!(
+                "CataloguedInconsistent: {reason}"
+            )))
+        }
+        RecordInventoryStatus::PhysicallyMissing => {}
+    }
+    let location = record
+        .location
+        .clone()
+        .ok_or_else(|| preparation_error("missing catalogue location"))?;
+    if physical.frames.iter().any(|frame| {
+        frame.location.segment == location.segment
+            && frame.location.offset == location.offset
+            && matches!(frame.status, PhysicalFrameStatus::CataloguedInconsistent)
+    }) {
+        return Err(preparation_error(
+            "CataloguedInconsistent: physical frame contradicts catalogue claim",
+        ));
+    }
+    let connection = Connection::open_with_flags(
+        root.join("metadata.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|error| PreparationError::Error(gmail::GmailError::Other(error.to_string())))?;
+    let mut rows = connection
+        .prepare(
+            "SELECT source_account,gmail_message_id,source_state
+             FROM gmail_messages WHERE doc_id=?1 ORDER BY source_account,gmail_message_id",
+        )
+        .map_err(|error| PreparationError::Error(gmail::GmailError::Other(error.to_string())))?;
+    let identities = rows
+        .query_map([doc_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| PreparationError::Error(gmail::GmailError::Other(error.to_string())))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| PreparationError::Error(gmail::GmailError::Other(error.to_string())))?;
+    let has_other_source: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM imap_messages WHERE doc_id=?1)",
+            [doc_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| PreparationError::Error(gmail::GmailError::Other(error.to_string())))?;
+    if identities.len() != 1 || has_other_source {
+        return Err(preparation_error("Gmail identity is missing or ambiguous"));
+    }
+    let (source_account, gmail_id, source_state) = identities.into_iter().next().unwrap();
+    if source_state != "present" || source_account.is_empty() || gmail_id.is_empty() {
+        return Err(preparation_error(
+            "Gmail source identity is not present and complete",
+        ));
+    }
+    let (segment, offset, frame_bytes, digest) = connection
+        .query_row(
+            "SELECT segment,archive_offset,frame_bytes,raw_blake3 FROM messages WHERE doc_id=?1",
+            [doc_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                ))
+            },
+        )
+        .map_err(|error| PreparationError::Error(gmail::GmailError::Other(error.to_string())))?;
+    let expected_blake3: [u8; 32] = digest
+        .try_into()
+        .map_err(|_| preparation_error("historical BLAKE3 is invalid"))?;
+    let location = ArchiveLocation {
+        segment,
+        offset: u64::try_from(offset).map_err(|_| preparation_error("negative archive offset"))?,
+        frame_bytes: u64::try_from(frame_bytes)
+            .map_err(|_| preparation_error("negative archive frame length"))?,
+    };
+    Ok(GmailRecoveryRecord {
+        location,
+        source_account,
+        gmail_id,
+        expected_blake3,
+    })
+}
+
+/// Re-fetch and repair exactly one missing Gmail RAW record.
+pub fn recover_missing_gmail_raw<T: gmail::GmailTransport>(
+    root: &Path,
+    doc_id: i64,
+    transport: &mut T,
+    segment_bytes: u64,
+) -> Result<GmailRecoveryResult, gmail::GmailError> {
+    recover_missing_gmail_raw_with_hook(root, doc_id, transport, segment_bytes, |_, _| Ok(()))
+}
+
+fn recover_missing_gmail_raw_with_hook<T, F>(
+    root: &Path,
+    doc_id: i64,
+    transport: &mut T,
+    segment_bytes: u64,
+    before_catalogue_publish: F,
+) -> Result<GmailRecoveryResult, gmail::GmailError>
+where
+    T: gmail::GmailTransport,
+    F: FnOnce(&crate::CatalogueConnection, &mut String) -> rusqlite::Result<()>,
+{
+    let authority = crate::acquire_recovery_authority(root)
+        .map_err(|error| gmail::GmailError::Io(error.to_string()))?;
+    let record = match recovery_record(root, doc_id) {
+        Ok(record) => record,
+        Err(PreparationError::Result(result)) => return Ok(result),
+        Err(PreparationError::Error(error)) => return Err(error),
+    };
+    let connection = Connection::open_with_flags(
+        root.join("metadata.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|error| gmail::GmailError::Other(error.to_string()))?;
+    let message_id: String = connection
+        .query_row(
+            "SELECT message_id FROM messages WHERE doc_id=?1",
+            [doc_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| gmail::GmailError::Other(error.to_string()))?;
+    let canonical = gmail::gmail_message_identity(&record.source_account, &record.gmail_id);
+    if message_id != canonical {
+        return Ok(GmailRecoveryResult::UnsafeInconsistent(
+            "messages.message_id does not match canonical Gmail identity".into(),
+        ));
+    }
+    let profile = transport.profile()?;
+    let authenticated = profile
+        .email_address
+        .as_deref()
+        .map(gmail::gmail_source_account);
+    let expected_account = record.source_account.as_str();
+    if authenticated.as_deref() != Some(expected_account) {
+        return Ok(GmailRecoveryResult::AccountMismatch);
+    }
+    let raw_message = match transport.get_raw(&record.gmail_id) {
+        Ok(raw) => raw,
+        Err(gmail::GmailError::Http(404)) => return Ok(GmailRecoveryResult::SourceUnavailable),
+        Err(error) => return Err(error),
+    };
+    if raw_message.id != record.gmail_id {
+        return Ok(GmailRecoveryResult::UnsafeInconsistent(
+            "Gmail response ID does not match requested identity".into(),
+        ));
+    }
+    let raw = gmail::decode_raw(&raw_message.raw)?;
+    // Re-read all Tier-A preconditions after the remote proof and before opening a writer.
+    let current = match recovery_record(root, doc_id) {
+        Ok(record) => record,
+        Err(PreparationError::Result(result)) => return Ok(result),
+        Err(PreparationError::Error(error)) => return Err(error),
+    };
+    if current.source_account != record.source_account
+        || current.gmail_id != record.gmail_id
+        || current.expected_blake3 != record.expected_blake3
+        || current.location != record.location
+    {
+        return Ok(GmailRecoveryResult::UnsafeInconsistent(
+            "record changed during revalidation".into(),
+        ));
+    }
+    let fetched = *blake3::hash(&raw).as_bytes();
+    if fetched != record.expected_blake3 {
+        return Ok(GmailRecoveryResult::SourceContentChanged {
+            expected: record.expected_blake3,
+            fetched,
+        });
+    }
+    let mut session =
+        crate::ArchiveSession::recovery_with_authority(root, segment_bytes, authority)
+            .map_err(|error| gmail::GmailError::Io(error.to_string()))?;
+    let (writer, _) = session.parts_mut();
+    let pending = writer
+        .append_raw(doc_id as u64, &raw)
+        .map_err(|error| gmail::GmailError::Io(error.to_string()))?;
+    let durable = writer
+        .durable_barrier()
+        .map_err(|error| gmail::GmailError::Io(error.to_string()))?;
+    let location = durable.entries()[0].reference().location.clone();
+    let (_, connection) = session.parts_mut();
+    let mut canonical_message_id = canonical;
+    before_catalogue_publish(connection, &mut canonical_message_id)
+        .map_err(|error| gmail::GmailError::Other(error.to_string()))?;
+    let published = session
+        .publish_gmail_recovery(
+            doc_id,
+            &record.source_account,
+            &record.gmail_id,
+            &canonical_message_id,
+            &record.location,
+            &record.expected_blake3,
+            &pending,
+            &durable,
+        )
+        .map_err(|error| gmail::GmailError::Other(error.to_string()))?;
+    if !published {
+        return Ok(GmailRecoveryResult::RecoveryConflict);
+    }
+    Ok(GmailRecoveryResult::Recovered { doc_id, location })
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum RecoveryDisposition {
@@ -457,14 +715,572 @@ pub fn plan_recovery(root: &Path) -> io::Result<RecoveryPlan> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gmail::{
+        GmailError, GmailTransport, HistoryPage, ListPage, MetadataMessage, Profile, RawMessage,
+    };
     use crate::{ArchiveSession, CatalogueBatchRecord, Message};
+    use base64::Engine;
     use rusqlite::Connection;
     use std::fs;
+
+    struct FakeGmail {
+        response: Result<Vec<u8>, GmailError>,
+        fetched_id: Option<String>,
+        authenticated_account: Option<String>,
+        returned_id: Option<String>,
+    }
+
+    impl GmailTransport for FakeGmail {
+        fn list(&mut self, _: Option<&str>, _: Option<&str>) -> Result<ListPage, GmailError> {
+            Ok(ListPage::default())
+        }
+        fn get_raw(&mut self, id: &str) -> Result<RawMessage, GmailError> {
+            self.fetched_id = Some(id.into());
+            self.response.clone().map(|bytes| RawMessage {
+                id: self.returned_id.clone().unwrap_or_else(|| id.into()),
+                thread_id: String::new(),
+                label_ids: Vec::new(),
+                history_id: None,
+                internal_date: None,
+                raw: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes),
+            })
+        }
+        fn get_metadata(&mut self, _: &str) -> Result<MetadataMessage, GmailError> {
+            unreachable!()
+        }
+        fn profile(&mut self) -> Result<Profile, GmailError> {
+            Ok(Profile {
+                history_id: "fixture-history".into(),
+                email_address: self.authenticated_account.clone(),
+            })
+        }
+        fn history(&mut self, _: &str, _: Option<&str>) -> Result<HistoryPage, GmailError> {
+            unreachable!()
+        }
+    }
+
+    impl Clone for GmailError {
+        fn clone(&self) -> Self {
+            match self {
+                GmailError::Config(value) => GmailError::Config(value.clone()),
+                GmailError::Http(value) => GmailError::Http(*value),
+                GmailError::HistoryExpired => GmailError::HistoryExpired,
+                GmailError::Json(value) => GmailError::Json(value.clone()),
+                GmailError::Io(value) => GmailError::Io(value.clone()),
+                GmailError::Other(value) => GmailError::Other(value.clone()),
+            }
+        }
+    }
+
+    type SidecarSnapshot = (String, Option<(u64, [u8; 32])>);
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ArchiveSnapshot {
+        segments: Vec<(String, u64, [u8; 32])>,
+        catalogue: Vec<u8>,
+        sidecars: Vec<SidecarSnapshot>,
+    }
+
+    fn archive_snapshot(root: &std::path::Path) -> ArchiveSnapshot {
+        let mut segments = fs::read_dir(root.join("archive"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".arc"))
+            .map(|entry| {
+                let bytes = fs::read(entry.path()).unwrap();
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    bytes.len() as u64,
+                    *blake3::hash(&bytes).as_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        segments.sort_by(|left, right| left.0.cmp(&right.0));
+        ArchiveSnapshot {
+            segments,
+            catalogue: fs::read(root.join("metadata.sqlite")).unwrap(),
+            sidecars: [
+                "metadata.sqlite-wal",
+                "metadata.sqlite-shm",
+                "metadata.sqlite-journal",
+            ]
+            .into_iter()
+            .map(|name| {
+                let path = root.join(name);
+                let state = fs::read(&path)
+                    .ok()
+                    .map(|bytes| (bytes.len() as u64, *blake3::hash(&bytes).as_bytes()));
+                (name.into(), state)
+            })
+            .collect(),
+        }
+    }
+
+    fn table_snapshot(
+        connection: &Connection,
+        sql: &str,
+        columns: usize,
+    ) -> Vec<Vec<rusqlite::types::Value>> {
+        connection
+            .prepare(sql)
+            .unwrap()
+            .query_map([], |row| {
+                (0..columns)
+                    .map(|index| row.get(index))
+                    .collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn gmail_missing_fixture(label: &str, state: &str) -> (std::path::PathBuf, Vec<u8>) {
+        let root = std::env::temp_dir().join(format!(
+            "atlas-recovery-exact-{label}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let (root, location) = published_fixture(label);
+        let raw = b"From: fixture@example.test\r\n\r\nbody".to_vec();
+        let source_account = gmail::gmail_source_account("account-a");
+        let message_identity = gmail::gmail_message_identity(&source_account, "gmail-1");
+        let connection = Connection::open(root.join("metadata.sqlite")).unwrap();
+        connection
+            .execute(
+                "UPDATE messages SET message_id=?1 WHERE doc_id=1",
+                [message_identity],
+            )
+            .unwrap();
+        connection.execute("INSERT INTO gmail_messages(source_account,gmail_message_id,doc_id,thread_id,label_ids,source_state,first_seen_unix,last_seen_unix) VALUES (?1,'gmail-1',1,'thread','[]',?2,0,0)", rusqlite::params![source_account, state]).unwrap();
+        drop(connection);
+        fs::remove_file(root.join("archive").join(location.segment)).unwrap();
+        (root, raw)
+    }
 
     #[test]
     fn disposition_labels_are_stable() {
         assert_eq!(RecoveryDisposition::SalvageOnly.label(), "salvage");
         assert!(!RecoveryDisposition::NoAction.label().is_empty());
+    }
+
+    #[test]
+    fn exact_gmail_recovery_publishes_byte_exact_raw() {
+        let (root, raw) = gmail_missing_fixture("exact", "present");
+        let old_location = crate::inventory_records(&root).unwrap()[0]
+            .location
+            .clone()
+            .unwrap();
+        let mut transport = FakeGmail {
+            response: Ok(raw.clone()),
+            fetched_id: None,
+            authenticated_account: Some("account-a".into()),
+            returned_id: None,
+        };
+        let result = recover_missing_gmail_raw(&root, 1, &mut transport, 4096).unwrap();
+        assert!(matches!(result, GmailRecoveryResult::Recovered { .. }));
+        assert_eq!(transport.fetched_id.as_deref(), Some("gmail-1"));
+        assert_eq!(crate::read_archived_raw(&root, 1).unwrap(), raw);
+        assert!(matches!(
+            crate::inventory_records(&root).unwrap()[0].status,
+            RecordInventoryStatus::AvailableValidated
+        ));
+        let repaired = crate::inventory_records(&root).unwrap()[0]
+            .location
+            .clone()
+            .unwrap();
+        assert_ne!(repaired, old_location);
+        assert!(crate::inventory_physical(&root)
+            .unwrap()
+            .frames
+            .iter()
+            .any(|frame| {
+                frame.location == repaired
+                    && frame.status == crate::PhysicalFrameStatus::CataloguedValidated
+            }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn mismatch_404_network_and_deleted_are_fail_closed() {
+        for (label, state, response, expected_fetch) in [
+            ("mismatch", "present", Ok(b"changed".to_vec()), true),
+            ("missing", "present", Err(GmailError::Http(404)), true),
+            (
+                "network",
+                "present",
+                Err(GmailError::Other("network".into())),
+                true,
+            ),
+            (
+                "deleted",
+                "deleted",
+                Ok(b"From: fixture@example.test\r\n\r\nbody".to_vec()),
+                false,
+            ),
+        ] {
+            let (root, _) = gmail_missing_fixture(label, state);
+            let before = archive_snapshot(&root);
+            let mut transport = FakeGmail {
+                response,
+                fetched_id: None,
+                authenticated_account: Some("account-a".into()),
+                returned_id: None,
+            };
+            let result = recover_missing_gmail_raw(&root, 1, &mut transport, 4096);
+            if label == "network" {
+                assert!(result.is_err());
+            } else if label == "missing" {
+                assert_eq!(result.unwrap(), GmailRecoveryResult::SourceUnavailable);
+            } else if label == "deleted" {
+                assert!(matches!(
+                    result.unwrap(),
+                    GmailRecoveryResult::UnsafeInconsistent(_)
+                ));
+            } else {
+                assert!(matches!(
+                    result.unwrap(),
+                    GmailRecoveryResult::SourceContentChanged { .. }
+                ));
+            }
+            assert_eq!(transport.fetched_id.is_some(), expected_fetch);
+            assert_eq!(archive_snapshot(&root), before);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn recovery_refuses_ambiguous_or_inconsistent_records_without_fetch() {
+        let (root, _) = gmail_missing_fixture("ambiguous", "present");
+        let connection = Connection::open(root.join("metadata.sqlite")).unwrap();
+        connection.execute("INSERT INTO imap_messages(source_account,mailbox,uid_validity,uid,doc_id,flags,source_state,first_seen_unix,last_seen_unix) VALUES ('account-b','INBOX',42,9,1,'[]','present',0,0)", []).unwrap();
+        drop(connection);
+        let mut transport = FakeGmail {
+            response: Ok(Vec::new()),
+            fetched_id: None,
+            authenticated_account: Some("account-a".into()),
+            returned_id: None,
+        };
+        let result = recover_missing_gmail_raw(&root, 1, &mut transport, 4096).unwrap();
+        assert!(matches!(result, GmailRecoveryResult::UnsafeInconsistent(_)));
+        assert!(transport.fetched_id.is_none());
+        let _ = fs::remove_dir_all(root);
+
+        let (root, location) = published_fixture("inconsistent");
+        let source_account = gmail::gmail_source_account("account-a");
+        let message_identity = gmail::gmail_message_identity(&source_account, "gmail-1");
+        let connection = Connection::open(root.join("metadata.sqlite")).unwrap();
+        connection
+            .execute(
+                "UPDATE messages SET message_id=?1, frame_bytes=?2 WHERE doc_id=1",
+                rusqlite::params![message_identity, location.frame_bytes as i64 + 1],
+            )
+            .unwrap();
+        connection.execute("INSERT INTO gmail_messages(source_account,gmail_message_id,doc_id,thread_id,label_ids,source_state,first_seen_unix,last_seen_unix) VALUES (?1,'gmail-1',1,'thread','[]','present',0,0)", [&source_account]).unwrap();
+        drop(connection);
+        let before = archive_snapshot(&root);
+        let mut transport = FakeGmail {
+            response: Ok(Vec::new()),
+            fetched_id: None,
+            authenticated_account: Some("account-a".into()),
+            returned_id: None,
+        };
+        assert!(matches!(
+            recover_missing_gmail_raw(&root, 1, &mut transport, 4096).unwrap(),
+            GmailRecoveryResult::UnsafeInconsistent(_)
+        ));
+        assert!(transport.fetched_id.is_none());
+        assert_eq!(archive_snapshot(&root), before);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn account_and_returned_id_mismatches_stop_before_archive_write() {
+        let (root, _) = gmail_missing_fixture("wrong-account", "present");
+        let before = archive_snapshot(&root);
+        let mut transport = FakeGmail {
+            response: Ok(Vec::new()),
+            fetched_id: None,
+            authenticated_account: Some("account-b".into()),
+            returned_id: None,
+        };
+        assert_eq!(
+            recover_missing_gmail_raw(&root, 1, &mut transport, 4096).unwrap(),
+            GmailRecoveryResult::AccountMismatch
+        );
+        assert!(transport.fetched_id.is_none());
+        assert_eq!(archive_snapshot(&root), before);
+        let _ = fs::remove_dir_all(root);
+
+        let (root, raw) = gmail_missing_fixture("wrong-response-id", "present");
+        let mut transport = FakeGmail {
+            response: Ok(raw),
+            fetched_id: None,
+            authenticated_account: Some("account-a".into()),
+            returned_id: Some("gmail-2".into()),
+        };
+        let before = archive_snapshot(&root);
+        assert!(matches!(
+            recover_missing_gmail_raw(&root, 1, &mut transport, 4096).unwrap(),
+            GmailRecoveryResult::UnsafeInconsistent(_)
+        ));
+        assert_eq!(archive_snapshot(&root), before);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn contradictory_message_identity_is_rejected_before_profile() {
+        let (root, _) = gmail_missing_fixture("contradictory-message-id", "present");
+        let connection = Connection::open(root.join("metadata.sqlite")).unwrap();
+        connection
+            .execute(
+                "UPDATE messages SET message_id='contradictory' WHERE doc_id=1",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let before = archive_snapshot(&root);
+        let mut transport = FakeGmail {
+            response: Ok(Vec::new()),
+            fetched_id: None,
+            authenticated_account: None,
+            returned_id: None,
+        };
+        assert!(matches!(
+            recover_missing_gmail_raw(&root, 1, &mut transport, 4096).unwrap(),
+            GmailRecoveryResult::UnsafeInconsistent(_)
+        ));
+        assert!(transport.fetched_id.is_none());
+        assert_eq!(archive_snapshot(&root), before);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn catalogue_conflict_after_durable_append_leaves_fresh_orphan() {
+        let (root, raw) = gmail_missing_fixture("cas-conflict", "present");
+        let old_segments = fs::read_dir(root.join("archive")).unwrap().count();
+        let before_connection = Connection::open(root.join("metadata.sqlite")).unwrap();
+        let old_message: (i64, String, String, i64, i64, Vec<u8>) = before_connection
+            .query_row(
+                "SELECT doc_id,message_id,segment,archive_offset,frame_bytes,raw_blake3
+                 FROM messages WHERE doc_id=1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let old_gmail: (
+            String,
+            String,
+            i64,
+            String,
+            String,
+            Option<i64>,
+            Option<String>,
+            String,
+        ) = before_connection
+            .query_row(
+                "SELECT source_account,gmail_message_id,doc_id,thread_id,label_ids,
+                            internal_date_ms,message_history_id,source_state
+                     FROM gmail_messages WHERE doc_id=1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        drop(before_connection);
+        let before_connection = Connection::open(root.join("metadata.sqlite")).unwrap();
+        let old_messages_full = table_snapshot(
+            &before_connection,
+            "SELECT doc_id,message_id,timestamp,sender,recipients,subject,account,folder,
+                    thread,segment,archive_offset,frame_bytes,raw_blake3
+             FROM messages WHERE doc_id=1",
+            13,
+        );
+        let old_gmail_full = table_snapshot(
+            &before_connection,
+            "SELECT source_account,gmail_message_id,doc_id,thread_id,label_ids,
+                    internal_date_ms,message_history_id,source_state,first_seen_unix,last_seen_unix
+             FROM gmail_messages WHERE doc_id=1",
+            10,
+        );
+        let old_frontier = table_snapshot(
+            &before_connection,
+            "SELECT source_account,history_id,complete FROM gmail_state ORDER BY source_account",
+            3,
+        );
+        drop(before_connection);
+        let mut transport = FakeGmail {
+            response: Ok(raw),
+            fetched_id: None,
+            authenticated_account: Some("account-a".into()),
+            returned_id: None,
+        };
+        let result =
+            recover_missing_gmail_raw_with_hook(&root, 1, &mut transport, 4096, |_, message_id| {
+                *message_id = "gmail:stale".into();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(result, GmailRecoveryResult::RecoveryConflict);
+        assert_eq!(
+            fs::read_dir(root.join("archive")).unwrap().count(),
+            old_segments + 1
+        );
+        assert_eq!(
+            crate::inventory_records(&root).unwrap()[0].status,
+            RecordInventoryStatus::PhysicallyMissing
+        );
+        let physical = crate::inventory_physical(&root).unwrap();
+        assert_eq!(physical.orphan_valid_frames, 1);
+        let after_connection = Connection::open(root.join("metadata.sqlite")).unwrap();
+        let after_message: (i64, String, String, i64, i64, Vec<u8>) = after_connection
+            .query_row(
+                "SELECT doc_id,message_id,segment,archive_offset,frame_bytes,raw_blake3
+                 FROM messages WHERE doc_id=1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(after_message, old_message);
+        assert_eq!(
+            after_connection
+                .query_row(
+                    "SELECT source_account,gmail_message_id,doc_id,thread_id,label_ids,
+                            internal_date_ms,message_history_id,source_state
+                     FROM gmail_messages WHERE doc_id=1",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, Option<i64>>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                            row.get::<_, String>(7)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            old_gmail
+        );
+        assert_eq!(
+            table_snapshot(
+                &after_connection,
+                "SELECT doc_id,message_id,timestamp,sender,recipients,subject,account,folder,
+                        thread,segment,archive_offset,frame_bytes,raw_blake3
+                 FROM messages WHERE doc_id=1",
+                13,
+            ),
+            old_messages_full
+        );
+        assert_eq!(
+            table_snapshot(
+                &after_connection,
+                "SELECT source_account,gmail_message_id,doc_id,thread_id,label_ids,
+                        internal_date_ms,message_history_id,source_state,first_seen_unix,last_seen_unix
+                 FROM gmail_messages WHERE doc_id=1",
+                10,
+            ),
+            old_gmail_full
+        );
+        assert_eq!(
+            table_snapshot(
+                &after_connection,
+                "SELECT source_account,history_id,complete FROM gmail_state ORDER BY source_account",
+                3,
+            ),
+            old_frontier
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn same_doc_id_orphan_is_not_adopted_by_recovery() {
+        let (root, location) = published_fixture("same-doc-orphan-executor");
+        let raw = b"From: fixture@example.test\r\n\r\nbody".to_vec();
+        let source_account = gmail::gmail_source_account("account-a");
+        let message_identity = gmail::gmail_message_identity(&source_account, "gmail-1");
+        let connection = Connection::open(root.join("metadata.sqlite")).unwrap();
+        connection
+            .execute(
+                "UPDATE messages SET message_id=?1, segment='segment-999999.arc' WHERE doc_id=1",
+                [message_identity],
+            )
+            .unwrap();
+        connection.execute("INSERT INTO gmail_messages(source_account,gmail_message_id,doc_id,thread_id,label_ids,source_state,first_seen_unix,last_seen_unix) VALUES (?1,'gmail-1',1,'thread','[]','present',0,0)", [&source_account]).unwrap();
+        drop(connection);
+        let mut transport = FakeGmail {
+            response: Ok(raw.clone()),
+            fetched_id: None,
+            authenticated_account: Some("account-a".into()),
+            returned_id: None,
+        };
+        assert!(matches!(
+            recover_missing_gmail_raw(&root, 1, &mut transport, 4096).unwrap(),
+            GmailRecoveryResult::Recovered { .. }
+        ));
+        let physical = crate::inventory_physical(&root).unwrap();
+        assert_eq!(physical.orphan_valid_frames, 1);
+        assert_eq!(crate::read_archived_raw(&root, 1).unwrap(), raw);
+        assert_ne!(location.segment, "segment-999999.arc");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn recovery_is_no_action_when_raw_is_already_available() {
+        let (root, location) = published_fixture("already-available");
+        let source_account = gmail::gmail_source_account("account-a");
+        let message_identity = gmail::gmail_message_identity(&source_account, "gmail-1");
+        let connection = Connection::open(root.join("metadata.sqlite")).unwrap();
+        connection
+            .execute(
+                "UPDATE messages SET message_id=?1 WHERE doc_id=1",
+                [message_identity],
+            )
+            .unwrap();
+        connection.execute("INSERT INTO gmail_messages(source_account,gmail_message_id,doc_id,thread_id,label_ids,source_state,first_seen_unix,last_seen_unix) VALUES (?1,'gmail-1',1,'thread','[]','present',0,0)", [&source_account]).unwrap();
+        drop(location);
+        let mut transport = FakeGmail {
+            response: Ok(Vec::new()),
+            fetched_id: None,
+            authenticated_account: Some("account-a".into()),
+            returned_id: None,
+        };
+        assert_eq!(
+            recover_missing_gmail_raw(&root, 1, &mut transport, 4096).unwrap(),
+            GmailRecoveryResult::AlreadyAvailable
+        );
+        assert!(transport.fetched_id.is_none());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

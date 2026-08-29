@@ -517,12 +517,31 @@ fn initialize_archive(path: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
-fn source_key(email: Option<&str>, credentials: &std::path::Path) -> String {
-    let stable = email
+fn source_key(email: &str) -> String {
+    gmail::gmail_source_account(email)
+}
+
+fn validate_gui_sync_profile<T: GmailTransport>(
+    transport: &mut T,
+    configured_account: &str,
+    expected_email: Option<&str>,
+) -> Result<(), String> {
+    let profile = transport
+        .profile()
+        .map_err(|error| friendly_gmail_error(&error))?;
+    let authenticated_email = profile
+        .email_address
         .filter(|value| !value.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| credentials.to_string_lossy().into_owned());
-    format!("gmail:{}", blake3::hash(stable.as_bytes()).to_hex())
+        .ok_or("Gmail profile did not return an email address")?;
+    if expected_email.is_some_and(|expected| {
+        gmail::gmail_source_account(expected) != gmail::gmail_source_account(&authenticated_email)
+    }) {
+        return Err("--account does not match the authenticated Gmail profile".into());
+    }
+    if gmail::gmail_source_account(&authenticated_email) != configured_account {
+        return Err("Gmail profile does not match the configured source".into());
+    }
+    Ok(())
 }
 
 fn set_source_state(ui: &MailWindow, source: Option<&GmailSourceConfig>) {
@@ -756,25 +775,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    let cli_credentials = option_argument("--credentials").map(PathBuf::from);
-    let cli_token_dir = option_argument("--token-dir")
-        .map(PathBuf::from)
-        .unwrap_or_else(default_token_dir);
-    let cli_account = option_argument("--account");
-    if let (Some(archive), Some(credentials), Some(account)) =
-        (&initial_archive, cli_credentials, cli_account)
-    {
-        user_config.set_source(
-            archive,
-            GmailSourceConfig {
-                credentials_path: credentials.to_string_lossy().into_owned(),
-                token_dir: cli_token_dir.to_string_lossy().into_owned(),
-                account_key: account,
-                display_email: None,
-            },
-        );
-        let _ = user_config.save();
-    }
+    let cli_expected_email = option_argument("--account");
     let open_started = Instant::now();
     let index_open_us = open_started.elapsed().as_micros();
     if env::args().any(|argument| argument == "--benchmark") {
@@ -1006,6 +1007,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let archive_for_sync = current_archive.clone();
     let source_for_sync = current_source.clone();
     let index_for_refresh = current_index.clone();
+    let expected_email_for_sync = cli_expected_email.clone();
     ui.on_refresh_search_index(move || {
         index_for_refresh
             .borrow()
@@ -1043,12 +1045,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ui.set_source_status(i18n::status(Language::system(), "sync-running").into());
         ui.set_sync_progress(i18n::status(Language::system(), "prepare-sync").into());
         let account = source.account_key;
+        let expected_email = expected_email_for_sync.clone();
         let running = sync_running_for_handler.clone();
         let weak = ui.as_weak();
         thread::spawn(move || {
             let result = (|| -> Result<gmail::SyncStats, String> {
                 let mut transport = gmail::HttpGmail::authenticate(&credentials, &token_dir)
                     .map_err(|error| friendly_gmail_error(&error))?;
+                validate_gui_sync_profile(&mut transport, &account, expected_email.as_deref())?;
                 let progress_weak = weak.clone();
                 let stats = gmail::sync_account_with_progress(
                     &archive,
@@ -1650,6 +1654,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let weak = ui.as_weak();
         let source_state = source_state.clone();
         let config_state = config_state.clone();
+        let expected_email = cli_expected_email.clone();
         thread::spawn(move || {
             let result = (|| -> Result<GmailSourceConfig, String> {
                 let mut transport = gmail::HttpGmail::authenticate(&credentials, &token_dir)
@@ -1657,12 +1662,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let profile = transport
                     .profile()
                     .map_err(|error| friendly_gmail_error(&error))?;
-                let email = profile.email_address.clone();
+                let email = profile
+                    .email_address
+                    .clone()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or("Gmail profile did not return an email address")?;
+                if expected_email.as_deref().is_some_and(|expected| {
+                    gmail::gmail_source_account(expected) != gmail::gmail_source_account(&email)
+                }) {
+                    return Err("--account does not match the authenticated Gmail profile".into());
+                }
                 Ok(GmailSourceConfig {
                     credentials_path: credentials.to_string_lossy().into_owned(),
                     token_dir: token_dir.to_string_lossy().into_owned(),
-                    account_key: source_key(email.as_deref(), &credentials),
-                    display_email: email,
+                    account_key: source_key(&email),
+                    display_email: Some(email),
                 })
             })();
             let _ = slint::invoke_from_event_loop(move || {
@@ -1703,6 +1717,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SyncValidationTransport {
+        profile_calls: usize,
+        list_calls: usize,
+        raw_calls: usize,
+    }
+
+    impl GmailTransport for SyncValidationTransport {
+        fn list(
+            &mut self,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<gmail::ListPage, GmailError> {
+            self.list_calls += 1;
+            Err(GmailError::Other("list must not be called".into()))
+        }
+
+        fn get_raw(&mut self, _: &str) -> Result<gmail::RawMessage, GmailError> {
+            self.raw_calls += 1;
+            Err(GmailError::Other("get_raw must not be called".into()))
+        }
+
+        fn get_metadata(&mut self, _: &str) -> Result<gmail::MetadataMessage, GmailError> {
+            Err(GmailError::Other("get_metadata must not be called".into()))
+        }
+
+        fn profile(&mut self) -> Result<gmail::Profile, GmailError> {
+            self.profile_calls += 1;
+            Ok(gmail::Profile {
+                history_id: "fixture-history".into(),
+                email_address: Some("account-a".into()),
+            })
+        }
+
+        fn history(&mut self, _: &str, _: Option<&str>) -> Result<gmail::HistoryPage, GmailError> {
+            Err(GmailError::Other("history must not be called".into()))
+        }
+    }
+
+    #[test]
+    fn existing_source_rejects_cli_account_mismatch_before_sync() {
+        let source_account = gmail::gmail_source_account("account-a");
+        let mut transport = SyncValidationTransport {
+            profile_calls: 0,
+            list_calls: 0,
+            raw_calls: 0,
+        };
+
+        let result = validate_gui_sync_profile(&mut transport, &source_account, Some("account-b"));
+
+        assert_eq!(
+            result,
+            Err("--account does not match the authenticated Gmail profile".into())
+        );
+        assert_eq!(transport.profile_calls, 1);
+        assert_eq!(transport.list_calls, 0);
+        assert_eq!(transport.raw_calls, 0);
+    }
 
     #[test]
     fn archive_validation_and_creation_are_explicit() {

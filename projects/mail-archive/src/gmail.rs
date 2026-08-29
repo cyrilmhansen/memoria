@@ -198,6 +198,17 @@ pub struct Profile {
     pub email_address: Option<String>,
 }
 
+pub fn gmail_source_account(email: &str) -> String {
+    format!(
+        "gmail:{}",
+        blake3::hash(email.trim().to_ascii_lowercase().as_bytes()).to_hex()
+    )
+}
+
+pub fn gmail_message_identity(source_account: &str, gmail_message_id: &str) -> String {
+    format!("gmail:{source_account}:{gmail_message_id}")
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct OfflineMimeReport {
     pub messages: u64,
@@ -1362,10 +1373,6 @@ fn apply_history_events<T: GmailTransport>(
     Ok(())
 }
 
-fn canonical_gmail_message_id(source: &str, gmail_id: &str) -> String {
-    format!("gmail:{source}:{gmail_id}")
-}
-
 fn repair_gmail_metadata(
     connection: &crate::CatalogueConnection,
     source: &str,
@@ -1423,7 +1430,7 @@ fn gmail_identity_is_valid(
         &root.join("archive"),
         connection,
         doc_id,
-        &canonical_gmail_message_id(source, gmail_id),
+        &gmail_message_identity(source, gmail_id),
     )
     .map_err(|error| {
         GmailError::Other(format!(
@@ -1438,7 +1445,7 @@ fn ensure_gmail_message_id_available(
     source: &str,
     gmail_id: &str,
 ) -> Result<(), GmailError> {
-    let canonical = canonical_gmail_message_id(source, gmail_id);
+    let canonical = gmail_message_identity(source, gmail_id);
     let exists = connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM messages WHERE message_id=?1)",

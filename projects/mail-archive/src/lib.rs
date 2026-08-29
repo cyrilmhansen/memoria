@@ -217,7 +217,7 @@ pub struct PendingRawLocation {
 struct RawBatchIdentity;
 
 #[derive(Debug)]
-struct ArchiveAuthority {
+pub(crate) struct ArchiveAuthority {
     _lock: Option<ArchiveLock>,
 }
 
@@ -281,10 +281,29 @@ pub struct ArchiveSession {
     catalogue: CatalogueConnection,
 }
 
+pub(crate) fn acquire_recovery_authority(root: &Path) -> io::Result<Arc<ArchiveAuthority>> {
+    acquire_session_authority(root)
+}
+
 impl ArchiveSession {
     pub fn create(root: &Path, segment_bytes: u64) -> io::Result<Self> {
         let authority = acquire_session_authority(root)?;
         let writer = ArchiveWriter::open_with_authority(
+            &root.join("archive"),
+            segment_bytes,
+            Arc::clone(&authority),
+        )?;
+        let catalogue = create_catalogue_for_authority(&root.join("metadata.sqlite"), authority)
+            .map_err(sqlite_io)?;
+        Ok(Self { writer, catalogue })
+    }
+
+    pub(crate) fn recovery_with_authority(
+        root: &Path,
+        segment_bytes: u64,
+        authority: Arc<ArchiveAuthority>,
+    ) -> io::Result<Self> {
+        let writer = ArchiveWriter::open_recovery_with_authority(
             &root.join("archive"),
             segment_bytes,
             Arc::clone(&authority),
@@ -345,6 +364,71 @@ impl ArchiveSession {
         durable: &DurableRawBatch,
     ) -> rusqlite::Result<()> {
         publish_gmail_batch(&self.catalogue, batch, durable)
+    }
+
+    /// Publishes one already verified recovery frame, changing only its
+    /// physical catalogue coordinates.  The old claim and source identity are
+    /// compare-and-swapped in the same transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn publish_gmail_recovery(
+        &self,
+        doc_id: i64,
+        source_account: &str,
+        gmail_id: &str,
+        canonical_message_id: &str,
+        old_location: &ArchiveLocation,
+        expected_blake3: &[u8; 32],
+        pending: &PendingRawLocation,
+        durable: &DurableRawBatch,
+    ) -> rusqlite::Result<bool> {
+        if durable.entries.len() != 1 {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "recovery durable batch must contain exactly one frame".into(),
+            ));
+        }
+        validate_pending_batch(&self.catalogue, durable, std::iter::once((pending, doc_id)))?;
+        let reference = durable.entries[pending.ordinal].reference();
+        if reference.doc_id != doc_id as u64 || reference.blake3 != *expected_blake3 {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "recovery durable frame does not match its expected record".into(),
+            ));
+        }
+        let transaction = self.catalogue.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE messages
+             SET segment=?1,archive_offset=?2,frame_bytes=?3
+             WHERE doc_id=?4
+               AND message_id=?5
+               AND segment=?6
+               AND archive_offset=?7
+               AND frame_bytes=?8
+               AND raw_blake3=?9
+               AND EXISTS (
+                 SELECT 1 FROM gmail_messages
+                 WHERE doc_id=?4 AND source_account=?10
+                   AND gmail_message_id=?11 AND source_state='present'
+               )",
+            params![
+                reference.location.segment,
+                reference.location.offset as i64,
+                reference.location.frame_bytes as i64,
+                doc_id,
+                canonical_message_id,
+                old_location.segment,
+                old_location.offset as i64,
+                old_location.frame_bytes as i64,
+                expected_blake3.as_slice(),
+                source_account,
+                gmail_id,
+            ],
+        )?;
+        if changed == 1 {
+            transaction.commit()?;
+            Ok(true)
+        } else {
+            transaction.rollback()?;
+            Ok(false)
+        }
     }
 }
 
@@ -1990,6 +2074,85 @@ impl ArchiveWriter {
             #[cfg(test)]
             fault: ArchiveWriterFaultInjection::default(),
         })
+    }
+
+    fn open_recovery_with_authority(
+        root: &Path,
+        segment_bytes: u64,
+        authority: Arc<ArchiveAuthority>,
+    ) -> io::Result<Self> {
+        fs::create_dir_all(root)?;
+        let mut claimed_segments = HashSet::new();
+        let catalogue_path = root.parent().unwrap_or(root).join("metadata.sqlite");
+        if catalogue_path.is_file() {
+            let connection =
+                Connection::open_with_flags(&catalogue_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .map_err(sqlite_io)?;
+            let mut statement = connection
+                .prepare("SELECT segment FROM messages")
+                .map_err(sqlite_io)?;
+            let segments = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(sqlite_io)?;
+            for segment in segments {
+                claimed_segments.insert(segment.map_err(sqlite_io)?);
+            }
+        }
+        let mut number = fs::read_dir(root)?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.strip_prefix("segment-"))
+                    .and_then(|n| n.strip_suffix(".arc"))
+                    .and_then(|n| n.parse::<u64>().ok())
+            })
+            .max()
+            .unwrap_or(0);
+        loop {
+            number = number.checked_add(1).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "archive segment number overflow",
+                )
+            })?;
+            let segment_name = format!("segment-{number:06}.arc");
+            if claimed_segments.contains(&segment_name) {
+                continue;
+            }
+            let path = root.join(&segment_name);
+            match OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .append(true)
+                .open(&path)
+            {
+                Ok(file) => {
+                    return Ok(Self {
+                        authority,
+                        root: root.to_path_buf(),
+                        segment_bytes: segment_bytes.max(1024),
+                        file,
+                        segment_name,
+                        offset: 0,
+                        segment_number: number,
+                        pending_batch: Arc::new(RawBatchIdentity),
+                        pending_references: Vec::new(),
+                        pending_records: 0,
+                        pending_frame_bytes: 0,
+                        file_dirty: false,
+                        namespace_sync_pending: true,
+                        current_segment_created: true,
+                        poisoned: None,
+                        #[cfg(test)]
+                        fault: ArchiveWriterFaultInjection::default(),
+                    });
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub fn open(root: &Path, segment_bytes: u64) -> io::Result<Self> {
@@ -4144,7 +4307,7 @@ fn insert_gmail_metadata_in_transaction(
     }
     transaction.execute(
         "INSERT INTO messages(doc_id,message_id,timestamp,sender,recipients,subject,account,folder,thread,segment,archive_offset,frame_bytes,raw_blake3) VALUES (?1,?2,0,'','','',?3,'','',?4,?5,?6,?7)",
-        params![doc_id, format!("gmail:{source_account}:{gmail_id}"), source_account, location.reference.location.segment, location.reference.location.offset as i64, location.reference.location.frame_bytes as i64, &location.reference.blake3[..]],
+        params![doc_id, crate::gmail::gmail_message_identity(source_account, gmail_id), source_account, location.reference.location.segment, location.reference.location.offset as i64, location.reference.location.frame_bytes as i64, &location.reference.blake3[..]],
     )?;
     let now = chrono_like_now();
     transaction.execute(

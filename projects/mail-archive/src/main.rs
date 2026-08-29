@@ -1,3 +1,4 @@
+use mail_archive_experiment::gmail::GmailTransport;
 use mail_archive_experiment::*;
 use std::env;
 use std::fs;
@@ -52,6 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?,
         "cas-benchmark" => cas_benchmark(&out, config)?,
         "gmail-sync" => gmail_sync(&args, &out)?,
+        "recover-gmail-raw" => recover_gmail_raw(&args, &out)?,
         "gmail-report" => gmail_report(&args, &out)?,
         "archive-inventory" => archive_inventory(&args, &out)?,
         "recovery-plan" => recovery_plan(&args, &out)?,
@@ -139,15 +141,54 @@ fn gmail_sync(args: &[String], default_out: &Path) -> Result<(), Box<dyn std::er
     if credentials.starts_with(&archive) || token_dir.starts_with(&archive) {
         return Err("credentials and tokens must be outside the archive directory".into());
     }
-    let account = option(args, "--account")
-        .ok_or("--account is required (use a stable local account key)")?;
+    let requested_account = option(args, "--account");
     let query = option(args, "--query");
     let max = option(args, "--max-messages")
         .map(|value| value.parse::<u64>())
         .transpose()?;
     let mut transport = gmail::HttpGmail::authenticate(&credentials, &token_dir)?;
+    let email = transport
+        .profile()?
+        .email_address
+        .ok_or("Gmail profile did not return an email address")?;
+    let account = gmail::gmail_source_account(&email);
+    if requested_account
+        .as_deref()
+        .is_some_and(|value| gmail::gmail_source_account(value) != account)
+    {
+        return Err("--account does not match the authenticated Gmail profile".into());
+    }
     let stats = gmail::sync_account(&archive, &account, &mut transport, query.as_deref(), max)?;
     println!("command=gmail-sync\nfull_sync={}\nexamined={}\nnew_messages={}\nlabel_changes={}\ndeletions_detected={}\nnetwork_bytes={}\narchive_bytes_added={}\nmime_messages={}\nmime_parse_failures={}\nattachments={}\nattachment_encoded_bytes={}\nattachment_decoded_bytes={}\nattachment_unique_encoded_objects={}\nattachment_unique_encoded_bytes={}\nattachment_unique_decoded_objects={}\nattachment_unique_decoded_bytes={}\nattachment_encoded_over_64k_bytes={}\nduration_ms={}", stats.full_sync, stats.examined, stats.new_messages, stats.label_changes, stats.deletions, stats.network_bytes, stats.archive_bytes_added, stats.mime_messages, stats.mime_parse_failures, stats.attachments, stats.attachment_encoded_bytes, stats.attachment_decoded_bytes, stats.attachment_unique_encoded_objects, stats.attachment_unique_encoded_bytes, stats.attachment_unique_decoded_objects, stats.attachment_unique_decoded_bytes, stats.attachment_encoded_over_64k_bytes, stats.duration_ms);
+    Ok(())
+}
+
+fn recover_gmail_raw(
+    args: &[String],
+    default_out: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let archive = PathBuf::from(
+        option(args, "--archive").unwrap_or_else(|| default_out.display().to_string()),
+    );
+    let doc_id = option(args, "--doc-id")
+        .ok_or("--doc-id is required")?
+        .parse::<i64>()?;
+    let credentials =
+        PathBuf::from(option(args, "--credentials").ok_or("--credentials is required")?);
+    let token_dir = option(args, "--token-dir")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::config_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("mail-archive-experiment/tokens")
+        });
+    if credentials.starts_with(&archive) || token_dir.starts_with(&archive) {
+        return Err("credentials and tokens must be outside the archive directory".into());
+    }
+    let mut transport = gmail::HttpGmail::authenticate(&credentials, &token_dir)?;
+    let result =
+        recovery::recover_missing_gmail_raw(&archive, doc_id, &mut transport, 64 * 1024 * 1024)?;
+    println!("command=recover-gmail-raw\ndoc_id={doc_id}\nresult={result:?}");
     Ok(())
 }
 
@@ -466,5 +507,5 @@ fn benchmark(
 }
 
 fn help() {
-    println!("mail-archive-experiment\n\ncommands: generate | benchmark | cas-benchmark | gmail-sync | gmail-report | archive-inventory | recovery-plan | gmail-index | search\noptions: --messages N --seed N --profile light|personal|heavy --queries N --segment-bytes N --attachment-rate P --duplicate-rate P --max-attachment-bytes N --compression --out PATH\ngmail-sync: --archive PATH --credentials PATH --token-dir PATH --account KEY [--max-messages N] [--query GMAIL_QUERY]\ngmail-report: --archive PATH (offline aggregate MIME/checksum report)\narchive-inventory: --archive PATH (read-only physical/catalogue reconciliation)\nrecovery-plan: --archive PATH (strictly read-only Tier A recovery policy plan)\ngmail-index: --archive PATH (offline Tantivy build and aggregate workload)\nsearch: --archive PATH QUERY (local Tantivy search)\nGmail sync requests only gmail.readonly and never writes to Gmail.");
+    println!("mail-archive-experiment\n\ncommands: generate | benchmark | cas-benchmark | gmail-sync | recover-gmail-raw | gmail-report | archive-inventory | recovery-plan | gmail-index | search\noptions: --messages N --seed N --profile light|personal|heavy --queries N --segment-bytes N --attachment-rate P --duplicate-rate P --max-attachment-bytes N --compression --out PATH\ngmail-sync: --archive PATH --credentials PATH --token-dir PATH [--account KEY] [--max-messages N] [--query GMAIL_QUERY]\nrecover-gmail-raw: --archive PATH --doc-id N --credentials PATH [--token-dir PATH] (one explicit exact recovery)\ngmail-report: --archive PATH (offline aggregate MIME/checksum report)\narchive-inventory: --archive PATH (read-only physical/catalogue reconciliation)\nrecovery-plan: --archive PATH (strictly read-only Tier A recovery policy plan)\ngmail-index: --archive PATH (offline Tantivy build and aggregate workload)\nsearch: --archive PATH QUERY (local Tantivy search)\nGmail sync and recovery requests only gmail.readonly and never write to Gmail.");
 }
