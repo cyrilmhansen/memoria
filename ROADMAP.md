@@ -35,6 +35,7 @@ Une évolution fonctionnelle qui modifie ces principes doit être traitée comme
 | Détection RAW physique | Fermé | Frames cataloguées, orphans, contradictions, corruption, missing et tail sont distingués sans mutation | Recovery R1 |
 | Single-writer | Fermé | Une seule autorité Tier A existe par archive locale ; reset/création sont couverts | Toute future réparation destructive |
 | Recovery R1 | Fermé | `recovery-plan` classe les preuves en lecture seule sans réseau ni mutation | Recovery R2 action par action |
+| R2.1a — Gmail exact re-fetch | Fermé | Un RAW Gmail physiquement manquant n’est re-fetché et republié que si l’identité source et le BLAKE3 historique sont exactement validés | R2.1b IMAP |
 
 Les checkpoints récents correspondants incluent notamment :
 
@@ -42,6 +43,7 @@ Les checkpoints récents correspondants incluent notamment :
 8046fa2  fix(mail-archive): detect orphan raw frames safely
 83d546c  fix(mail-archive): enforce single-writer archive authority
 2693e40  feat(mail-archive): add read-only recovery planning
+f8c61a1  feat(mail-archive): recover missing gmail raw exactly
 ```
 
 ## 3. Dépendances principales
@@ -85,6 +87,16 @@ La durabilité namespace/power-loss et le fuzzing renforcent cette chaîne mais 
 R2 ne doit pas devenir une commande générale `recover --force`. Chaque action possède ses propres preuves, son niveau de destructivité et son audit.
 
 ### R2.1 — Re-fetch assisté par source
+
+#### R2.1a Gmail — Fermé
+
+Le re-fetch Gmail exact est fermé pour le périmètre d’un `doc_id` explicite.
+L’identité source, le compte OAuth, l’ID Gmail et le BLAKE3 historique doivent
+être validés avant publication.
+
+#### R2.1b IMAP — À faire
+
+L’extension du mécanisme exact à IMAP reste la prochaine étape.
 
 **Produit / utilisateur**
 

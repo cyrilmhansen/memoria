@@ -4,13 +4,30 @@ Journal léger des découvertes provisoires, hypothèses, expériences et
 questions ouvertes. Les conclusions réutilisables doivent être promues dans
 `KNOWLEDGE.md`, avec un pointeur vers le détail conservé dans `experiments/`.
 
+## 2026-08-29 — Recovery R2.1a Gmail exact
+
+- La première implémentation ouvrait le writer normal et pouvait recréer un
+  segment manquant avant la preuve distante.
+- La séparation `authority-only` / writer a supprimé cette possibilité ; la
+  publication utilise ensuite une destination fresh `create_new`.
+- La réconciliation combine `inventory_records` et `inventory_physical`.
+- Le profile OAuth est vérifié contre `source_account`, avec les helpers uniques
+  `gmail_source_account` et `gmail_message_identity`.
+- Le conflit CAS est démontré explicitement : `RecoveryConflict` laisse une
+  frame `OrphanValidated` sûre, sans modifier l’ancien record.
+- Les tests fail-closed snapshotent les segments, SQLite et le contenu des
+  sidecars. Le GUI `--account` est une simple assertion sur le profile
+  authentifié, jamais une identité persistée.
+- Sol High a fermé R2.1a. Commit final :
+  `f8c61a1 feat(mail-archive): recover missing gmail raw exactly`.
+
 ## 2026-08-29 — R2.1a recovery Gmail exact
 
 - **Fait vérifié :** le checkout local était sur `mail-archive` à `2693e40`;
   `git pull --ff-only` n'a pas pu mettre à jour `.git/FETCH_HEAD`, refusé en
   lecture seule par l'environnement. Les répertoires historiques `target/`
   non suivis n'ont pas été touchés.
-- **Décision de projet :** implémentation candidate en audit, limitée à une
+- **Décision de projet :** implémentation limitée à une
   récupération explicite d'un seul RAW Gmail manquant. Le plan R1 n'est pas
   traité comme une capability d'écriture.
 - **Faits vérifiés par tests :** égalité exacte restaurée byte pour byte;
@@ -31,7 +48,8 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
   BLAKE3), SQLite et les sidecars avant les refus pré-append ; le test de
   conflit CAS capture aussi l'ancienne localisation, le digest et toutes les
   métadonnées Gmail, puis vérifie que seule une nouvelle frame orphan durable
-  apparaît. R2.1a reste une implémentation candidate en audit.
+  apparaît. R2.1a est fermée pour son périmètre, sous réserve de la prochaine
+  extension IMAP.
 - **Contrat produit :** le GUI et la synchronisation refusent désormais un
   profil sans e-mail, vérifient tout compte configuré contre le profil OAuth,
   et dérivent toujours `source_account` depuis ce profil ; `--account` n'est

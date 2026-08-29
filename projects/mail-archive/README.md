@@ -38,7 +38,7 @@ compare le BLAKE3 au digest historique et ne publie qu'en cas d'égalité
 exacte. Avant cette validation complète, elle ne crée ni segment RAW ni frame
 et ne modifie ni le catalogue, ni les métadonnées Gmail, ni la frontière
 d'historique.
-Cette capacité est une **implémentation candidate en audit**.
+Le chemin Gmail exact re-fetch R2.1a est fermé pour ce périmètre.
 Après append durable, un conflit du CAS catalogue peut volontairement laisser
 la nouvelle frame `OrphanValidated`; l'ancienne ligne `messages` reste alors
 non publiée.

@@ -101,16 +101,41 @@ signifie seulement qu'une identité suffisamment forte permet de tenter un
 futur re-fetch; elle ne garantit ni la disponibilité actuelle de Gmail/IMAP,
 ni l'identité des octets retournés avec le RAW historique perdu.
 
-L'implémentation candidate R2.1a ajoute une seule action effective : un
-re-fetch Gmail explicite par `doc_id`, uniquement pour un record
-`PhysicallyMissing` dont l'identité Gmail présente est complète et non
-ambiguë. Le RAW décodé n'est publié que si son BLAKE3 égale le digest
-historique du catalogue. Toute divergence, absence ou erreur réseau reste
-sans mutation Tier A ni création de segment ; le profil Gmail doit d'abord
-prouver la même identité canonique que `source_account`. La publication suit
-`append RAW → barrière durable → transaction catalogue` sous l'autorité
-single-writer, sur une destination fraîche non revendiquée, et n'avance
-jamais la frontière Gmail.
+## R2.1a — re-fetch Gmail exact
+
+R2.1a est fermé pour son périmètre : un seul `doc_id` peut être réparé si et
+seulement si le record est `PhysicallyMissing`, sans contradiction
+physique/catalogue, avec une identité Gmail durable unique et cohérente,
+`source_state == present`, un compte OAuth authentifié correspondant à
+`source_account`, un Gmail message ID retourné égal à l'ID demandé et un BLAKE3
+du RAW re-fetché égal au `raw_blake3` historique.
+
+Pour Gmail, `source_account` est la clé locale opaque
+`gmail:<BLAKE3(email Gmail canonique)>`, dérivée du profile OAuth authentifié ;
+l'adresse brute n'est jamais l'identité persistée. Aucune réparation ne peut
+utiliser Message-ID MIME, sujet, date, expéditeur, thread, `doc_id` seul,
+proximité physique ou index dérivé.
+
+L'ordre garanti est :
+
+```text
+authority-only → réconciliation locale → identité canonique
+→ profile OAuth → fetch Gmail exact → returned ID → décodage RAW
+→ BLAKE3 → fresh segment non revendiqué → append
+→ durable barrier → CAS catalogue
+```
+
+Avant validation complète du compte, de l'ID et du digest, aucune mutation Tier
+A de l'archive n'a lieu. La destination est physiquement absente, non
+revendiquée par le catalogue et créée par `create_new` sous single-writer ; la
+localisation manquante n'est jamais recréée. Un échec CAS après append durable
+retourne `RecoveryConflict`, conserve l'ancienne ligne catalogue et laisse la
+nouvelle frame `OrphanValidated`.
+
+R2.1a ne modifie ni `gmail_state`/frontier, ni `source_state`, labels ou thread
+metadata : le recovery n'est pas une synchronisation. Un contenu Gmail dont le
+BLAKE3 diffère produit `SourceContentChanged` et ne remplace jamais
+silencieusement le RAW historique.
 
 `source_account` Gmail n'est pas une adresse affichée : c'est l'identité locale
 opaque `gmail:<BLAKE3(email canonique)>`, produite par le helper partagé entre

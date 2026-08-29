@@ -22,8 +22,8 @@ applications. Les expériences détaillées, mesures et échecs restent dans
 
 Cette section sera enrichie uniquement par des expériences reproductibles.
 
-- **Recovery Gmail exact — implémentation candidate en audit, fait vérifié le
-  2026-08-29 :** `recovery::recover_missing_gmail_raw` revalide sous
+- **Recovery Gmail exact — fermé, fait vérifié le 2026-08-29 :**
+  `recovery::recover_missing_gmail_raw` revalide sous
   `ArchiveSession` l'état `PhysicallyMissing` réconcilié avec l'inventaire
   physique, l'identité Gmail présente et non ambiguë, le `doc_id`, l'ancienne
   localisation et le BLAKE3 historique. Il vérifie le profil Gmail authentifié
