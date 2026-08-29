@@ -22,6 +22,27 @@ applications. Les expériences détaillées, mesures et échecs restent dans
 
 Cette section sera enrichie uniquement par des expériences reproductibles.
 
+- **Recovery Gmail exact — implémentation candidate en audit, fait vérifié le
+  2026-08-29 :** `recovery::recover_missing_gmail_raw` revalide sous
+  `ArchiveSession` l'état `PhysicallyMissing` réconcilié avec l'inventaire
+  physique, l'identité Gmail présente et non ambiguë, le `doc_id`, l'ancienne
+  localisation et le BLAKE3 historique. Il vérifie le profil Gmail authentifié
+  contre la même identité canonique que `source_account`, appelle seulement
+  `get_raw(gmail_message_id)`, vérifie l'ID retourné, décode avec le même
+  `decode_raw`, puis exige l'égalité BLAKE3 avant
+  `append_raw → durable_barrier → UPDATE conditionnel` sur un segment frais
+  non revendiqué. Les réponses 404, réseau, source supprimée, compte/ID
+  différent, digest différent et contradictions ne modifient pas le
+  namespace RAW, le catalogue ni la frontière. Voir les tests de
+  `recovery.rs`.
+
+  `source_account` Gmail est une clé opaque `gmail:<BLAKE3(email canonique)>`,
+  jamais une adresse e-mail persistée ; `--account` n'est qu'une assertion
+  utilisateur sur cette adresse. Les identités `messages.message_id` sont
+  construites et contrôlées par le helper Gmail partagé. Avant validation
+  complète, aucun segment RAW ni publication catalogue n'est créé ; après
+  append durable, un conflit CAS laisse volontairement un orphan valide.
+
 - **Memoria / single-writer — fait vérifié le 2026-08-27 :** `ArchiveWriter`
   acquiert avant toute ouverture mutable de segment un lock exclusif OS sur un
   fichier de rendez-vous stable, hors du sous-arbre supprimable de l’archive.

@@ -4,6 +4,49 @@ Journal léger des découvertes provisoires, hypothèses, expériences et
 questions ouvertes. Les conclusions réutilisables doivent être promues dans
 `KNOWLEDGE.md`, avec un pointeur vers le détail conservé dans `experiments/`.
 
+## 2026-08-29 — R2.1a recovery Gmail exact
+
+- **Fait vérifié :** le checkout local était sur `mail-archive` à `2693e40`;
+  `git pull --ff-only` n'a pas pu mettre à jour `.git/FETCH_HEAD`, refusé en
+  lecture seule par l'environnement. Les répertoires historiques `target/`
+  non suivis n'ont pas été touchés.
+- **Décision de projet :** implémentation candidate en audit, limitée à une
+  récupération explicite d'un seul RAW Gmail manquant. Le plan R1 n'est pas
+  traité comme une capability d'écriture.
+- **Faits vérifiés par tests :** égalité exacte restaurée byte pour byte;
+  digest divergent, 404, erreur réseau, source `deleted`, identité ambiguë,
+  contradiction catalogue et RAW déjà disponible sont fail-closed. La
+  frontière Gmail n'est pas utilisée par l'action.
+- **Limitation ouverte :** le hook de panne après append durable avant
+  transaction catalogue n'était pas encore ajouté à ce premier état ; ce
+  point est traité par le correctif d'audit ci-dessous.
+
+## 2026-08-29 — corrections d'audit Sol R2.1a
+
+- **Correction :** `source_account` est désormais reconstruit depuis le profil
+  Gmail par le helper unique `gmail_source_account`, dans le même espace opaque
+  `gmail:<BLAKE3(email canonique)>` que l'ingestion. `gmail_message_identity`
+  est également unique et partagé entre ingestion, pré-validation et CAS.
+- **Preuves renforcées :** les tests snapshotent les segments RAW (taille et
+  BLAKE3), SQLite et les sidecars avant les refus pré-append ; le test de
+  conflit CAS capture aussi l'ancienne localisation, le digest et toutes les
+  métadonnées Gmail, puis vérifie que seule une nouvelle frame orphan durable
+  apparaît. R2.1a reste une implémentation candidate en audit.
+- **Contrat produit :** le GUI et la synchronisation refusent désormais un
+  profil sans e-mail, vérifient tout compte configuré contre le profil OAuth,
+  et dérivent toujours `source_account` depuis ce profil ; `--account` n'est
+  qu'une assertion d'adresse.
+
+- **Faits vérifiés :** l'action acquiert maintenant l'autorité seule, réconcilie
+  `inventory_records` avec `inventory_physical`, vérifie le lien canonique et
+  le profil Gmail avant `get_raw`, puis vérifie l'ID retourné.
+- **Décision de projet :** l'append de recovery ouvre un segment frais créé
+  exclusivement avec `create_new`, après validation distante et digest exact ;
+  il ne peut donc pas recréer la localisation manquante.
+- **Fait vérifié par test :** une précondition catalogue rendue obsolète après
+  append durable produit `RecoveryConflict`, conserve l'ancienne claim et
+  laisse la nouvelle frame comme `OrphanValidated`.
+
 ## 2026-08-20 — Initialisation
 
 - **Décision de projet :** commencer avec un workspace Cargo virtuel vide.

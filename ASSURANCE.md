@@ -101,6 +101,27 @@ signifie seulement qu'une identité suffisamment forte permet de tenter un
 futur re-fetch; elle ne garantit ni la disponibilité actuelle de Gmail/IMAP,
 ni l'identité des octets retournés avec le RAW historique perdu.
 
+L'implémentation candidate R2.1a ajoute une seule action effective : un
+re-fetch Gmail explicite par `doc_id`, uniquement pour un record
+`PhysicallyMissing` dont l'identité Gmail présente est complète et non
+ambiguë. Le RAW décodé n'est publié que si son BLAKE3 égale le digest
+historique du catalogue. Toute divergence, absence ou erreur réseau reste
+sans mutation Tier A ni création de segment ; le profil Gmail doit d'abord
+prouver la même identité canonique que `source_account`. La publication suit
+`append RAW → barrière durable → transaction catalogue` sous l'autorité
+single-writer, sur une destination fraîche non revendiquée, et n'avance
+jamais la frontière Gmail.
+
+`source_account` Gmail n'est pas une adresse affichée : c'est l'identité locale
+opaque `gmail:<BLAKE3(email canonique)>`, produite par le helper partagé entre
+l'ingestion, la CLI et le recovery. Une valeur `--account` éventuelle n'est
+qu'une assertion sur l'adresse du profil et n'est jamais persistée comme
+identité. Avant validation complète de l'état local,
+du compte authentifié, de l'identité Gmail distante et du digest historique,
+R2.1a ne crée ni segment RAW ni publication catalogue. Après append durable,
+un échec du CAS catalogue peut volontairement laisser une nouvelle frame
+`OrphanValidated`; c'est le mode de panne sûr hérité d'A3.2.
+
 Une zone `PhysicalCorruption` n'est pas un salvage : sans payload et digest
 validés, elle est irrécupérable localement, ou unsafe si elle contredit une
 revendication catalogue. Seules les frames indépendantes validées peuvent
