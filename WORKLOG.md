@@ -62,8 +62,37 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
   exclusivement avec `create_new`, après validation distante et digest exact ;
   il ne peut donc pas recréer la localisation manquante.
 - **Fait vérifié par test :** une précondition catalogue rendue obsolète après
-  append durable produit `RecoveryConflict`, conserve l'ancienne claim et
+  append durable produit `RecoveryConflict`, conserve l’ancienne claim et
   laisse la nouvelle frame comme `OrphanValidated`.
+
+## 2026-08-29 — R2.1b IMAP exact re-fetch
+
+- **Fermeture :** ajout d'une récupération explicite
+  d'un seul RAW IMAP par identité durable `source_account`, mailbox,
+  UIDVALIDITY et UID.
+- **Enseignements :** la configuration de session authentifiée (`username`,
+  `host`, `port`) correspond à la source persistée via la convention
+  `imap:{username}@{host}:{port}` ; les anciennes clés
+  `--source` libres sont refusées pour le refetch automatique. `EXAMINE`
+  vérifie une UIDVALIDITY et un UID positifs avant `UID FETCH ... BODY.PEEK[]`;
+  toutes les réponses sont drainées, sans effet `\\Seen`.
+- **Publication :** le chemin réutilise authority-only, destination fraîche
+  `create_new`, barrière A3.2 et CAS ; un digest différent est
+  `SourceContentChanged`, un conflit CAS laisse `OrphanValidated`. Les
+  frontiers, UIDNEXT et flags restent inchangés.
+
+- **Enseignements de clôture :** les identités IMAP historiques opaques ne
+  fournissent pas une preuve suffisante de refetch automatique ; les nouveaux
+  imports utilisent un producteur canonique unique. UIDVALIDITY est une
+  frontière absolue. Le chemin Tier A émet `UID FETCH ... BODY.PEEK[]`,
+  abandonne `Fetch::body()` au profit de `run_command`/`read_response` et
+  inspecte tous les `AttributeValue` via `imap-proto`. Il draine jusqu'au
+  tagged `OK` et refuse les ambiguïtés multi-réponse ou multi-BODY.
+- **Publication et audit :** Gmail et IMAP partagent
+  `publish_exact_recovered_raw`; le CAS conflict laisse un orphan sûr. Les
+  tests wire ont fermé les preuves de réponse vide et de réponse correcte
+  suivie d'une réponse sans UID. Sol High a fermé R2.1b ; R2.1 est fermé pour
+  Gmail + IMAP.
 
 ## 2026-08-20 — Initialisation
 

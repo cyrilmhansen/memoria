@@ -381,21 +381,15 @@ impl ArchiveSession {
         pending: &PendingRawLocation,
         durable: &DurableRawBatch,
     ) -> rusqlite::Result<bool> {
-        if durable.entries.len() != 1 {
-            return Err(rusqlite::Error::InvalidParameterName(
-                "recovery durable batch must contain exactly one frame".into(),
-            ));
-        }
-        validate_pending_batch(&self.catalogue, durable, std::iter::once((pending, doc_id)))?;
-        let reference = durable.entries[pending.ordinal].reference();
-        if reference.doc_id != doc_id as u64 || reference.blake3 != *expected_blake3 {
-            return Err(rusqlite::Error::InvalidParameterName(
-                "recovery durable frame does not match its expected record".into(),
-            ));
-        }
-        let transaction = self.catalogue.unchecked_transaction()?;
-        let changed = transaction.execute(
-            "UPDATE messages
+        publish_exact_recovered_raw(
+            &self.catalogue,
+            doc_id,
+            expected_blake3,
+            pending,
+            durable,
+            |transaction, location| {
+                transaction.execute(
+                    "UPDATE messages
              SET segment=?1,archive_offset=?2,frame_bytes=?3
              WHERE doc_id=?4
                AND message_id=?5
@@ -407,28 +401,108 @@ impl ArchiveSession {
                  SELECT 1 FROM gmail_messages
                  WHERE doc_id=?4 AND source_account=?10
                    AND gmail_message_id=?11 AND source_state='present'
-               )",
-            params![
-                reference.location.segment,
-                reference.location.offset as i64,
-                reference.location.frame_bytes as i64,
-                doc_id,
-                canonical_message_id,
-                old_location.segment,
-                old_location.offset as i64,
-                old_location.frame_bytes as i64,
-                expected_blake3.as_slice(),
-                source_account,
-                gmail_id,
-            ],
-        )?;
-        if changed == 1 {
-            transaction.commit()?;
-            Ok(true)
-        } else {
-            transaction.rollback()?;
-            Ok(false)
-        }
+               )
+               AND NOT EXISTS (SELECT 1 FROM imap_messages WHERE doc_id=?4)",
+                    params![
+                        location.segment,
+                        location.offset as i64,
+                        location.frame_bytes as i64,
+                        doc_id,
+                        canonical_message_id,
+                        old_location.segment,
+                        old_location.offset as i64,
+                        old_location.frame_bytes as i64,
+                        expected_blake3.as_slice(),
+                        source_account,
+                        gmail_id,
+                    ],
+                )
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn publish_imap_recovery(
+        &self,
+        doc_id: i64,
+        source_account: &str,
+        mailbox: &str,
+        uid_validity: u32,
+        uid: u32,
+        canonical_message_id: &str,
+        old_location: &ArchiveLocation,
+        expected_blake3: &[u8; 32],
+        pending: &PendingRawLocation,
+        durable: &DurableRawBatch,
+    ) -> rusqlite::Result<bool> {
+        publish_exact_recovered_raw(
+            &self.catalogue,
+            doc_id,
+            expected_blake3,
+            pending,
+            durable,
+            |transaction, location| {
+                transaction.execute(
+                    "UPDATE messages SET segment=?1,archive_offset=?2,frame_bytes=?3
+             WHERE doc_id=?4 AND message_id=?5 AND segment=?6 AND archive_offset=?7
+               AND frame_bytes=?8 AND raw_blake3=?9
+               AND EXISTS (SELECT 1 FROM imap_messages
+                 WHERE doc_id=?4 AND source_account=?10 AND mailbox=?11
+                   AND uid_validity=?12 AND uid=?13 AND source_state='present'
+                   AND uid_validity > 0 AND uid > 0)
+                 AND NOT EXISTS (SELECT 1 FROM gmail_messages WHERE doc_id=?4)",
+                    params![
+                        location.segment,
+                        location.offset as i64,
+                        location.frame_bytes as i64,
+                        doc_id,
+                        canonical_message_id,
+                        old_location.segment,
+                        old_location.offset as i64,
+                        old_location.frame_bytes as i64,
+                        expected_blake3.as_slice(),
+                        source_account,
+                        mailbox,
+                        uid_validity as i64,
+                        uid as i64,
+                    ],
+                )
+            },
+        )
+    }
+}
+
+fn publish_exact_recovered_raw<F>(
+    catalogue: &CatalogueConnection,
+    doc_id: i64,
+    expected_blake3: &[u8; 32],
+    pending: &PendingRawLocation,
+    durable: &DurableRawBatch,
+    publish: F,
+) -> rusqlite::Result<bool>
+where
+    F: FnOnce(&rusqlite::Transaction<'_>, &ArchiveLocation) -> rusqlite::Result<usize>,
+{
+    if durable.entries.len() != 1 {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "recovery durable batch must contain exactly one frame".into(),
+        ));
+    }
+    validate_pending_batch(catalogue, durable, std::iter::once((pending, doc_id)))?;
+    let reference = durable.entries[pending.ordinal].reference();
+    if reference.doc_id != doc_id as u64 || reference.blake3 != *expected_blake3 {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "recovery durable frame does not match its expected record".into(),
+        ));
+    }
+    let transaction = catalogue.unchecked_transaction()?;
+    let changed = publish(&transaction, &reference.location)?;
+    if changed == 1 {
+        transaction.commit()?;
+        Ok(true)
+    } else {
+        transaction.rollback()?;
+        Ok(false)
     }
 }
 
@@ -4509,7 +4583,7 @@ fn insert_imap_metadata_in_transaction(
             "IMAP identity does not match durable RAW document ID",
         ));
     }
-    let message_id = format!("imap:{source_account}:{mailbox}:{uid_validity}:{uid}");
+    let message_id = crate::imap::imap_message_identity(source_account, mailbox, uid_validity, uid);
     transaction.execute(
         "INSERT INTO messages(doc_id,message_id,timestamp,sender,recipients,subject,account,folder,thread,segment,archive_offset,frame_bytes,raw_blake3) VALUES (?1,?2,?3,'','','',?4,?5,'',?6,?7,?8,?9)",
         params![

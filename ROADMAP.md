@@ -36,6 +36,8 @@ Une évolution fonctionnelle qui modifie ces principes doit être traitée comme
 | Single-writer | Fermé | Une seule autorité Tier A existe par archive locale ; reset/création sont couverts | Toute future réparation destructive |
 | Recovery R1 | Fermé | `recovery-plan` classe les preuves en lecture seule sans réseau ni mutation | Recovery R2 action par action |
 | R2.1a — Gmail exact re-fetch | Fermé | Un RAW Gmail physiquement manquant n’est re-fetché et republié que si l’identité source et le BLAKE3 historique sont exactement validés | R2.1b IMAP |
+| R2.1b — IMAP exact re-fetch | Fermé | Un RAW IMAP manquant exige mailbox, UIDVALIDITY, UID, fetch exact et digest historique validés | R2.2 salvage/export |
+| R2.1 — re-fetch assisté par source | Fermé pour Gmail + IMAP | Gmail et IMAP partagent une publication A3.2/CAS exacte, avec destination fraîche et orphan sûr en cas de conflit | R2.2 salvage/export |
 
 Les checkpoints récents correspondants incluent notamment :
 
@@ -44,6 +46,7 @@ Les checkpoints récents correspondants incluent notamment :
 83d546c  fix(mail-archive): enforce single-writer archive authority
 2693e40  feat(mail-archive): add read-only recovery planning
 f8c61a1  feat(mail-archive): recover missing gmail raw exactly
+429d167  docs(mail-archive): close gmail recovery R2.1a
 ```
 
 ## 3. Dépendances principales
@@ -94,9 +97,12 @@ Le re-fetch Gmail exact est fermé pour le périmètre d’un `doc_id` explicite
 L’identité source, le compte OAuth, l’ID Gmail et le BLAKE3 historique doivent
 être validés avant publication.
 
-#### R2.1b IMAP — À faire
+#### R2.1b IMAP — Fermé
 
-L’extension du mécanisme exact à IMAP reste la prochaine étape.
+L’extension du mécanisme exact à IMAP est fermée pour son périmètre. Les
+anciennes identités `source_account` libres restent volontairement non
+éligibles tant qu’aucune correspondance durable avec une configuration IMAP
+n’est prouvée. La prochaine étape est R2.2, le salvage/export des orphelins.
 
 **Produit / utilisateur**
 

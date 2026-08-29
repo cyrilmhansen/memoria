@@ -1,4 +1,9 @@
-use mail_archive_experiment::imap::{sync_imap_mailboxes, ImapConfig};
+use mail_archive_experiment::i18n::{
+    imap_recovery_error_label, imap_source_configuration_mismatch, invalid_doc_id,
+    recovery_result_label, Language,
+};
+use mail_archive_experiment::imap::{imap_source_account, sync_imap_mailboxes, ImapConfig};
+use mail_archive_experiment::recovery::recover_missing_imap_raw;
 use std::env;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -39,8 +44,14 @@ fn main() {
     let ca_cert = PathBuf::from(required("--ca-cert"));
     let mailboxes = options(&args, "--mailbox");
     let mailbox = mailboxes.first().cloned().unwrap_or_else(|| "INBOX".into());
-    let source_account =
-        option(&args, "--source").unwrap_or_else(|| format!("imap:{username}@{host}:{port}"));
+    let derived_source_account = imap_source_account(&username, &host, port);
+    if let Some(configured_source_account) = option(&args, "--source") {
+        if configured_source_account != derived_source_account {
+            eprintln!("{}", imap_source_configuration_mismatch(Language::system()));
+            std::process::exit(2);
+        }
+    }
+    let source_account = derived_source_account;
     let limit = option(&args, "--limit").map(|value| {
         value.parse().unwrap_or_else(|_| {
             eprintln!("invalid --limit");
@@ -68,6 +79,20 @@ fn main() {
         limit,
         timeout: Duration::from_millis(timeout_ms),
     };
+    if args.iter().any(|arg| arg == "recover-imap-raw") {
+        let doc_id = required("--doc-id").parse().unwrap_or_else(|_| {
+            eprintln!("{}", invalid_doc_id(Language::system()));
+            std::process::exit(2);
+        });
+        match recover_missing_imap_raw(&archive, doc_id, &config, 64 * 1024 * 1024) {
+            Ok(result) => println!("{}", recovery_result_label(Language::system(), &result)),
+            Err(error) => {
+                eprintln!("{}", imap_recovery_error_label(Language::system(), &error));
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     match sync_imap_mailboxes(&archive, &config) {
         Ok(summary) => {
             println!("capabilities={:?}", summary.discovery.capabilities);

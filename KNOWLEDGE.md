@@ -43,6 +43,21 @@ Cette section sera enrichie uniquement par des expériences reproductibles.
   complète, aucun segment RAW ni publication catalogue n'est créé ; après
   append durable, un conflit CAS laisse volontairement un orphan valide.
 
+- **Recovery IMAP exact — fermé, fait vérifié le 2026-08-29 :** l'identité durable est
+  `source_account + mailbox + UIDVALIDITY + UID`, avec message ID canonique
+  partagé. Les anciennes clés IMAP libres ne sont pas éligibles sans preuve
+  durable de configuration ; le format moderne est
+  `imap:{username}@{host}:{port}`. `EXAMINE` doit confirmer une UIDVALIDITY et
+  un UID positifs avant `UID FETCH ... BODY.PEEK[]`, dont toutes les réponses
+  sont drainées. Le RAW est accepté seulement si son BLAKE3 historique
+  correspond. La publication réutilise la primitive A3.2/CAS commune et une
+  destination fraîche ; frontiers et flags restent inchangés. Voir
+  `ASSURANCE.md`. Le chemin exact utilise `run_command`/`read_response` et
+  `imap-proto` plutôt que `Fetch::body()`, draine jusqu'au tagged `OK`, et
+  refuse toute ambiguïté de réponse ou de payload. Gmail et IMAP partagent la
+  publication A3.2/CAS ; un conflit laisse un orphan sûr. R2.1 est ainsi fermé
+  pour Gmail + IMAP, sans généraliser aux futurs providers.
+
 - **Memoria / single-writer — fait vérifié le 2026-08-27 :** `ArchiveWriter`
   acquiert avant toute ouverture mutable de segment un lock exclusif OS sur un
   fichier de rendez-vous stable, hors du sous-arbre supprimable de l’archive.

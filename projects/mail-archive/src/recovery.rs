@@ -3,7 +3,7 @@
 //! This module deliberately has no executor.  A plan is evidence and a
 //! proposed next action, never permission to mutate the archive.
 
-use crate::{gmail, ArchiveLocation, PhysicalFrameStatus, RecordInventoryStatus};
+use crate::{gmail, imap, ArchiveLocation, PhysicalFrameStatus, RecordInventoryStatus};
 use rusqlite::{Connection, OpenFlags};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -30,6 +30,311 @@ struct GmailRecoveryRecord {
     source_account: String,
     gmail_id: String,
     expected_blake3: [u8; 32],
+}
+
+pub type ImapRecoveryResult = GmailRecoveryResult;
+
+struct ImapRecoveryRecord {
+    location: ArchiveLocation,
+    source_account: String,
+    mailbox: String,
+    uid_validity: u32,
+    uid: u32,
+    expected_blake3: [u8; 32],
+}
+
+pub trait ImapRecoveryTransport {
+    fn fetch_exact(
+        &mut self,
+        config: &imap::ImapConfig,
+        mailbox: &str,
+        uid_validity: u32,
+        uid: u32,
+    ) -> Result<imap::ImapRawMessage, imap::ImapError>;
+}
+
+struct NetworkImapRecoveryTransport;
+
+impl ImapRecoveryTransport for NetworkImapRecoveryTransport {
+    fn fetch_exact(
+        &mut self,
+        config: &imap::ImapConfig,
+        mailbox: &str,
+        uid_validity: u32,
+        uid: u32,
+    ) -> Result<imap::ImapRawMessage, imap::ImapError> {
+        imap::fetch_exact_raw(config, mailbox, uid_validity, uid)
+    }
+}
+
+fn imap_recovery_record(root: &Path, doc_id: i64) -> Result<ImapRecoveryRecord, imap::ImapError> {
+    let inventory =
+        crate::inventory_records(root).map_err(|error| imap::ImapError::Io(error.to_string()))?;
+    let physical =
+        crate::inventory_physical(root).map_err(|error| imap::ImapError::Io(error.to_string()))?;
+    let record = inventory
+        .into_iter()
+        .find(|record| record.doc_id == doc_id)
+        .ok_or_else(|| imap::ImapError::Protocol(format!("catalogue record {doc_id} not found")))?;
+    match record.status {
+        RecordInventoryStatus::AvailableValidated => {
+            return Err(imap::ImapError::Protocol("already available".into()))
+        }
+        RecordInventoryStatus::Inconsistent { reason } => {
+            return Err(imap::ImapError::Protocol(format!(
+                "CataloguedInconsistent: {reason}"
+            )))
+        }
+        RecordInventoryStatus::PhysicallyMissing => {}
+    }
+    let location = record
+        .location
+        .ok_or_else(|| imap::ImapError::Protocol("missing catalogue location".into()))?;
+    if physical.frames.iter().any(|frame| {
+        frame.location.segment == location.segment
+            && frame.location.offset == location.offset
+            && matches!(frame.status, PhysicalFrameStatus::CataloguedInconsistent)
+    }) {
+        return Err(imap::ImapError::Protocol(
+            "CataloguedInconsistent: physical frame contradicts catalogue claim".into(),
+        ));
+    }
+    let connection = Connection::open_with_flags(
+        root.join("metadata.sqlite"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|error| imap::ImapError::Io(error.to_string()))?;
+    let identity: (String, String, i64, i64, String) = connection.query_row(
+        "SELECT source_account,mailbox,uid_validity,uid,source_state FROM imap_messages WHERE doc_id=?1",
+        [doc_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+    ).map_err(|error| imap::ImapError::Io(error.to_string()))?;
+    let (source_account, mailbox, uid_validity, uid, source_state) = identity;
+    if source_state != "present"
+        || !imap::is_canonical_imap_source_account(&source_account)
+        || mailbox.is_empty()
+        || uid_validity <= 0
+        || uid <= 0
+    {
+        return Err(imap::ImapError::Protocol(
+            "IMAP source identity is not present and complete".into(),
+        ));
+    }
+    let uid_validity = u32::try_from(uid_validity)
+        .map_err(|_| imap::ImapError::Protocol("invalid stored UIDVALIDITY".into()))?;
+    let uid =
+        u32::try_from(uid).map_err(|_| imap::ImapError::Protocol("invalid stored UID".into()))?;
+    let message_id: String = connection
+        .query_row(
+            "SELECT message_id FROM messages WHERE doc_id=?1",
+            [doc_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| imap::ImapError::Io(error.to_string()))?;
+    let has_gmail_identity: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM gmail_messages WHERE doc_id=?1)",
+            [doc_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| imap::ImapError::Io(error.to_string()))?;
+    if has_gmail_identity {
+        return Err(imap::ImapError::Protocol(
+            "multiple provider identities claim this doc_id".into(),
+        ));
+    }
+    if message_id != imap::imap_message_identity(&source_account, &mailbox, uid_validity, uid) {
+        return Err(imap::ImapError::Protocol(
+            "messages.message_id does not match canonical IMAP identity".into(),
+        ));
+    }
+    let (segment, offset, frame_bytes, digest): (String, i64, i64, Vec<u8>) = connection
+        .query_row(
+            "SELECT segment,archive_offset,frame_bytes,raw_blake3 FROM messages WHERE doc_id=?1",
+            [doc_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(|error| imap::ImapError::Io(error.to_string()))?;
+    let expected_blake3: [u8; 32] = digest
+        .try_into()
+        .map_err(|_| imap::ImapError::Protocol("historical BLAKE3 is invalid".into()))?;
+    Ok(ImapRecoveryRecord {
+        location: ArchiveLocation {
+            segment,
+            offset: u64::try_from(offset)
+                .map_err(|_| imap::ImapError::Protocol("negative archive offset".into()))?,
+            frame_bytes: u64::try_from(frame_bytes)
+                .map_err(|_| imap::ImapError::Protocol("negative archive frame length".into()))?,
+        },
+        source_account,
+        mailbox,
+        uid_validity,
+        uid,
+        expected_blake3,
+    })
+}
+
+pub fn recover_missing_imap_raw(
+    root: &Path,
+    doc_id: i64,
+    config: &imap::ImapConfig,
+    segment_bytes: u64,
+) -> Result<ImapRecoveryResult, imap::ImapError> {
+    let mut transport = NetworkImapRecoveryTransport;
+    recover_missing_imap_raw_with_transport(root, doc_id, config, segment_bytes, &mut transport)
+}
+
+pub fn recover_missing_imap_raw_with_transport<T: ImapRecoveryTransport>(
+    root: &Path,
+    doc_id: i64,
+    config: &imap::ImapConfig,
+    segment_bytes: u64,
+    transport: &mut T,
+) -> Result<ImapRecoveryResult, imap::ImapError> {
+    recover_missing_imap_raw_with_transport_and_hook(
+        root,
+        doc_id,
+        config,
+        segment_bytes,
+        transport,
+        |_, _| Ok(()),
+    )
+}
+
+fn recover_missing_imap_raw_with_transport_and_hook<T, F>(
+    root: &Path,
+    doc_id: i64,
+    config: &imap::ImapConfig,
+    segment_bytes: u64,
+    transport: &mut T,
+    before_catalogue_publish: F,
+) -> Result<ImapRecoveryResult, imap::ImapError>
+where
+    T: ImapRecoveryTransport,
+    F: FnOnce(&crate::CatalogueConnection, &mut String) -> rusqlite::Result<()>,
+{
+    let authority = crate::acquire_recovery_authority(root)
+        .map_err(|error| imap::ImapError::Io(error.to_string()))?;
+    let record = match imap_recovery_record(root, doc_id) {
+        Ok(record) => record,
+        Err(imap::ImapError::Protocol(message)) if message == "already available" => {
+            return Ok(ImapRecoveryResult::AlreadyAvailable)
+        }
+        Err(imap::ImapError::Protocol(message)) => {
+            return Ok(ImapRecoveryResult::UnsafeInconsistent(message))
+        }
+        Err(error) => return Err(error),
+    };
+    if config.mailbox != record.mailbox {
+        return Ok(ImapRecoveryResult::UnsafeInconsistent(
+            "configured mailbox does not match durable identity".into(),
+        ));
+    }
+    if !imap::is_canonical_imap_source_account(&record.source_account)
+        || config.username.is_empty()
+        || config.host.is_empty()
+        || config.port == 0
+    {
+        return Ok(ImapRecoveryResult::UnsafeInconsistent(
+            "IMAP source configuration is structurally invalid".into(),
+        ));
+    }
+    if imap::validate_source_configuration(config).is_err()
+        || config.source_account != record.source_account
+    {
+        return Ok(ImapRecoveryResult::AccountMismatch);
+    }
+    let fetched =
+        match transport.fetch_exact(config, &record.mailbox, record.uid_validity, record.uid) {
+            Ok(fetched) => fetched,
+            Err(imap::ImapError::SourceUnavailable) => {
+                return Ok(ImapRecoveryResult::SourceUnavailable)
+            }
+            Err(imap::ImapError::UidValidityChanged { expected, observed }) => {
+                return Ok(ImapRecoveryResult::UnsafeInconsistent(format!(
+                    "UIDVALIDITY changed: expected {expected}, observed {observed}"
+                )))
+            }
+            Err(imap::ImapError::FetchWrongUid { expected, observed }) => {
+                return Ok(ImapRecoveryResult::UnsafeInconsistent(format!(
+                    "FETCH returned UID {observed}, requested {expected}"
+                )))
+            }
+            Err(imap::ImapError::FetchAmbiguous) => {
+                return Ok(ImapRecoveryResult::UnsafeInconsistent(
+                    "ambiguous IMAP FETCH response".into(),
+                ))
+            }
+            Err(error) => return Err(error),
+        };
+    if fetched.uid_validity != record.uid_validity || fetched.uid != record.uid {
+        return Ok(ImapRecoveryResult::UnsafeInconsistent(
+            "IMAP response identity does not match requested identity".into(),
+        ));
+    }
+    let digest = *blake3::hash(&fetched.raw).as_bytes();
+    if digest != record.expected_blake3 {
+        return Ok(ImapRecoveryResult::SourceContentChanged {
+            expected: record.expected_blake3,
+            fetched: digest,
+        });
+    }
+    let current = match imap_recovery_record(root, doc_id) {
+        Ok(record) => record,
+        Err(imap::ImapError::Protocol(message)) => {
+            return Ok(ImapRecoveryResult::UnsafeInconsistent(message))
+        }
+        Err(error) => return Err(error),
+    };
+    if current.source_account != record.source_account
+        || current.mailbox != record.mailbox
+        || current.uid_validity != record.uid_validity
+        || current.uid != record.uid
+        || current.location != record.location
+        || current.expected_blake3 != record.expected_blake3
+    {
+        return Err(imap::ImapError::Protocol(
+            "record changed during revalidation".into(),
+        ));
+    }
+    let mut session =
+        crate::ArchiveSession::recovery_with_authority(root, segment_bytes, authority)
+            .map_err(|error| imap::ImapError::Io(error.to_string()))?;
+    let (writer, _) = session.parts_mut();
+    let pending = writer
+        .append_raw(doc_id as u64, &fetched.raw)
+        .map_err(|error| imap::ImapError::Io(error.to_string()))?;
+    let durable = writer
+        .durable_barrier()
+        .map_err(|error| imap::ImapError::Io(error.to_string()))?;
+    let location = durable.entries()[0].reference().location.clone();
+    let mut canonical_message_id = imap::imap_message_identity(
+        &record.source_account,
+        &record.mailbox,
+        record.uid_validity,
+        record.uid,
+    );
+    let (_, connection) = session.parts_mut();
+    before_catalogue_publish(connection, &mut canonical_message_id)
+        .map_err(|error| imap::ImapError::Io(error.to_string()))?;
+    let published = session
+        .publish_imap_recovery(
+            doc_id,
+            &record.source_account,
+            &record.mailbox,
+            record.uid_validity,
+            record.uid,
+            &canonical_message_id,
+            &record.location,
+            &record.expected_blake3,
+            &pending,
+            &durable,
+        )
+        .map_err(|error| imap::ImapError::Io(error.to_string()))?;
+    if !published {
+        return Ok(ImapRecoveryResult::RecoveryConflict);
+    }
+    Ok(ImapRecoveryResult::Recovered { doc_id, location })
 }
 
 enum PreparationError {
@@ -423,7 +728,7 @@ fn source_evidence(path: &Path, doc_id: i64) -> io::Result<SourceEvidence> {
             .ok()
             .filter(|value| *value != 0)
             .zip(u32::try_from(uid).ok().filter(|value| *value != 0));
-        let valid = !account.is_empty()
+        let valid = imap::is_canonical_imap_source_account(&account)
             && !mailbox.is_empty()
             && valid_numbers.is_some()
             && matches!(state.as_str(), "present" | "deleted");
@@ -730,6 +1035,30 @@ mod tests {
         returned_id: Option<String>,
     }
 
+    struct FakeImap {
+        response: Option<Result<imap::ImapRawMessage, imap::ImapError>>,
+        calls: usize,
+        mailbox: Option<String>,
+        uid_validity: Option<u32>,
+        uid: Option<u32>,
+    }
+
+    impl ImapRecoveryTransport for FakeImap {
+        fn fetch_exact(
+            &mut self,
+            _: &imap::ImapConfig,
+            mailbox: &str,
+            uid_validity: u32,
+            uid: u32,
+        ) -> Result<imap::ImapRawMessage, imap::ImapError> {
+            self.calls += 1;
+            self.mailbox = Some(mailbox.into());
+            self.uid_validity = Some(uid_validity);
+            self.uid = Some(uid);
+            self.response.take().unwrap()
+        }
+    }
+
     impl GmailTransport for FakeGmail {
         fn list(&mut self, _: Option<&str>, _: Option<&str>) -> Result<ListPage, GmailError> {
             Ok(ListPage::default())
@@ -857,6 +1186,43 @@ mod tests {
         (root, raw)
     }
 
+    fn imap_missing_fixture(label: &str) -> (std::path::PathBuf, Vec<u8>, imap::ImapConfig) {
+        let (root, location) = published_fixture(label);
+        let raw = crate::read_archived_raw(&root, 1).unwrap();
+        let source_account = imap::imap_source_account("account-a", "imap.example.test", 993);
+        let message_id = imap::imap_message_identity(&source_account, "INBOX", 17, 42);
+        let connection = Connection::open(root.join("metadata.sqlite")).unwrap();
+        connection
+            .execute(
+                "UPDATE messages SET message_id=?1 WHERE doc_id=1",
+                [message_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO imap_messages(source_account,mailbox,uid_validity,uid,doc_id,flags,source_state,first_seen_unix,last_seen_unix) VALUES (?1,'INBOX',17,42,1,'[]','present',0,0)",
+                [&source_account],
+            )
+            .unwrap();
+        drop(connection);
+        fs::remove_file(root.join("archive").join(location.segment)).unwrap();
+        let config = imap::ImapConfig {
+            host: "imap.example.test".into(),
+            server_name: "imap.example.test".into(),
+            port: 993,
+            username: "account-a".into(),
+            password: "secret".into(),
+            ca_cert: "unused.pem".into(),
+            mailbox: "INBOX".into(),
+            mailboxes: Vec::new(),
+            all_mailboxes: false,
+            source_account,
+            limit: None,
+            timeout: std::time::Duration::from_secs(1),
+        };
+        (root, raw, config)
+    }
+
     #[test]
     fn disposition_labels_are_stable() {
         assert_eq!(RecoveryDisposition::SalvageOnly.label(), "salvage");
@@ -897,6 +1263,404 @@ mod tests {
                 frame.location == repaired
                     && frame.status == crate::PhysicalFrameStatus::CataloguedValidated
             }));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exact_imap_recovery_publishes_byte_exact_raw() {
+        let (root, raw, config) = imap_missing_fixture("imap-exact");
+        let mut transport = FakeImap {
+            response: Some(Ok(imap::ImapRawMessage {
+                uid_validity: 17,
+                uid: 42,
+                raw: raw.clone(),
+            })),
+            calls: 0,
+            mailbox: None,
+            uid_validity: None,
+            uid: None,
+        };
+        let result =
+            recover_missing_imap_raw_with_transport(&root, 1, &config, 4096, &mut transport)
+                .unwrap();
+        assert!(matches!(result, ImapRecoveryResult::Recovered { .. }));
+        assert_eq!(transport.calls, 1);
+        assert_eq!(transport.mailbox.as_deref(), Some("INBOX"));
+        assert_eq!(transport.uid_validity, Some(17));
+        assert_eq!(transport.uid, Some(42));
+        assert_eq!(crate::read_archived_raw(&root, 1).unwrap(), raw);
+        assert_eq!(
+            crate::inventory_records(&root).unwrap()[0].status,
+            RecordInventoryStatus::AvailableValidated
+        );
+        assert!(crate::inventory_physical(&root)
+            .unwrap()
+            .frames
+            .iter()
+            .any(|frame| frame.status == PhysicalFrameStatus::CataloguedValidated));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn imap_recovery_rejects_a_concurrent_gmail_identity_before_fetch() {
+        let (root, _, config) = imap_missing_fixture("imap-provider-conflict");
+        let source = imap::imap_source_account("account-a", "imap.example.test", 993);
+        let connection = Connection::open(root.join("metadata.sqlite")).unwrap();
+        connection
+            .execute(
+                "INSERT INTO gmail_messages(source_account,gmail_message_id,doc_id,thread_id,label_ids,source_state,first_seen_unix,last_seen_unix) VALUES (?1,'gmail-conflict',1,'thread','[]','present',0,0)",
+                [&source],
+            )
+            .unwrap();
+        drop(connection);
+        let mut transport = FakeImap {
+            response: None,
+            calls: 0,
+            mailbox: None,
+            uid_validity: None,
+            uid: None,
+        };
+        assert!(matches!(
+            recover_missing_imap_raw_with_transport(&root, 1, &config, 4096, &mut transport)
+                .unwrap(),
+            ImapRecoveryResult::UnsafeInconsistent(_)
+        ));
+        assert_eq!(transport.calls, 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn imap_recovery_rejects_uidvalidity_uid_mailbox_and_account_mismatches() {
+        let (root, _, config) = imap_missing_fixture("imap-uidvalidity");
+        let before = archive_snapshot(&root);
+        let mut transport = FakeImap {
+            response: Some(Err(imap::ImapError::UidValidityChanged {
+                expected: 17,
+                observed: 18,
+            })),
+            calls: 0,
+            mailbox: None,
+            uid_validity: None,
+            uid: None,
+        };
+        assert!(matches!(
+            recover_missing_imap_raw_with_transport(&root, 1, &config, 4096, &mut transport)
+                .unwrap(),
+            ImapRecoveryResult::UnsafeInconsistent(_)
+        ));
+        assert_eq!(archive_snapshot(&root), before);
+        let _ = fs::remove_dir_all(root);
+
+        let (root, _, config) = imap_missing_fixture("imap-uid");
+        let before = archive_snapshot(&root);
+        let mut transport = FakeImap {
+            response: Some(Ok(imap::ImapRawMessage {
+                uid_validity: 17,
+                uid: 43,
+                raw: Vec::new(),
+            })),
+            calls: 0,
+            mailbox: None,
+            uid_validity: None,
+            uid: None,
+        };
+        assert!(matches!(
+            recover_missing_imap_raw_with_transport(&root, 1, &config, 4096, &mut transport)
+                .unwrap(),
+            ImapRecoveryResult::UnsafeInconsistent(_)
+        ));
+        assert_eq!(archive_snapshot(&root), before);
+        let _ = fs::remove_dir_all(root);
+
+        let (root, _, mut config) = imap_missing_fixture("imap-mailbox");
+        config.mailbox = "Other".into();
+        let before = archive_snapshot(&root);
+        let mut transport = FakeImap {
+            response: Some(Ok(imap::ImapRawMessage {
+                uid_validity: 17,
+                uid: 42,
+                raw: Vec::new(),
+            })),
+            calls: 0,
+            mailbox: None,
+            uid_validity: None,
+            uid: None,
+        };
+        assert!(matches!(
+            recover_missing_imap_raw_with_transport(&root, 1, &config, 4096, &mut transport)
+                .unwrap(),
+            ImapRecoveryResult::UnsafeInconsistent(_)
+        ));
+        assert_eq!(transport.calls, 0);
+        assert_eq!(archive_snapshot(&root), before);
+        let _ = fs::remove_dir_all(root);
+
+        let (root, _, mut config) = imap_missing_fixture("imap-account");
+        config.username = "account-b".into();
+        let before = archive_snapshot(&root);
+        let mut transport = FakeImap {
+            response: Some(Ok(imap::ImapRawMessage {
+                uid_validity: 17,
+                uid: 42,
+                raw: Vec::new(),
+            })),
+            calls: 0,
+            mailbox: None,
+            uid_validity: None,
+            uid: None,
+        };
+        assert_eq!(
+            recover_missing_imap_raw_with_transport(&root, 1, &config, 4096, &mut transport)
+                .unwrap(),
+            ImapRecoveryResult::AccountMismatch
+        );
+        assert_eq!(transport.calls, 0);
+        assert_eq!(archive_snapshot(&root), before);
+        let _ = fs::remove_dir_all(root);
+
+        for (zero_uid_validity, label) in
+            [(true, "imap-zero-uidvalidity"), (false, "imap-zero-uid")]
+        {
+            let (root, _, config) = imap_missing_fixture(label);
+            let source = imap::imap_source_account("account-a", "imap.example.test", 993);
+            let (uid_validity, uid) = if zero_uid_validity { (0, 42) } else { (17, 0) };
+            let connection = Connection::open(root.join("metadata.sqlite")).unwrap();
+            connection
+                .execute(
+                    "UPDATE imap_messages SET uid_validity=?1,uid=?2 WHERE doc_id=1",
+                    rusqlite::params![uid_validity, uid],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE messages SET message_id=?1 WHERE doc_id=1",
+                    [imap::imap_message_identity(
+                        &source,
+                        "INBOX",
+                        uid_validity,
+                        uid,
+                    )],
+                )
+                .unwrap();
+            drop(connection);
+            let before = archive_snapshot(&root);
+            let mut transport = FakeImap {
+                response: Some(Ok(imap::ImapRawMessage {
+                    uid_validity: 17,
+                    uid: 42,
+                    raw: Vec::new(),
+                })),
+                calls: 0,
+                mailbox: None,
+                uid_validity: None,
+                uid: None,
+            };
+            assert!(matches!(
+                recover_missing_imap_raw_with_transport(&root, 1, &config, 4096, &mut transport)
+                    .unwrap(),
+                ImapRecoveryResult::UnsafeInconsistent(_)
+            ));
+            assert_eq!(transport.calls, 0);
+            assert_eq!(archive_snapshot(&root), before);
+            let _ = fs::remove_dir_all(root);
+        }
+
+        for (invalid_username, invalid_host, invalid_port, label) in [
+            (true, false, false, "imap-empty-username"),
+            (false, true, false, "imap-empty-host"),
+            (false, false, true, "imap-zero-port"),
+        ] {
+            let (root, _, mut config) = imap_missing_fixture(label);
+            if invalid_username {
+                config.username.clear();
+            }
+            if invalid_host {
+                config.host.clear();
+            }
+            if invalid_port {
+                config.port = 0;
+            }
+            let before = archive_snapshot(&root);
+            let mut transport = FakeImap {
+                response: None,
+                calls: 0,
+                mailbox: None,
+                uid_validity: None,
+                uid: None,
+            };
+            assert!(matches!(
+                recover_missing_imap_raw_with_transport(&root, 1, &config, 4096, &mut transport)
+                    .unwrap(),
+                ImapRecoveryResult::UnsafeInconsistent(_)
+            ));
+            assert_eq!(transport.calls, 0);
+            assert_eq!(archive_snapshot(&root), before);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn imap_recovery_source_unavailable_and_digest_mismatch_are_read_only() {
+        let (root, _, config) = imap_missing_fixture("imap-unavailable");
+        let before = archive_snapshot(&root);
+        let mut transport = FakeImap {
+            response: Some(Err(imap::ImapError::SourceUnavailable)),
+            calls: 0,
+            mailbox: None,
+            uid_validity: None,
+            uid: None,
+        };
+        assert_eq!(
+            recover_missing_imap_raw_with_transport(&root, 1, &config, 4096, &mut transport)
+                .unwrap(),
+            ImapRecoveryResult::SourceUnavailable
+        );
+        assert_eq!(transport.calls, 1);
+        assert_eq!(archive_snapshot(&root), before);
+        let _ = fs::remove_dir_all(root);
+
+        let (root, _, config) = imap_missing_fixture("imap-digest");
+        let before = archive_snapshot(&root);
+        let mut transport = FakeImap {
+            response: Some(Ok(imap::ImapRawMessage {
+                uid_validity: 17,
+                uid: 42,
+                raw: b"changed".to_vec(),
+            })),
+            calls: 0,
+            mailbox: None,
+            uid_validity: None,
+            uid: None,
+        };
+        assert!(matches!(
+            recover_missing_imap_raw_with_transport(&root, 1, &config, 4096, &mut transport)
+                .unwrap(),
+            ImapRecoveryResult::SourceContentChanged { .. }
+        ));
+        assert_eq!(archive_snapshot(&root), before);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn imap_recovery_same_doc_orphan_is_not_adopted() {
+        let (root, raw, config) = imap_missing_fixture("imap-same-doc-orphan");
+        let mut orphan_writer = crate::ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        orphan_writer.append_raw(1, b"unrelated orphan").unwrap();
+        orphan_writer.durable_barrier().unwrap();
+        drop(orphan_writer);
+        let orphan_segment = fs::read_dir(root.join("archive"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name();
+        fs::rename(
+            root.join("archive").join(orphan_segment),
+            root.join("archive").join("segment-999999.arc"),
+        )
+        .unwrap();
+        let mut transport = FakeImap {
+            response: Some(Ok(imap::ImapRawMessage {
+                uid_validity: 17,
+                uid: 42,
+                raw: raw.clone(),
+            })),
+            calls: 0,
+            mailbox: None,
+            uid_validity: None,
+            uid: None,
+        };
+        assert!(matches!(
+            recover_missing_imap_raw_with_transport(&root, 1, &config, 4096, &mut transport)
+                .unwrap(),
+            ImapRecoveryResult::Recovered { .. }
+        ));
+        assert_eq!(crate::read_archived_raw(&root, 1).unwrap(), raw);
+        assert_eq!(
+            crate::inventory_physical(&root)
+                .unwrap()
+                .orphan_valid_frames,
+            1
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn imap_recovery_cas_conflict_leaves_old_record_and_frontier_unchanged() {
+        let (root, raw, config) = imap_missing_fixture("imap-cas-conflict");
+        let connection = Connection::open(root.join("metadata.sqlite")).unwrap();
+        let before_messages = table_snapshot(&connection, "SELECT doc_id,message_id,timestamp,sender,recipients,subject,account,folder,thread,segment,archive_offset,frame_bytes,raw_blake3 FROM messages WHERE doc_id=1", 13);
+        let before_imap = table_snapshot(&connection, "SELECT source_account,mailbox,uid_validity,uid,doc_id,flags,internal_date,internal_date_ms,rfc822_size,source_state,first_seen_unix,last_seen_unix FROM imap_messages WHERE doc_id=1", 12);
+        let before_frontier = table_snapshot(&connection, "SELECT source_account,mailbox,uid_validity,scanned_through_uid,last_uid_next,updated_unix FROM imap_scan_state ORDER BY source_account,mailbox", 6);
+        drop(connection);
+        let mut transport = FakeImap {
+            response: Some(Ok(imap::ImapRawMessage {
+                uid_validity: 17,
+                uid: 42,
+                raw,
+            })),
+            calls: 0,
+            mailbox: None,
+            uid_validity: None,
+            uid: None,
+        };
+        let result = recover_missing_imap_raw_with_transport_and_hook(
+            &root,
+            1,
+            &config,
+            4096,
+            &mut transport,
+            |_, message_id| {
+                *message_id = "imap:stale".into();
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(result, ImapRecoveryResult::RecoveryConflict);
+        let connection = Connection::open(root.join("metadata.sqlite")).unwrap();
+        assert_eq!(table_snapshot(&connection, "SELECT doc_id,message_id,timestamp,sender,recipients,subject,account,folder,thread,segment,archive_offset,frame_bytes,raw_blake3 FROM messages WHERE doc_id=1", 13), before_messages);
+        assert_eq!(table_snapshot(&connection, "SELECT source_account,mailbox,uid_validity,uid,doc_id,flags,internal_date,internal_date_ms,rfc822_size,source_state,first_seen_unix,last_seen_unix FROM imap_messages WHERE doc_id=1", 12), before_imap);
+        assert_eq!(table_snapshot(&connection, "SELECT source_account,mailbox,uid_validity,scanned_through_uid,last_uid_next,updated_unix FROM imap_scan_state ORDER BY source_account,mailbox", 6), before_frontier);
+        drop(connection);
+        assert_eq!(
+            crate::inventory_physical(&root)
+                .unwrap()
+                .orphan_valid_frames,
+            1
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn imap_recovery_rejects_contradictory_canonical_message_id_before_fetch() {
+        let (root, _, config) = imap_missing_fixture("imap-message-id");
+        let connection = Connection::open(root.join("metadata.sqlite")).unwrap();
+        connection
+            .execute(
+                "UPDATE messages SET message_id='contradictory' WHERE doc_id=1",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let before = archive_snapshot(&root);
+        let mut transport = FakeImap {
+            response: Some(Ok(imap::ImapRawMessage {
+                uid_validity: 17,
+                uid: 42,
+                raw: Vec::new(),
+            })),
+            calls: 0,
+            mailbox: None,
+            uid_validity: None,
+            uid: None,
+        };
+        assert!(matches!(
+            recover_missing_imap_raw_with_transport(&root, 1, &config, 4096, &mut transport)
+                .unwrap(),
+            ImapRecoveryResult::UnsafeInconsistent(_)
+        ));
+        assert_eq!(transport.calls, 0);
+        assert_eq!(archive_snapshot(&root), before);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1439,7 +2203,7 @@ mod tests {
         );
         assert_eq!(
             by_doc("3").unwrap().disposition,
-            RecoveryDisposition::RecoverableWithSource
+            RecoveryDisposition::UnsafeToRepairAutomatically
         );
         assert!(by_doc("1").unwrap().evidence.source_identities[0].source_account == "account-a");
 

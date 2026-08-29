@@ -137,6 +137,29 @@ metadata : le recovery n'est pas une synchronisation. Un contenu Gmail dont le
 BLAKE3 diffère produit `SourceContentChanged` et ne remplace jamais
 silencieusement le RAW historique.
 
+### R2.1b — re-fetch IMAP exact — fermé
+
+R2.1b reprend ce contrat pour l'identité IMAP complète
+`source_account + mailbox + UIDVALIDITY + UID`. Seules les sources dont la
+clé suit la convention persistée `imap:{username}@{host}:{port}` peuvent être
+reliées automatiquement à une configuration de session authentifiée ; les
+anciennes clés `--source` libres restent non éligibles, sans migration
+silencieuse. `EXAMINE` doit confirmer la même UIDVALIDITY, strictement
+positive, ainsi que l'UID strictement positif ; le fetch exact utilise
+`UID FETCH ... BODY.PEEK[]`, sans modifier les flags. Toutes les réponses
+ sont drainées jusqu'au tagged completion `OK` et exactement une
+`Response::Fetch`, un UID correspondant et un BODY full-message sont requis.
+Toute ambiguïté multi-réponse ou multi-BODY est refusée.
+
+Gmail et IMAP partagent `publish_exact_recovered_raw` pour la frontière A3.2 :
+destination fraîche, RAW durable, transaction/CAS catalogue et
+`RecoveryConflict` laissant une nouvelle frame `OrphanValidated`.
+
+### R2.1 — re-fetch assisté par source — fermé pour Gmail + IMAP
+
+R2.1 est fermé pour les deux providers actuellement supportés : R2.1a Gmail
+exact et R2.1b IMAP exact. Cette fermeture ne préjuge pas des futurs providers.
+
 `source_account` Gmail n'est pas une adresse affichée : c'est l'identité locale
 opaque `gmail:<BLAKE3(email canonique)>`, produite par le helper partagé entre
 l'ingestion, la CLI et le recovery. Une valeur `--account` éventuelle n'est

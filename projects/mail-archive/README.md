@@ -43,6 +43,20 @@ Après append durable, un conflit du CAS catalogue peut volontairement laisser
 la nouvelle frame `OrphanValidated`; l'ancienne ligne `messages` reste alors
 non publiée.
 
+R2.1b IMAP exact re-fetch est fermé pour son périmètre. Il reprend l'identité
+`source_account + mailbox + UIDVALIDITY + UID`; les anciennes clés IMAP
+`--source` libres ne sont pas automatiquement reliées à une session et restent
+insuffisamment prouvées pour un refetch. Le format moderne est
+`imap:{username}@{host}:{port}`. `UID FETCH ... BODY.PEEK[]` est utilisé avec
+tagged completion `OK`, exactement une réponse et un payload full-message ;
+toute ambiguïté est refusée. Les flags et le frontier restent inchangés.
+
+R2.1 — re-fetch assisté par source est fermé pour Gmail + IMAP. Les deux
+providers partagent `publish_exact_recovered_raw` : une destination RAW fraîche
+et durable est publiée par A3.2/CAS ; un conflit peut laisser une frame
+`OrphanValidated` sûre sans modifier l'ancienne ligne catalogue. La prochaine
+étape est R2.2, le salvage/export des RAW orphelins.
+
 Le connecteur utilise exclusivement le scope
 `https://www.googleapis.com/auth/gmail.readonly`. Il appelle `list`, `get` en
 `format=RAW` et `history`; aucune opération Gmail d’écriture n’est présente

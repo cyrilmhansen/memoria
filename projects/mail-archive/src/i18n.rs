@@ -6,6 +6,93 @@ pub enum Language {
     En,
 }
 
+pub fn recovery_result_label(
+    language: Language,
+    result: &crate::recovery::GmailRecoveryResult,
+) -> String {
+    let text = match (language, result) {
+        (Language::Fr, crate::recovery::GmailRecoveryResult::Recovered { .. }) => {
+            "RAW IMAP récupéré"
+        }
+        (Language::En, crate::recovery::GmailRecoveryResult::Recovered { .. }) => {
+            "IMAP RAW recovered"
+        }
+        (Language::Fr, crate::recovery::GmailRecoveryResult::AlreadyAvailable) => {
+            "RAW déjà disponible"
+        }
+        (Language::En, crate::recovery::GmailRecoveryResult::AlreadyAvailable) => {
+            "RAW already available"
+        }
+        (Language::Fr, crate::recovery::GmailRecoveryResult::SourceUnavailable) => {
+            "Source IMAP indisponible"
+        }
+        (Language::En, crate::recovery::GmailRecoveryResult::SourceUnavailable) => {
+            "IMAP source unavailable"
+        }
+        (Language::Fr, crate::recovery::GmailRecoveryResult::SourceContentChanged { .. }) => {
+            "Contenu source modifié"
+        }
+        (Language::En, crate::recovery::GmailRecoveryResult::SourceContentChanged { .. }) => {
+            "Source content changed"
+        }
+        (Language::Fr, crate::recovery::GmailRecoveryResult::AccountMismatch) => {
+            "Compte IMAP incohérent"
+        }
+        (Language::En, crate::recovery::GmailRecoveryResult::AccountMismatch) => {
+            "IMAP account mismatch"
+        }
+        (Language::Fr, crate::recovery::GmailRecoveryResult::UnsafeInconsistent(_)) => {
+            "État IMAP incohérent ou non sûr"
+        }
+        (Language::En, crate::recovery::GmailRecoveryResult::UnsafeInconsistent(_)) => {
+            "Unsafe or inconsistent IMAP state"
+        }
+        (Language::Fr, crate::recovery::GmailRecoveryResult::RecoveryConflict) => {
+            "Conflit de recovery"
+        }
+        (Language::En, crate::recovery::GmailRecoveryResult::RecoveryConflict) => {
+            "Recovery conflict"
+        }
+    };
+    text.into()
+}
+
+pub fn imap_source_configuration_mismatch(language: Language) -> &'static str {
+    match language {
+        Language::Fr => "La source IMAP ne correspond pas à la configuration authentifiée",
+        Language::En => "IMAP source does not match the authenticated configuration",
+    }
+}
+
+pub fn invalid_doc_id(language: Language) -> &'static str {
+    match language {
+        Language::Fr => "Identifiant de document invalide",
+        Language::En => "Invalid document identifier",
+    }
+}
+
+pub fn imap_recovery_error_label(
+    language: Language,
+    error: &crate::imap::ImapError,
+) -> &'static str {
+    match (language, error) {
+        (Language::Fr, crate::imap::ImapError::SourceUnavailable) => "Source IMAP indisponible",
+        (Language::En, crate::imap::ImapError::SourceUnavailable) => "IMAP source unavailable",
+        (Language::Fr, crate::imap::ImapError::UidValidityChanged { .. }) => {
+            "UIDVALIDITY IMAP incohérente"
+        }
+        (Language::En, crate::imap::ImapError::UidValidityChanged { .. }) => {
+            "Inconsistent IMAP UIDVALIDITY"
+        }
+        (Language::Fr, crate::imap::ImapError::FetchAmbiguous) => "Réponse FETCH IMAP ambiguë",
+        (Language::En, crate::imap::ImapError::FetchAmbiguous) => "Ambiguous IMAP FETCH response",
+        (Language::Fr, crate::imap::ImapError::FetchWrongUid { .. }) => "UID FETCH IMAP inattendu",
+        (Language::En, crate::imap::ImapError::FetchWrongUid { .. }) => "Unexpected IMAP FETCH UID",
+        (Language::Fr, _) => "Échec du recovery IMAP",
+        (Language::En, _) => "IMAP recovery failed",
+    }
+}
+
 impl Language {
     pub fn from_locale(value: &str) -> Self {
         if value.trim().to_ascii_lowercase().starts_with("fr") {
