@@ -1168,3 +1168,26 @@ questions ouvertes. Les conclusions réutilisables doivent être promues dans
   record.
 - **État :** implémentation candidate corrigée, validations finales Sol High
   en cours. Aucun recovery exécuté et aucun commit.
+
+## 2026-08-30 — R2.2a : salvage/export orphan
+
+- **Fait vérifié :** l’export prend l’autorité single-writer, revalide
+  `OrphanValidated` par coordonnées et preuve physique complète, puis lit le
+  payload de la même frame.
+- **Implémentation candidate :** `export_orphan_raw` écrit par `create_new`
+  le RAW byte-exact et son manifest sans provenance; la CLI n’accepte jamais
+  `doc_id` seul.
+- **Décision :** aucun INSERT/UPDATE/DELETE, relink, adoption, mutation RAW,
+  frontier ou index. R2.2a reste en audit jusqu’à la fermeture Sol High.
+
+## 2026-08-30 — Fermeture R2.2a après micro-audit Sol High
+
+- **Fait vérifié :** `OrphanValidated` est une preuve physique, pas une
+  provenance; `doc_id` seul ne sélectionne jamais un orphan. L’ancienne
+  observation est revalidée sous authority au moment de l’action, y compris
+  le BLAKE3 contre une frame physiquement valide mais remplacée.
+- **Fait vérifié :** la destination est strictement externe à la racine
+  archive, alias/symlink compris; le manifest contient uniquement les faits
+  physiques et le snapshot source reste byte-identique.
+- **Décision :** fermeture de R2.2a après audit Sol final. R2.2 global reste
+  ouvert pour les tranches ultérieures.

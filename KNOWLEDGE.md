@@ -956,6 +956,18 @@ résultats d'expérience locale :
   forte permet de tenter un futur re-fetch ; cela ne garantit ni la
   disponibilité de la source ni l'identité des octets retournés avec le RAW
   historique perdu.
+
+## 2026-08-30 — R2.2a : export RAW orphan fermé
+
+- **Fait vérifié :** `export_orphan_raw` utilise la preuve physique complète,
+  acquiert l’autorité single-writer, rescane puis relit la même frame. Une
+  ancienne référence n’est jamais une autorisation durable.
+- **Fait vérifié :** `create_new` produit un payload byte-exact externe et un
+  manifest limité aux huit faits physiques autorisés; les alias/symlinks sous
+  la racine archive sont refusés.
+- **Décision :** aucune écriture catalogue/RAW/frontier/index, adoption ou
+  provenance; les états non-orphan et le same-doc-id sont refusés sans
+  modifier le message catalogue. R2.2a est fermé; R2.2 global reste ouvert.
 - **Conclusion :** le schéma catalogue v1, avec provenance et identités
   `NOT NULL`, ne représente pas honnêtement un RAW salvage dont la source est
   perdue. Il faudra un modèle séparé ou une évolution explicite du schéma.

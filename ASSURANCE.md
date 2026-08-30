@@ -383,3 +383,14 @@ L’audit du 25 août 2026 a notamment identifié des écarts Tier A concernant 
 - exploitation d’une archive partiellement amputée.
 
 Ces éléments doivent être traités comme des défauts ou dettes Tier A distincts et priorisés séparément, sans refactoring global automatique.
+
+### R2.2a — salvage/export orphan — fermé
+
+L’export d’un `OrphanValidated` exige `segment + offset + frame_bytes + doc_id
++ BLAKE3`, prend l’autorité single-writer pendant la revalidation et la
+lecture, puis écrit le payload RAW exactement via `create_new` hors archive.
+Le manifest ne contient que `format`, `segment`, `offset`, `frame_bytes`,
+`doc_id`, `raw_blake3`, `raw_size` et `state=OrphanValidated`. L’opération ne
+modifie ni SQLite, ni RAW, ni frontier, ni index, et ne constitue ni adoption
+ni provenance. La destination et le manifest sont hors de toute la racine
+source canonique, y compris via alias ou symlink.

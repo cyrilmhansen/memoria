@@ -57,6 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "gmail-report" => gmail_report(&args, &out)?,
         "archive-inventory" => archive_inventory(&args, &out)?,
         "recovery-plan" => recovery_plan(&args, &out)?,
+        "salvage-orphan" => salvage_orphan(&args, &out)?,
         "gmail-index" => gmail_index(&args, &out)?,
         "search" => search(&args, &out)?,
         "help" | "--help" | "-h" => help(),
@@ -294,6 +295,45 @@ fn recovery_plan(args: &[String], default_out: &Path) -> Result<(), Box<dyn std:
     Ok(())
 }
 
+fn salvage_orphan(args: &[String], default_out: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let archive = PathBuf::from(
+        option(args, "--archive").unwrap_or_else(|| default_out.display().to_string()),
+    );
+    let segment = option(args, "--segment").ok_or("salvage-orphan requires --segment")?;
+    let offset = option(args, "--offset")
+        .ok_or("salvage-orphan requires --offset")?
+        .parse::<u64>()?;
+    let destination =
+        PathBuf::from(option(args, "--output").ok_or("salvage-orphan requires --output")?);
+    let inventory = inventory_physical(&archive)?;
+    let frame = inventory
+        .frames
+        .iter()
+        .find(|frame| frame.location.segment == segment && frame.location.offset == offset)
+        .ok_or("physical frame not found")?;
+    if !matches!(frame.status, PhysicalFrameStatus::OrphanValidated) {
+        return Err("NotOrphan / Unsafe: selected frame is not OrphanValidated".into());
+    }
+    let reference = OrphanRawReference {
+        location: frame.location.clone(),
+        frame_bytes: frame.location.frame_bytes,
+        doc_id: frame.doc_id.ok_or("orphan frame has no doc_id")?,
+        raw_blake3: frame.blake3.ok_or("orphan frame has no BLAKE3")?,
+    };
+    let result = export_orphan_raw(&archive, &reference, &destination)?;
+    println!(
+        "result=exported orphan\nsegment={}\noffset={}\ndoc_id={}\nraw_bytes={}\nraw_blake3={}\noutput={}\nmanifest={}",
+        reference.location.segment,
+        reference.location.offset,
+        reference.doc_id,
+        result.raw_bytes,
+        blake3::Hash::from_bytes(result.raw_blake3).to_hex(),
+        result.destination.display(),
+        result.manifest.display()
+    );
+    Ok(())
+}
+
 fn gmail_index(args: &[String], default_out: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let archive = PathBuf::from(
         option(args, "--archive").unwrap_or_else(|| default_out.display().to_string()),
@@ -507,5 +547,5 @@ fn benchmark(
 }
 
 fn help() {
-    println!("mail-archive-experiment\n\ncommands: generate | benchmark | cas-benchmark | gmail-sync | recover-gmail-raw | gmail-report | archive-inventory | recovery-plan | gmail-index | search\noptions: --messages N --seed N --profile light|personal|heavy --queries N --segment-bytes N --attachment-rate P --duplicate-rate P --max-attachment-bytes N --compression --out PATH\ngmail-sync: --archive PATH --credentials PATH --token-dir PATH [--account KEY] [--max-messages N] [--query GMAIL_QUERY]\nrecover-gmail-raw: --archive PATH --doc-id N --credentials PATH [--token-dir PATH] (one explicit exact recovery)\ngmail-report: --archive PATH (offline aggregate MIME/checksum report)\narchive-inventory: --archive PATH (read-only physical/catalogue reconciliation)\nrecovery-plan: --archive PATH (strictly read-only Tier A recovery policy plan)\ngmail-index: --archive PATH (offline Tantivy build and aggregate workload)\nsearch: --archive PATH QUERY (local Tantivy search)\nGmail sync and recovery requests only gmail.readonly and never write to Gmail.");
+    println!("mail-archive-experiment\n\ncommands: generate | benchmark | cas-benchmark | gmail-sync | recover-gmail-raw | salvage-orphan | gmail-report | archive-inventory | recovery-plan | gmail-index | search\noptions: --messages N --seed N --profile light|personal|heavy --queries N --segment-bytes N --attachment-rate P --duplicate-rate P --max-attachment-bytes N --compression --out PATH\ngmail-sync: --archive PATH --credentials PATH --token-dir PATH [--account KEY] [--max-messages N] [--query GMAIL_QUERY]\nrecover-gmail-raw: --archive PATH --doc-id N --credentials PATH [--token-dir PATH] (one explicit exact recovery)\nsalvage-orphan: --archive PATH --segment NAME --offset N --output PATH (exact RAW orphan export plus manifest)\ngmail-report: --archive PATH (offline aggregate MIME/checksum report)\narchive-inventory: --archive PATH (read-only physical/catalogue reconciliation)\nrecovery-plan: --archive PATH (strictly read-only Tier A recovery policy plan)\ngmail-index: --archive PATH (offline Tantivy build and aggregate workload)\nsearch: --archive PATH QUERY (local Tantivy search)\nGmail sync and recovery requests only gmail.readonly and never write to Gmail.");
 }

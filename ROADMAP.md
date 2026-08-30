@@ -124,6 +124,17 @@ Si un BLAKE3 historique existe et que le RAW récupéré aujourd’hui diffère,
 
 ### R2.2 — Salvage/export des RAW orphelins
 
+#### R2.2a — Export explicite byte-exact d’un OrphanValidated — Fermé
+
+La commande `salvage-orphan` exporte une frame `OrphanValidated` par
+`segment + offset + frame_bytes + doc_id + raw_blake3`, jamais par `doc_id`
+seul. Elle acquiert l’autorité single-writer, rescane, revalide framing/FNV/
+BLAKE3 et l’absence de claim catalogue, puis relit la même frame avant un
+export `create_new` hors de toute la racine archive canonique. Le manifest
+sidecar ne contient que les faits physiques observés. Aucun catalogue,
+segment, frontier, index ou provenance n’est modifié. R2.2 reste ouvert pour
+ses tranches ultérieures.
+
 **Produit / utilisateur**
 
 Permettre d’exporter ou de décrire les `OrphanValidated` byte-exacts sans les adopter dans le catalogue autoritatif.

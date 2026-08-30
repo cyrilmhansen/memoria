@@ -24,6 +24,7 @@ cargo test -p mail-archive-experiment
 cargo run -p mail-archive-experiment --bin mail-archive-experiment -- gmail-report --archive /chemin/archive
 cargo run -p mail-archive-experiment --bin mail-archive-experiment -- archive-inventory --archive /chemin/archive
 cargo run -p mail-archive-experiment --bin mail-archive-experiment -- recovery-plan --archive /chemin/archive
+cargo run -p mail-archive-experiment --bin mail-archive-experiment -- salvage-orphan --archive /chemin/archive --segment segment-000000.arc --offset N --output /chemin/salvage.eml
 cargo run -p mail-archive-experiment --bin mail-archive-experiment -- recover-gmail-raw --archive /chemin/archive --doc-id N --credentials /chemin/client_secret.json
 cargo run -p mail-archive-experiment --bin mail-archive-app
 cargo run -p mail-archive-experiment --bin mail-archive-app -- --archive /chemin/archive
@@ -54,8 +55,12 @@ toute ambiguïté est refusée. Les flags et le frontier restent inchangés.
 R2.1 — re-fetch assisté par source est fermé pour Gmail + IMAP. Les deux
 providers partagent `publish_exact_recovered_raw` : une destination RAW fraîche
 et durable est publiée par A3.2/CAS ; un conflit peut laisser une frame
-`OrphanValidated` sûre sans modifier l'ancienne ligne catalogue. La prochaine
-étape est R2.2, le salvage/export des RAW orphelins.
+`OrphanValidated` sûre sans modifier l’ancienne ligne catalogue. R2.2a —
+export explicite byte-exact d’un `OrphanValidated` — est fermé : la commande
+`salvage-orphan` revalide sous single-writer une preuve physique complète,
+exporte le payload RAW dans une destination externe `create_new` et produit
+un manifest limité aux faits physiques. Elle ne fait aucune adoption,
+mutation catalogue/RAW/frontier ou index; R2.2 global reste ouvert.
 
 Le connecteur utilise exclusivement le scope
 `https://www.googleapis.com/auth/gmail.readonly`. Il appelle `list`, `get` en

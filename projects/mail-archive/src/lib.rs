@@ -202,6 +202,26 @@ pub struct RawReference {
     pub blake3: [u8; 32],
 }
 
+/// Physical proof used to salvage one frame which was observed as an orphan.
+///
+/// Coordinates are deliberately part of the proof: `doc_id` is not an
+/// identity for salvage and may be reused by a catalogued frame.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrphanRawReference {
+    pub location: ArchiveLocation,
+    pub frame_bytes: u64,
+    pub doc_id: u64,
+    pub raw_blake3: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrphanRawExport {
+    pub destination: PathBuf,
+    pub manifest: PathBuf,
+    pub raw_bytes: u64,
+    pub raw_blake3: [u8; 32],
+}
+
 /// Opaque token for one RAW append that has not crossed a durable barrier.
 ///
 /// It deliberately exposes neither archive coordinates nor a content digest.
@@ -5766,6 +5786,127 @@ pub fn export_message_eml(root: &Path, doc_id: u64, destination: &Path) -> io::R
     fs::write(destination, raw)
 }
 
+fn orphan_manifest_path(destination: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.manifest", destination.display()))
+}
+
+fn reject_archive_destination(root: &Path, destination: &Path) -> io::Result<()> {
+    let archive = fs::canonicalize(root)?;
+    let parent = destination
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .canonicalize()?;
+    if parent == archive || parent.starts_with(&archive) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "salvage destination must be outside the archive source",
+        ));
+    }
+    Ok(())
+}
+
+/// Export one physically proven orphan without publishing or adopting it.
+///
+/// The archive authority is held for the complete revalidation and read. This
+/// makes the inventory classification and the bytes consumed by the export one
+/// single-writer operation, rather than trusting an old recovery plan.
+pub fn export_orphan_raw(
+    root: &Path,
+    reference: &OrphanRawReference,
+    destination: &Path,
+) -> io::Result<OrphanRawExport> {
+    if reference.frame_bytes != reference.location.frame_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "orphan reference frame length is inconsistent",
+        ));
+    }
+    let manifest = orphan_manifest_path(destination);
+    reject_archive_destination(root, destination)?;
+    reject_archive_destination(root, &manifest)?;
+    if destination.exists() || manifest.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "salvage destination or manifest already exists",
+        ));
+    }
+
+    let _authority = acquire_recovery_authority(root)?;
+    let inventory = inventory_physical(root)?;
+    let frame = inventory
+        .frames
+        .iter()
+        .find(|frame| frame.location == reference.location)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "orphan frame was not found"))?;
+    if frame.doc_id != Some(reference.doc_id)
+        || frame.blake3 != Some(reference.raw_blake3)
+        || !matches!(frame.status, PhysicalFrameStatus::OrphanValidated)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "NotOrphan / Unsafe: frame is no longer OrphanValidated",
+        ));
+    }
+
+    // Read from the same physical reference that was revalidated above. The
+    // reader checks magic, length and FNV; the digest check binds the payload
+    // to the observed inventory proof.
+    let (doc_id, raw) = read_record(&root.join("archive"), &reference.location)?;
+    let digest = *blake3::hash(&raw).as_bytes();
+    if doc_id != reference.doc_id || digest != reference.raw_blake3 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "orphan frame changed after revalidation",
+        ));
+    }
+
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    if let Err(error) = output.write_all(&raw).and_then(|_| output.sync_all()) {
+        drop(output);
+        let _ = fs::remove_file(destination);
+        return Err(error);
+    }
+    drop(output);
+    let manifest_text = format!(
+        "format=memoria-orphan-salvage-manifest-v1\nsegment={}\noffset={}\nframe_bytes={}\ndoc_id={}\nraw_blake3={}\nraw_size={}\nstate=OrphanValidated\n",
+        reference.location.segment,
+        reference.location.offset,
+        reference.frame_bytes,
+        reference.doc_id,
+        blake3::Hash::from_bytes(digest).to_hex(),
+        raw.len()
+    );
+    let mut manifest_file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&manifest)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = fs::remove_file(destination);
+            return Err(error);
+        }
+    };
+    if let Err(error) = manifest_file
+        .write_all(manifest_text.as_bytes())
+        .and_then(|_| manifest_file.sync_all())
+    {
+        drop(manifest_file);
+        let _ = fs::remove_file(&manifest);
+        let _ = fs::remove_file(destination);
+        return Err(error);
+    }
+    Ok(OrphanRawExport {
+        destination: destination.to_path_buf(),
+        manifest,
+        raw_bytes: raw.len() as u64,
+        raw_blake3: digest,
+    })
+}
+
 pub fn sqlite_search(index: &SqliteFtsIndex, query: &str) -> rusqlite::Result<Vec<SearchHit>> {
     let connection = &index.connection;
     let mut statement = connection.prepare(
@@ -6113,6 +6254,69 @@ fn _ordering_is_total(a: f32, b: f32) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type FileSnapshot = (u64, [u8; 32]);
+    type SidecarSnapshot = (String, Option<FileSnapshot>);
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct ArchiveSnapshot {
+        segments: Vec<(String, u64, [u8; 32])>,
+        sqlite: Option<FileSnapshot>,
+        sidecars: Vec<SidecarSnapshot>,
+    }
+
+    fn snapshot_file(path: &Path) -> Option<(u64, [u8; 32])> {
+        fs::read(path)
+            .ok()
+            .map(|bytes| (bytes.len() as u64, *blake3::hash(&bytes).as_bytes()))
+    }
+
+    fn archive_snapshot(root: &Path) -> ArchiveSnapshot {
+        let mut segments = fs::read_dir(root.join("archive"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("arc"))
+            .map(|entry| {
+                let bytes = fs::read(entry.path()).unwrap();
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    bytes.len() as u64,
+                    *blake3::hash(&bytes).as_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        segments.sort_by(|left, right| left.0.cmp(&right.0));
+        ArchiveSnapshot {
+            segments,
+            sqlite: snapshot_file(&root.join("metadata.sqlite")),
+            sidecars: [
+                "metadata.sqlite-wal",
+                "metadata.sqlite-shm",
+                "metadata.sqlite-journal",
+            ]
+            .into_iter()
+            .map(|name| (name.into(), snapshot_file(&root.join(name))))
+            .collect(),
+        }
+    }
+
+    fn external_test_dir(root: &Path, suffix: &str) -> PathBuf {
+        let name = root.file_name().unwrap().to_string_lossy();
+        let directory = root.with_file_name(format!("{name}-{suffix}"));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        directory
+    }
+
+    fn parse_manifest(bytes: &[u8]) -> HashMap<String, String> {
+        let mut fields = HashMap::new();
+        for line in std::str::from_utf8(bytes).unwrap().lines() {
+            let (key, value) = line.split_once('=').expect("manifest key=value");
+            assert!(!key.is_empty());
+            assert!(fields.insert(key.to_owned(), value.to_owned()).is_none());
+        }
+        fields
+    }
 
     fn raw_read_test_root(label: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
@@ -8565,6 +8769,356 @@ mod tests {
         fs::write(&destination, b"keep").unwrap();
         export_message_eml(&root, 8, &destination).unwrap();
         assert_eq!(fs::read(destination).unwrap(), raw);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn export_orphan_raw_is_exact_and_non_destructive() {
+        let root = std::env::temp_dir().join(format!(
+            "atlas-orphan-export-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("archive")).unwrap();
+        create_metadata(&root.join("metadata.sqlite")).unwrap();
+        let raw = b"From: orphan@example.test\r\n\r\nraw bytes\0\xff";
+        let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        let durable = append_durable_raw(&mut writer, 42, raw);
+        let location = durable.reference.location.clone();
+        drop(writer);
+        let frame = inventory_physical(&root)
+            .unwrap()
+            .frames
+            .into_iter()
+            .find(|frame| frame.location == location)
+            .unwrap();
+        assert_eq!(frame.status, PhysicalFrameStatus::OrphanValidated);
+        let reference = OrphanRawReference {
+            location: location.clone(),
+            frame_bytes: location.frame_bytes,
+            doc_id: frame.doc_id.unwrap(),
+            raw_blake3: frame.blake3.unwrap(),
+        };
+        let archive_before = archive_snapshot(&root);
+        let export_dir = external_test_dir(&root, "exports");
+        let output = export_dir.join("salvage.eml");
+        let receipt = export_orphan_raw(&root, &reference, &output).unwrap();
+        assert_eq!(fs::read(&output).unwrap(), raw);
+        assert_eq!(receipt.raw_blake3, *blake3::hash(raw).as_bytes());
+        let manifest = parse_manifest(&fs::read(&receipt.manifest).unwrap());
+        let expected_keys = [
+            "format",
+            "segment",
+            "offset",
+            "frame_bytes",
+            "doc_id",
+            "raw_blake3",
+            "raw_size",
+            "state",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<HashSet<_>>();
+        assert_eq!(
+            manifest.keys().cloned().collect::<HashSet<_>>(),
+            expected_keys
+        );
+        assert_eq!(manifest["format"], "memoria-orphan-salvage-manifest-v1");
+        assert_eq!(manifest["segment"], location.segment);
+        assert_eq!(manifest["offset"], location.offset.to_string());
+        assert_eq!(manifest["frame_bytes"], location.frame_bytes.to_string());
+        assert_eq!(manifest["doc_id"], reference.doc_id.to_string());
+        assert_eq!(
+            manifest["raw_blake3"],
+            blake3::hash(raw).to_hex().to_string()
+        );
+        assert_eq!(manifest["raw_size"], raw.len().to_string());
+        assert_eq!(manifest["state"], "OrphanValidated");
+        assert_eq!(archive_snapshot(&root), archive_before);
+        assert!(!fs::read_to_string(&receipt.manifest)
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("gmail"));
+        let _ = fs::remove_dir_all(export_dir);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn export_orphan_raw_refuses_claimed_frame_and_existing_destination() {
+        let root = std::env::temp_dir().join(format!(
+            "atlas-orphan-refuse-{}-{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("archive")).unwrap();
+        create_metadata(&root.join("metadata.sqlite")).unwrap();
+        let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        let durable = append_durable_raw(&mut writer, 42, b"orphan");
+        let location = durable.reference.location.clone();
+        drop(writer);
+        let frame = inventory_physical(&root).unwrap().frames[0].clone();
+        let reference = OrphanRawReference {
+            location: location.clone(),
+            frame_bytes: location.frame_bytes,
+            doc_id: 42,
+            raw_blake3: frame.blake3.unwrap(),
+        };
+        let catalogue = create_metadata(&root.join("metadata.sqlite")).unwrap();
+        catalogue
+            .execute(
+                "INSERT INTO messages(doc_id,message_id,timestamp,sender,recipients,subject,account,folder,thread,segment,archive_offset,frame_bytes,raw_blake3) VALUES (42,'claimed',0,'','','','','','',?1,?2,?3,?4)",
+                rusqlite::params![location.segment, location.offset as i64, location.frame_bytes as i64, reference.raw_blake3.as_slice()],
+            )
+            .unwrap();
+        drop(catalogue);
+        let archive_before_export = archive_snapshot(&root);
+        let export_dir = external_test_dir(&root, "exports-claim");
+        let output = export_dir.join("salvage.eml");
+        let error = export_orphan_raw(&root, &reference, &output).unwrap_err();
+        assert!(error.to_string().contains("NotOrphan"));
+        assert!(!output.exists());
+        assert!(!output.with_file_name("salvage.eml.manifest").exists());
+        assert_eq!(archive_snapshot(&root), archive_before_export);
+        fs::write(&output, b"keep").unwrap();
+        assert_eq!(
+            export_orphan_raw(&root, &reference, &output)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&output).unwrap(), b"keep");
+        let _ = fs::remove_dir_all(export_dir);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn export_orphan_raw_refuses_stale_digest_and_changed_frame_id() {
+        for (label, field_offset) in [("stale-digest", 32usize), ("stale-frame-id", 8usize)] {
+            let root = raw_read_test_root(label);
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(root.join("archive")).unwrap();
+            create_metadata(&root.join("metadata.sqlite")).unwrap();
+            let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+            let durable = append_durable_raw(&mut writer, 9, b"stale proof");
+            let location = durable.reference.location.clone();
+            drop(writer);
+            let frame = inventory_physical(&root).unwrap().frames[0].clone();
+            let reference = OrphanRawReference {
+                location: location.clone(),
+                frame_bytes: location.frame_bytes,
+                doc_id: 9,
+                raw_blake3: frame.blake3.unwrap(),
+            };
+            let path = root.join("archive").join(&location.segment);
+            let mut bytes = fs::read(&path).unwrap();
+            if label == "stale-digest" {
+                let payload = b"newer proof";
+                assert_eq!(
+                    payload.len(),
+                    (location.frame_bytes - FRAME_HEADER_BYTES) as usize
+                );
+                let start = location.offset as usize;
+                let mut replacement = Vec::new();
+                replacement.extend_from_slice(FRAME_MAGIC);
+                replacement.extend_from_slice(&9u64.to_le_bytes());
+                replacement.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+                replacement.extend_from_slice(&fnv64(payload).to_le_bytes());
+                replacement.extend_from_slice(payload);
+                bytes.splice(start..start + location.frame_bytes as usize, replacement);
+            } else {
+                bytes[location.offset as usize + field_offset] ^= 1;
+            }
+            fs::write(&path, bytes).unwrap();
+            let observed = inventory_physical(&root).unwrap().frames[0].clone();
+            assert_eq!(observed.status, PhysicalFrameStatus::OrphanValidated);
+            if label == "stale-digest" {
+                assert_ne!(observed.blake3.unwrap(), reference.raw_blake3);
+            }
+            let archive_after_mutation = archive_snapshot(&root);
+            let export_dir = external_test_dir(&root, "exports-stale");
+            let output = export_dir.join("stale.eml");
+            assert!(export_orphan_raw(&root, &reference, &output).is_err());
+            assert!(!output.exists());
+            assert!(!output.with_file_name("stale.eml.manifest").exists());
+            assert_eq!(archive_snapshot(&root), archive_after_mutation);
+            let _ = fs::remove_dir_all(export_dir);
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn export_orphan_raw_same_doc_id_exports_only_the_physical_orphan() {
+        let (root, locations, raws) = inventory_fixture("export-same-doc-id");
+        let mut writer = ArchiveWriter::open(&root.join("archive"), 64 * 1024).unwrap();
+        let orphan_raw = b"same doc id but different physical frame";
+        let durable = append_durable_raw(&mut writer, 1, orphan_raw);
+        let orphan_location = durable.reference.location.clone();
+        drop(writer);
+        let frame = inventory_physical(&root)
+            .unwrap()
+            .frames
+            .into_iter()
+            .find(|frame| frame.location == orphan_location)
+            .unwrap();
+        assert_eq!(frame.status, PhysicalFrameStatus::OrphanValidated);
+        let reference = OrphanRawReference {
+            location: orphan_location,
+            frame_bytes: frame.location.frame_bytes,
+            doc_id: frame.doc_id.unwrap(),
+            raw_blake3: frame.blake3.unwrap(),
+        };
+        let export_dir = external_test_dir(&root, "exports-same-doc-id");
+        let output = export_dir.join("same-doc-id.eml");
+        export_orphan_raw(&root, &reference, &output).unwrap();
+        assert_eq!(fs::read(output).unwrap(), orphan_raw);
+        let catalogue = Connection::open(root.join("metadata.sqlite")).unwrap();
+        let stored: Vec<u8> = catalogue
+            .query_row(
+                "SELECT raw_blake3 FROM messages WHERE doc_id=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_slice(), blake3::hash(&raws[1]).as_bytes());
+        let _ = fs::remove_dir_all(export_dir);
+        let _ = fs::remove_dir_all(root);
+        let _ = locations;
+    }
+
+    #[test]
+    fn export_orphan_raw_refuses_every_non_orphan_physical_state() {
+        for (label, expected) in [
+            ("refuse-catalogued", "CataloguedValidated"),
+            ("refuse-inconsistent", "CataloguedInconsistent"),
+            ("refuse-corruption", "PhysicalCorruption"),
+            ("refuse-tail", "IncompleteTail"),
+        ] {
+            let (root, locations, _) = inventory_fixture(label);
+            let location = locations[0].clone();
+            match label {
+                "refuse-catalogued" => {}
+                "refuse-inconsistent" => {
+                    let connection = Connection::open(root.join("metadata.sqlite")).unwrap();
+                    connection
+                        .execute(
+                            "UPDATE messages SET raw_blake3=?1 WHERE doc_id=0",
+                            [vec![0u8; 32]],
+                        )
+                        .unwrap();
+                }
+                "refuse-corruption" => {
+                    let path = root.join("archive").join(&location.segment);
+                    let mut bytes = fs::read(&path).unwrap();
+                    bytes[location.offset as usize + 32] ^= 1;
+                    fs::write(path, bytes).unwrap();
+                }
+                "refuse-tail" => {
+                    let path = root.join("archive").join(&location.segment);
+                    let mut file = OpenOptions::new().append(true).open(path).unwrap();
+                    file.write_all(&[1]).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let inventory = inventory_physical(&root).unwrap();
+            let frame = if label == "refuse-tail" {
+                inventory.frames.last().unwrap()
+            } else {
+                inventory
+                    .frames
+                    .iter()
+                    .find(|frame| {
+                        frame.location.segment == location.segment
+                            && frame.location.offset == location.offset
+                    })
+                    .unwrap()
+            };
+            assert_eq!(
+                format!("{:?}", frame.status).split_whitespace().next(),
+                Some(expected)
+            );
+            let reference = OrphanRawReference {
+                location: frame.location.clone(),
+                frame_bytes: frame.location.frame_bytes,
+                doc_id: frame.doc_id.unwrap_or(0),
+                raw_blake3: frame.blake3.unwrap_or([0; 32]),
+            };
+            let output = root.join("refused.eml");
+            assert!(export_orphan_raw(&root, &reference, &output).is_err());
+            assert!(!output.exists());
+            assert!(!output.with_file_name("refused.eml.manifest").exists());
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn export_orphan_raw_rejects_all_archive_root_destination_aliases() {
+        let root = raw_read_test_root("destination-boundary");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("archive")).unwrap();
+        create_metadata(&root.join("metadata.sqlite")).unwrap();
+        let raw = b"destination boundary orphan";
+        let mut writer = ArchiveWriter::open(&root.join("archive"), 4096).unwrap();
+        let durable = append_durable_raw(&mut writer, 77, raw);
+        let location = durable.reference.location.clone();
+        drop(writer);
+        let inventory = inventory_physical(&root).unwrap();
+        let frame = inventory
+            .frames
+            .iter()
+            .find(|frame| frame.location == location)
+            .unwrap();
+        assert_eq!(frame.status, PhysicalFrameStatus::OrphanValidated);
+        let reference = OrphanRawReference {
+            location: location.clone(),
+            frame_bytes: location.frame_bytes,
+            doc_id: frame.doc_id.unwrap(),
+            raw_blake3: frame.blake3.unwrap(),
+        };
+        let missing_sidecar = root.join("metadata.sqlite-wal");
+        let destinations = [
+            root.join("salvage.eml"),
+            missing_sidecar.clone(),
+            root.join("archive").join("salvage.eml"),
+        ];
+        let archive_before = archive_snapshot(&root);
+        for destination in destinations {
+            let error = export_orphan_raw(&root, &reference, &destination).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error.to_string(),
+                "salvage destination must be outside the archive source"
+            );
+            assert!(!destination.exists());
+            assert!(!orphan_manifest_path(&destination).exists());
+        }
+        assert!(!missing_sidecar.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let alias = root.parent().unwrap().join(format!(
+                "{}-alias",
+                root.file_name().unwrap().to_string_lossy()
+            ));
+            symlink(&root, &alias).unwrap();
+            let destination = alias.join("aliased.eml");
+            let error = export_orphan_raw(&root, &reference, &destination).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(
+                error.to_string(),
+                "salvage destination must be outside the archive source"
+            );
+            assert!(!destination.exists());
+            let _ = fs::remove_file(alias);
+        }
+        assert_eq!(archive_snapshot(&root), archive_before);
+        let export_dir = external_test_dir(&root, "destination-positive");
+        let output = export_dir.join("salvage.eml");
+        let receipt = export_orphan_raw(&root, &reference, &output).unwrap();
+        assert_eq!(fs::read(output).unwrap(), raw);
+        assert!(receipt.manifest.exists());
+        let _ = fs::remove_dir_all(export_dir);
         let _ = fs::remove_dir_all(root);
     }
 
