@@ -419,6 +419,10 @@ Cette décision est conceptuelle. Elle n'adopte aujourd'hui :
 - aucun trait Rust universel ;
 - aucune interface provider imposée aux sources futures.
 
+La conception persistante concrète, les tables proposées et la migration
+v1 sont spécifiées dans [`M1-PERSISTENCE.md`](M1-PERSISTENCE.md). Ce document
+reste l'autorité du modèle conceptuel; M1 ne le remplace pas.
+
 ## 12. Évolution du schéma
 
 Une future évolution du catalogue doit :

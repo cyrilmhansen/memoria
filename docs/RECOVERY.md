@@ -216,6 +216,27 @@ Un conflit après append durable peut laisser une nouvelle frame
 `OrphanValidated`. C'est un mode de panne sûr : le RAW existe sans fausse
 publication.
 
+Avec M1, un re-fetch réussi ne réutilise pas la claim physique historique.
+Même lorsque les octets ont le digest historique attendu, l'append crée un
+nouveau `raw_record_id`. La publication est un compare-and-swap sur le lien
+courant de l'occurrence (la valeur attendue est l'ancien `raw_record_id`),
+suivi dans la même transaction single-writer par la relation de remplacement
+typée du provider. Cette transaction met aussi à jour
+`messages.raw_record_id` et chaque projection descriptive/current-RAW requise
+vers le nouveau `raw_record_id`, avant son commit. Il n'existe donc aucun état
+commis où le lien provider courant désigne le nouveau RAW tandis que les
+chemins normaux du catalogue désignent encore l'ancien. L'ancien claim
+physique reste représenté comme historique et le nouveau devient le lien
+courant. Si le compare-and-swap échoue, la transaction est annulée et seule la
+nouvelle frame durable subsiste comme `OrphanValidated`; aucune adoption ou
+substitution implicite n'est permise. Les valeurs current-RAW des tables de
+présentation sont des projections dérivées : elles ne peuvent ni remplacer
+ni reconstruire l'autorité provider. Une incohérence impose un échec fermé ou
+une reconstruction explicitement contractée depuis l'occurrence provider
+typée, jamais une inférence par similarité. Le `acquisition_id` immuable de
+l'occurrence n'est pas écrasé : l'acquisition de re-fetch est celle du nouveau
+RAW et de la transition de remplacement.
+
 ## 6. R2.2 — Salvage/export des orphelins
 
 ### R2.2a — Export byte-exact d'un `OrphanValidated` — fermé
@@ -300,9 +321,16 @@ implicitement :
 - un relink catalogue ;
 - une reconstruction de provenance.
 
-M1 doit conserver séparément les assertions prouvées, déclarées, observées,
-dérivées et inconnues. Une assertion inconnue ne doit ni effacer une assertion
-forte déjà prouvée, ni être promue en preuve par agrégation.
+M1 doit conserver séparément les faits directement attestés par un contrat
+provider, les attributs observés, les projections dérivées et les dimensions
+inconnues. Une absence ou un champ nullable ne doit ni effacer une identité
+forte déjà attestée, ni être promu en preuve par agrégation. Les provenances
+déclarées ou intermédiaires ne seront persistées dans une structure typée que
+lorsqu'un producteur concret en démontrera le contrat.
+
+La persistance concrète de ces qualifications et sa migration sont spécifiées dans
+[`M1-PERSISTENCE.md`](M1-PERSISTENCE.md). Elle ne crée aucune nouvelle action
+R2 et ne modifie pas la frontière read-only de R1.
 
 ## 8. R2.4 — Cleanup des tails incomplètes
 

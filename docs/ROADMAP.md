@@ -119,8 +119,10 @@ inventaire/R1, single-writer).
 - persistance d'un RAW partiellement documenté ≠ publication source, adoption
   ou relink.
 
-**Question principale :** évolution versionnée du catalogue, modèle auxiliaire
-ou combinaison explicite des deux.
+La conception versionnée du catalogue retenue, avec séparation entre RAW,
+acquisitions, occurrences provider et présentation, est documentée dans
+[`M1-PERSISTENCE.md`](M1-PERSISTENCE.md); son existence ne vaut pas encore
+implémentation.
 
 **Exit criterion :** format/migration, invariants, compatibilité et tests
 d'interruption sont spécifiés avant implémentation.
