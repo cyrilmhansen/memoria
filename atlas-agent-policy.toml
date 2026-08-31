@@ -18,8 +18,8 @@ codex_profile_web = "atlas-luna-web"
 codex_binary_sha256 = "5e841fe3f20e1649a0dc9ec144a73f56a6f62bb7e566a479dc46413d36d41524"
 codex_config_sha256 = "8680ff2454a4e2b954797d59308267e443a2565f1e8754c69a6707cc30c313ce"
 codex_catalog_sha256 = "757d35035ef92b7318dbfd4eb43fe2602bbc61cb32c1aad1398125d16058b439"
-codex_profile_local_sha256 = "95b431fe9acfd4e5bc733798215a5bf587e77d5502d97514687dd7fe54e92c98"
-codex_profile_web_sha256 = "6d1d9ab0ad4875eff3f4e928549890fe7baf35fbfff6236ee319ebd3f80b5d02"
+codex_profile_local_sha256 = "6c82760bcf5314354b29c63217529a6ff8693b2a82b957d315a17422a2ae6667"
+codex_profile_web_sha256 = "d5259782d10c4484aa75782cea2e6d6fb5cd84c6eb2a2f1d1fa3d423f3d8e942"
 
 [profiles.patch_review]
 executor = "codex"
@@ -35,8 +35,8 @@ codex_profile_web = "atlas-sol-web"
 codex_binary_sha256 = "5e841fe3f20e1649a0dc9ec144a73f56a6f62bb7e566a479dc46413d36d41524"
 codex_config_sha256 = "8680ff2454a4e2b954797d59308267e443a2565f1e8754c69a6707cc30c313ce"
 codex_catalog_sha256 = "757d35035ef92b7318dbfd4eb43fe2602bbc61cb32c1aad1398125d16058b439"
-codex_profile_local_sha256 = "857854d85b6987f59de6dc7cc68dc7376390c8fcd1cdec2f5c5cbcafb7150fb7"
-codex_profile_web_sha256 = "d01699afd71ed9d6e85a44b70d6e0ead3240add0cab61d04a2b61d1d793b61fa"
+codex_profile_local_sha256 = "16e3772748abc22655180d86e78bdf277a9510cd7249f6ef861de297fe5bcb25"
+codex_profile_web_sha256 = "43035a5f3ecb77673fabc3e472c37bd8aa8610ef78174f329ef5728d5024f321"
 
 [profiles.state_audit]
 executor = "codex"
@@ -52,8 +52,8 @@ codex_profile_web = "atlas-sol-web"
 codex_binary_sha256 = "5e841fe3f20e1649a0dc9ec144a73f56a6f62bb7e566a479dc46413d36d41524"
 codex_config_sha256 = "8680ff2454a4e2b954797d59308267e443a2565f1e8754c69a6707cc30c313ce"
 codex_catalog_sha256 = "757d35035ef92b7318dbfd4eb43fe2602bbc61cb32c1aad1398125d16058b439"
-codex_profile_local_sha256 = "857854d85b6987f59de6dc7cc68dc7376390c8fcd1cdec2f5c5cbcafb7150fb7"
-codex_profile_web_sha256 = "d01699afd71ed9d6e85a44b70d6e0ead3240add0cab61d04a2b61d1d793b61fa"
+codex_profile_local_sha256 = "16e3772748abc22655180d86e78bdf277a9510cd7249f6ef861de297fe5bcb25"
+codex_profile_web_sha256 = "43035a5f3ecb77673fabc3e472c37bd8aa8610ef78174f329ef5728d5024f321"
 
 [profiles.checkpoint]
 executor = "manual"
