@@ -5,93 +5,103 @@ email. The current product path is centered on Gmail, with a strict read-only
 connector and a local archive that remains usable without a network
 connection.
 
-The project is still under active development. It is a functional desktop
+The project is under active development. It is a functional desktop
 application, not yet a stabilized end-user release.
 
-## What it does
+## Product model
 
-Memoria is designed around a conservative rule: the original MIME/RAW message
-is the local source of truth. Search indexes, catalogues and rendered views are
-derived data that can be rebuilt or replaced without rewriting the archived
-message.
+Memoria follows a conservative authority model:
 
-The current end-to-end workflow is:
+> the original MIME/RAW bytes are the local byte authority; acquisition and
+> provenance are recorded separately; parsing, search and presentation remain
+> derived unless explicitly defined otherwise.
+
+The current product path is:
 
 ```text
-Gmail (read-only)
-      │
-      ▼
-RAW MIME archive  ← durable local source of truth
-      │
-      ├── SQLite catalogue
-      ├── Tantivy search index
-      │
-      ▼
+Gmail / IMAP / future import sources
+              │
+              ▼
+       acquisition module
+              │
+              ▼
+RAW MIME archive  ← byte-exact local authority
+              │
+              ├── SQLite catalogue
+              │      mixed authority:
+              │      physical coordinates, source identities,
+              │      source state and navigation metadata
+              │
+              ├── Tantivy search index
+              │      derived / rebuildable
+              │
+              ▼
 Memoria desktop UI / Slint
-      │
-      ├── system thumbnail services
-      └── system browser for sanitized HTML
+              │
+              ├── MIME parsing and attachment extraction
+              ├── system thumbnail / text-extraction helpers
+              └── system browser for sanitized HTML
 ```
 
-The goal is durable local archiving and fast local search. The RAW archive is
-the byte authority; the SQLite catalogue has mixed authority, while search
-indexes and rendered views are derived. Individual and batch
-byte-exact EML export are available; complete restoration or provider migration
-remain future work. Gmail is never treated as a writable target by the current
-connector.
+A persisted field is not automatically authoritative. The conceptual model for
+sources, acquisition and provenance is defined in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Current features
 
 - Create or open a Memoria archive from the desktop UI.
 - Remember recently used archives and local source configuration between runs.
 - Synchronize one Gmail source from the UI without blocking the interface.
-- Perform an initial full synchronization, then incremental synchronization
-  through Gmail history and reconciliation when needed.
+- Perform an initial full Gmail synchronization, then incremental
+  synchronization through Gmail history and reconciliation when needed.
 - Keep locally archived RAW messages when a message is later deleted at Gmail;
-  the source state is updated in the catalogue instead.
-- Show synchronization progress, newly archived message counts and the
-  subsequent Tantivy index update as separate phases.
-- Search the archive with free text and structured filters for sender,
-  recipient, date range, attachment presence, attachment MIME and Gmail
-  labels. Filters combine with AND semantics.
-- Sort filter-only searches by newest message first; textual searches use
-  Tantivy/BM25 ranking.
+  source state changes do not erase the local reference bytes.
+- Show synchronization progress and the subsequent derived Tantivy index update
+  as separate phases.
+- Search with free text and structured filters for sender, recipient, date,
+  attachment presence/type and Gmail labels.
+- Sort filter-only searches by newest first; textual searches use Tantivy/BM25.
 - Read messages in an integrated text reader and inspect their metadata.
-- List attachments on demand from the archived MIME, then open them with the
-  associated desktop application or save them through a native dialog.
-- Export an individual message or the displayed search results as byte-exact
-  EML files.
-- Request image and PDF previews through desktop thumbnail services when
-  available.
+- List attachments on demand from the archived RAW, then open or save them
+  through desktop integration.
+- Export individual messages or displayed search results as byte-exact EML.
+- Request image/PDF previews through desktop thumbnail services when available.
+- Index supported attachment text as derived search data: `text/*` internally,
+  PDF through the optional Linux provider, and PDF/DOCX through registered
+  Windows IFilter support where available.
+- Open sanitized HTML mail in the system browser without bundling a browser
+  engine.
 - Use French or English UI text according to the system locale, with Slint
   accessibility and keyboard navigation enabled.
-- Import IMAP readonly mailboxes, including multiple mailboxes, through the
-  experimental CLI; this is not integrated into the product UI workflow.
+- Import multiple IMAP mailboxes through the experimental read-only CLI. IMAP
+  is not yet integrated into the normal desktop source workflow.
 
-## Architecture
+## Architecture and authority
 
 The Rust archive/search API is independent from Slint. The UI controller calls
-the same archive and synchronization logic used by the experimental command
-line tools; it does not start a CLI subprocess.
+the same archive and synchronization logic used by experimental command-line
+tools; it does not launch a CLI subprocess.
 
-- The archive is append-only and segmented. Each validated frame contains the
-  original message bytes.
-- SQLite is a mixed-authority catalogue: it stores Tier A coordinates,
-  identities and provenance needed for lookup and reconciliation, alongside
-  mutable source state and derived navigation metadata. It is not itself the
-  byte authority and is not wholly disposable in the current design.
-- Tier A writing is single-writer enforced. `ArchiveWriter` acquires one
-  exclusive OS file lock for the logical archive before opening or creating
-  RAW segments or the RW catalogue; a competing writer fails with
-  `ArchiveAlreadyLocked`. The lock is released automatically on normal drop or
-  process crash, and belongs to the session authority rather than only the
-  RAW writer. Multiwriter is deliberately unsupported.
-- Tantivy stores a derived, reconstructible search index. Its schema may evolve
-  independently from the RAW archive.
-- MIME parsing, text extraction, attachment listing and HTML rendering are
-  derived operations. They never replace the RAW representation.
-- System thumbnail helpers and the system browser are optional presentation
-  integrations. Their failure must not make the archive unreadable.
+- The RAW archive is append-only and segmented. Each validated frame contains
+  the original message bytes.
+- The logical conservation unit is the individual validated RAW record, not the
+  segment that happens to contain it.
+- SQLite is a **mixed-authority** catalogue. It contains Tier A coordinates,
+  identities and provenance together with mutable source state and lower
+  authority navigation data. It is neither the byte authority nor wholly
+  disposable in the current design.
+- Tier A mutation is **single-writer enforced; multiwriter deliberately
+  unsupported**. Competing writers are rejected by an OS-backed archive lock.
+- Tantivy, parsed MIME, extracted text, rendered HTML, previews, ranking and UI
+  views are derived Tier B/C data. Their failure must not rewrite or replace
+  the authoritative RAW.
+- Source modules may attest only facts they can actually observe or verify.
+  MIME `Message-ID`, sender, subject and similar content are observed message
+  content, not automatically acquisition provenance.
+
+The stable authority boundaries are documented in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and the assurance requirements in
+[`docs/ASSURANCE.md`](docs/ASSURANCE.md).
 
 ## Gmail access and privacy
 
@@ -101,17 +111,99 @@ Gmail access uses the OAuth desktop flow and the single scope:
 https://www.googleapis.com/auth/gmail.readonly
 ```
 
-The connector lists messages, downloads them with Gmail `format=RAW`, stores
-the decoded RFC/MIME bytes, and keeps Gmail message/thread/label/history
-metadata separately in SQLite. A later synchronization refreshes source
-metadata and archives only messages that are not already known by the stable
-`source/account + Gmail message id` identity.
+The current Gmail connector lists messages, downloads them with Gmail
+`format=RAW`, stores the decoded RFC/MIME bytes and records Gmail-specific
+identity/state separately from the RAW payload.
 
 The application does not delete, trash, modify, label, send, insert or import
-anything into Gmail. OAuth client credentials and user tokens stay outside the
-archive and are never committed to the repository. Memoria does not ship a
-project OAuth client secret: developers must provide their own Google Desktop
-OAuth credentials locally.
+anything into Gmail. A future restoration or migration connector with write
+capability must be a separate, explicitly authorized capability rather than an
+extension of the current read-only contract.
+
+OAuth client credentials and user tokens stay outside the archive and are not
+committed to the repository. Memoria does not ship a project OAuth client
+secret; developers provide their own local Google Desktop OAuth credentials.
+
+The security threat model and credential/network boundaries are defined in
+[`docs/SECURITY.md`](docs/SECURITY.md).
+
+## HTML mail and attachments
+
+The integrated reader remains text-first. When a message has a suitable HTML
+part, **Open HTML** opens a sanitized document in the user's default system
+browser.
+
+The HTML view is served by an ephemeral localhost server bound only to
+`127.0.0.1` on an OS-selected port. Sessions are bounded; opaque session and
+resource tokens protect routes. Embedded `cid:` resources are served locally
+from the current MIME message. Automatic HTTP/HTTPS resource loading is
+blocked. Scripts, event handlers, forms, iframes and objects are neutralized,
+and a strict CSP is applied.
+
+Attachments are treated as untrusted content. Opening or saving one is an
+explicit user action. Temporary extraction and external thumbnail/text helpers
+remain derived operations and do not gain authority over the RAW archive.
+
+No WebKit, WebView2, WebKitGTK, QtWebEngine or Chromium engine is bundled into
+Memoria.
+
+## Recovery and integrity status
+
+Recovery is evidence-driven. Ambiguity is preserved as ambiguity rather than
+converted into authority by heuristics.
+
+The currently closed baseline includes:
+
+- validated authoritative RAW reads;
+- non-destructive use of partially damaged archives;
+- coherent publication of source identity/provenance;
+- RAW durability before catalogue/source publication;
+- Gmail frontier consistency;
+- physical inventory and orphan/contradiction classification;
+- enforced single-writer authority;
+- **R1** read-only recovery planning;
+- **R2.1a** exact Gmail re-fetch;
+- **R2.1b** exact IMAP re-fetch;
+- **R2.2a** byte-exact export of a validated orphan RAW.
+
+Exact source re-fetch requires the provider-specific durable identity and the
+historical RAW digest to match; a source returning different bytes does not
+silently replace the expected historical RAW. Recovery does not implicitly
+advance source frontiers or become a synchronization operation.
+
+R2 remains reserved for bounded recovery actions. The broader persistent
+acquisition/provenance model is tracked separately as **M1**, because it also
+serves normal acquisition and future EML/MBOX/Outlook/MailStore-style imports.
+Its provenance categories are composable per assertion rather than one global
+`provenance_level` for a message.
+
+Incomplete-tail cleanup, catalogue relink, catalogue-loss reconstruction and a
+complete recovery UI remain future work.
+
+The normative recovery contracts are in
+[`docs/RECOVERY.md`](docs/RECOVERY.md). The general conservation guarantees and
+closed assurance baseline are in [`docs/ASSURANCE.md`](docs/ASSURANCE.md).
+
+## Search
+
+The search API accepts a structured request rather than a Gmail-like query
+string. It supports:
+
+- free text in indexed message fields;
+- sender and recipient fragments;
+- calendar-date ranges;
+- attachment presence;
+- exact MIME types and MIME families such as `image/*`;
+- labels already present in the archive.
+
+Supplied constraints combine with AND semantics. Selecting several labels
+requires all of them. Filter-only searches are ordered by date; textual
+searches use BM25 ranking. An empty text query without filters intentionally
+does not load the entire archive.
+
+The structured-search path has been exercised with a deterministic synthetic
+corpus at million-message scale. Measurements and failed approaches remain in
+`experiments/` rather than in this README.
 
 ## Building and running
 
@@ -122,148 +214,45 @@ cargo build --release -p mail-archive-experiment --bin mail-archive-app
 cargo test --workspace
 ```
 
-To open an existing archive directly:
+Open an existing archive directly:
 
 ```bash
 target/release/mail-archive-app --archive /path/to/archive
 ```
 
-Memoria can also start without `--archive`:
+Or start without an explicit archive:
 
 ```bash
 target/release/mail-archive-app
 ```
 
-It reopens a valid recent archive when one is configured. Otherwise it shows
-actions to open an existing archive or create a new empty one. An archive is
-recognized by its Memoria metadata catalogue and archive directory; invalid
-folders are not initialized implicitly.
+Memoria reopens a valid recent archive when configured. Otherwise it offers to
+open an existing archive or create a new one. Invalid folders are not silently
+initialized as archives.
 
 The UI can select a local Google Desktop OAuth credentials JSON file when the
-user explicitly chooses **Add Gmail account**. The token directory is kept in
-the standard user configuration area and outside the archive. No real
-credentials belong in this repository.
-
-The package also contains experimental command-line tools for corpus
-generation, Gmail reporting, indexing and thumbnail probing. Their detailed
-usage belongs in the experiment reports rather than this introduction.
-
-## Desktop integration
-
-Memoria uses Slint with the Winit backend, software rendering and accessibility
-enabled. It does not embed a web browser engine.
-
-For attachment previews, the application asks desktop thumbnail services from
-a background task with a timeout. On KDE/Linux it tries the small KIO helper
-and then the freedesktop thumbnail backend; no Qt or KF6 library is linked into
-the main Memoria binary. Providers are optional and an unavailable preview
-does not remove the **Open** or **Save as** actions.
-
-Opening an attachment uses the operating system association API. Temporary
-extraction files are private to the Memoria process and are removed with the
-session store when the application exits.
-
-## Search
-
-The search API accepts a structured request rather than encoding advanced
-filters into a Gmail-like query string. It supports:
-
-- free text in the indexed message fields;
-- sender and recipient fragments;
-- date ranges entered as calendar dates;
-- all, with attachments or without attachments;
-- exact MIME filters such as `application/pdf` and MIME families such as
-  `image/*`;
-- labels already present in the archive.
-
-All supplied constraints are ANDed. Selecting several labels requires all of
-those labels for the first product version. An empty text query without filters
-intentionally does not load the entire archive.
-
-The structured search implementation has been exercised with a deterministic
-synthetic corpus at million-message scale; measurements and limits are recorded
-under `experiments/`.
-
-## HTML mail and attachments
-
-The integrated reader remains text-first. When a message has a suitable HTML
-part, **Open HTML** opens the sanitized document in the user's default system
-browser.
-
-The HTML view is served by an ephemeral localhost server scoped to the Memoria
-process, bound only to `127.0.0.1` on an OS-selected port. Its sessions are
-bounded and expire; opaque session and resource tokens protect the routes.
-Embedded `cid:` resources are served locally from the MIME message, including
-their MIME type. Automatic HTTP/HTTPS image loading is blocked. Scripts, event
-handlers, forms, iframes and objects are neutralized, and a strict CSP is
-applied. No WebKit, WebView2, WebKitGTK, QtWebEngine or Chromium engine is
-bundled into Memoria.
-
-Attachments are extracted only when requested from the authoritative RAW for
-opening/saving. During a derived Tantivy rebuild, `text/*` attachment parts
-and supported document attachments are also processed for search: text parts
-are decoded internally. On Linux, PDFs use the optional `pdftotext` provider;
-DOCX is not supported. On Windows, PDF and DOCX use the registered system
-IFilter through an isolated helper. Word COM Automation is not a Memoria
-dependency.
-Extracted text is never stored as a second authoritative attachment copy.
-
-## Storage and reconstruction model
-
-The RAW archive is authoritative and append-only. Tantivy and rendered/search
-views are derived. SQLite is a mixed-authority catalogue, as described above:
-
-- A2.1 inventories RAW/catalogue records read-only and A2.2 reconstructs
-  derived Tantivy state without truncating RAW segments; an incomplete tail is
-  reported without modifying the archive;
-- a missing or incompatible Tantivy index can be reconstructed from the RAW
-  archive and catalogue;
-- Gmail source deletion changes local source metadata but does not erase the
-  archived RAW message;
-- attachment parsing, HTML rendering and previews can fail independently
-  without changing the archived bytes.
-
-These are the diagnostic and reconstruction capabilities currently implemented
-and exercised. They
-do not claim all Tier A guarantees defined in
-[`ASSURANCE.md`](ASSURANCE.md), including complete crash-consistency,
-physical repair, central-corruption recovery, complete product operation from
-an arbitrarily damaged partial archive, or a multi-writer contract.
-
-The archive is intentionally not a mirror that destructively follows Gmail.
-Content-addressed attachment storage was evaluated separately and is not
-adopted in the current RAW-inline authority path.
-
-Readers do not acquire the archive writer lock and may run while a writer
-exists. `archive_summary`, inventory and physical RAW inspection are strict
-read-only; some legacy catalogue-backed search/RAW helpers still open SQLite
-through the existing RW runtime configuration, but do not obtain RAW-write
-authority. The persistent lock file is only a rendezvous point; the OS lock is
-authoritative and remains outside the resettable archive subtree. Linux/Unix
-and macOS use the platform file-lock
-primitive through `fs4`, and Windows uses `LockFileEx` through the same crate.
-This is a local-filesystem guarantee, not a distributed NFS/SMB protocol, and
-rename of an archive while it is in use is outside the contract.
+user explicitly chooses **Add Gmail account**. Tokens remain in the normal user
+configuration area outside the archive.
 
 ## Current platform status
 
 ### Linux / KDE Wayland
 
 The main desktop workflow has been exercised on Linux/KDE Wayland, including
-search, keyboard navigation, archive/synchronization views, attachment
-actions, system previews and browser-based HTML opening.
+search, keyboard navigation, archive/synchronization views, attachment actions,
+system previews and browser-based HTML opening.
 
 ### Windows x86-64
 
-The same crate and Slint sources build for Windows x86-64 MSVC. The repository
-contains the native GitHub Actions workflow and standard/static CRT build
-artifacts. Cross-build and CI build paths are available; native Windows
-validation of menus, HiDPI, UI Automation, native dialogs, OAuth and the full
-interactive workflow still needs to be performed on a real Windows machine.
+The same crate and Slint sources build for Windows x86-64 MSVC. Native GitHub
+Actions build paths exist, including the Windows document-extraction helper
+path. Full native validation of menus, HiDPI, UI Automation, dialogs, OAuth and
+the interactive workflow still needs to be completed on a real Windows
+machine.
 
-macOS and Windows 7 are not currently supported targets.
+macOS and Windows 7 are not current supported product targets.
 
-## Development / tests
+## Development and tests
 
 The normal workspace checks are:
 
@@ -274,64 +263,69 @@ cargo check --workspace
 git diff --check
 ```
 
-The tests use deterministic fixtures for archive frames, MIME parsing,
-structured search, Gmail transport behavior, synchronization state, HTML/CID
-sanitization, configuration and UI/controller logic. Real Gmail data is used
+Tests use deterministic fixtures for archive frames, MIME parsing, search,
+Gmail/IMAP transport behavior, synchronization state, recovery, HTML/CID
+sanitization, configuration and UI/controller logic. Real mail data is used
 only locally for offline validation and is not part of the repository.
 
 ## Project documentation
 
-The repository keeps the durable memory separate from detailed experiments:
+The repository separates current product description, authority documents,
+durable knowledge and experimental evidence:
 
 ```text
-AGENTS.md                         working rules and experiment discipline
-KNOWLEDGE.md                      durable facts and architectural conclusions
-WORKLOG.md                        lightweight development journal
+README.md                         current product state and user-visible limits
+
+docs/AGENTS.md                   working rules and documentation routing
+docs/ARCHITECTURE.md             conceptual model and authority boundaries
+docs/ASSURANCE.md                A/B/C criticality and conservation guarantees
+docs/SECURITY.md                 security threat model and capability policy
+docs/RECOVERY.md                 recovery evidence, states and bounded actions
+docs/ROADMAP.md                  priorities and dependencies
+docs/KNOWLEDGE.md                durable verified technical facts
+
+WORKLOG.md                        lightweight development history
 experiments/                      measurements, probes and detailed reports
 projects/mail-archive/            current Memoria implementation
 ```
 
-`KNOWLEDGE.md` is deliberately concise. The reports under `experiments/` hold
-the measurements, failed attempts and reproducible commands that support its
-conclusions.
+The specialized documents are authoritative for their own domain. Durable
+facts belong in `docs/KNOWLEDGE.md`; detailed measurements, failed attempts and
+reproducible probes belong in `experiments/`.
 
 ## Roadmap
 
-The next product questions are deliberately limited to durable archive use:
+The current planning horizons are deliberately compact:
 
-- extend bounded attachment-text indexing beyond the current text/*, PDF and
-  DOCX support, starting with formats justified by the real corpus;
-- consider automatic/background synchronization after the manual workflow is
-  stable;
-- support complete restoration and Gmail-to-Gmail migration workflows;
-- validate and package the native Windows desktop workflow;
-- support multiple Gmail accounts in the product UI;
-- add additional local sources such as MBOX when their requirements are known;
-- improve long-term offline retention and recovery operations.
+```text
+NOW    stabilize source/acquisition/provenance boundaries and specify M1
+NEXT   finish the minimum recovery product and local imports
+THEN   background synchronization, backup, restoration and migration
+LATER  storage optimization, richer extraction/search and broader platforms
+```
 
-Le chantier R1 dispose d'une politique de recovery conservatrice et d'une
-commande `recovery-plan` read-only ; aucune réparation physique ou
-reconstruction de provenance n'est encore promise.
-
-These are future directions, not current promises.
+Near-term work therefore focuses first on the persistent acquisition/provenance
+model and honest representation of partially known provenance, then on bounded
+recovery actions and local source imports. The detailed priority order and exit
+criteria live in [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 ## Current limitations
 
-- Gmail is the primary source integrated into the product UI today. IMAP
-  readonly multi-mailbox import exists as an experimental CLI capability, but
-  other providers are not integrated into the UI workflow.
-- There is no complete restoration or write-back workflow to Gmail; individual
-  and batch byte-exact EML export are already available.
-- Attachment text indexing currently covers text/* parts, PDF where the
-  platform provider is available, and DOCX through the registered Windows
-  IFilter. Linux DOCX and other Office formats are not indexed; there is no
-  OCR or semantic attachment search.
+- Gmail is the primary source integrated into the desktop UI. IMAP read-only
+  multi-mailbox import exists only through the experimental CLI.
+- EML/MBOX/Outlook/MailStore-style sources are represented in the conceptual
+  architecture but are not current product integrations.
+- There is no complete restoration or write-back workflow to Gmail or another
+  provider.
+- Recovery does not yet include destructive tail cleanup, general catalogue
+  relink, full catalogue-loss reconstruction or a complete recovery UI.
+- Attachment text indexing is provider/platform dependent; there is no OCR or
+  semantic attachment search.
 - Thumbnail support depends on desktop providers installed on the machine.
 - Active HTML and automatic remote resources are intentionally disabled.
 - The Windows build path exists, but native Windows UX/OAuth validation remains
-  open.
+  incomplete.
 - Memoria is not yet a stabilized release with a packaged installer or signed
   distribution.
-- The archive contract is `single-writer enforced; multiwriter deliberately
-  unsupported`. A second writer can reopen after the first writer drops or its
-  process exits; stale lock files do not require manual removal.
+- The archive contract is local-filesystem single-writer; distributed NFS/SMB
+  multiwriter behavior is outside the current contract.
