@@ -10,20 +10,20 @@ Pour un travail normal, lire dans cet ordre :
 
 1. `AGENTS.md`
 2. `README.md`
-3. `ARCHITECTURE.md`
+3. `docs/ARCHITECTURE.md`
 
 Puis charger uniquement les autorités nécessaires au travail :
 
 - **Tier A, stockage, acquisition, intégrité, publication :**
-  `ASSURANCE.md`
+  `docs/ASSURANCE.md`
 - **recovery, corruption, salvage, relink :**
-  `ASSURANCE.md` puis `RECOVERY.md`
+  `docs/ASSURANCE.md` puis `docs/RECOVERY.md`
 - **HTML, pièces jointes, réseau, credentials, helpers externes, privacy :**
-  `SECURITY.md`
+  `docs/SECURITY.md`
 - **sélection/cadrage du prochain chantier :**
-  `ROADMAP.md`
+  `docs/ROADMAP.md`
 - **faits techniques déjà établis :**
-  `KNOWLEDGE.md`
+  `docs/KNOWLEDGE.md`
 - **chronologie ou ancienne décision précise :**
   `WORKLOG.md`
 - **mesures, probes et échecs expérimentaux :**
@@ -31,7 +31,7 @@ Puis charger uniquement les autorités nécessaires au travail :
 
 `WORKLOG.md` ne doit pas être lu intégralement par défaut.
 
-`KNOWLEDGE.md` est une carte de faits, pas l'autorité de politique lorsqu'un
+`docs/KNOWLEDGE.md` est une carte de faits, pas l'autorité de politique lorsqu'un
 document spécialisé existe.
 
 ## 2. Hiérarchie documentaire
@@ -39,15 +39,15 @@ document spécialisé existe.
 Les responsabilités sont :
 
 ```text
-README.md         état produit réellement disponible
-ARCHITECTURE.md   modèle conceptuel et frontières d'autorité
-ASSURANCE.md      criticité A/B/C et garanties de conservation
-SECURITY.md       threat model et capacités de sécurité
-RECOVERY.md       preuves, états et actions de recovery
-ROADMAP.md        priorités et dépendances
-KNOWLEDGE.md      faits techniques durables
-WORKLOG.md        historique
-experiments/      preuves détaillées, mesures et probes
+README.md                   état produit réellement disponible
+docs/ARCHITECTURE.md        modèle conceptuel et frontières d'autorité
+docs/ASSURANCE.md           criticité A/B/C et garanties de conservation
+docs/SECURITY.md            threat model et capacités de sécurité
+docs/RECOVERY.md            preuves, états et actions de recovery
+docs/ROADMAP.md             priorités et dépendances
+docs/KNOWLEDGE.md           faits techniques durables
+WORKLOG.md                  historique
+experiments/                preuves détaillées, mesures et probes
 ```
 
 Lorsqu'une information est dupliquée, préférer l'autorité spécialisée et
@@ -75,7 +75,7 @@ architecturale.
 Ne pas ajouter une abstraction commune simplement parce que plusieurs sources
 ou projets pourraient hypothétiquement en avoir besoin.
 
-Le modèle source/acquisition/provenance de `ARCHITECTURE.md` est conceptuel. Il
+Le modèle source/acquisition/provenance de `docs/ARCHITECTURE.md` est conceptuel. Il
 ne constitue pas une instruction pour créer immédiatement :
 
 - un trait Rust universel ;
@@ -106,10 +106,10 @@ Ne pas confondre :
 - reproductibilité ;
 - méthodologie de développement.
 
-Une mesure de sécurité doit correspondre au threat model de `SECURITY.md`.
+Une mesure de sécurité doit correspondre au threat model de `docs/SECURITY.md`.
 
 Une mesure Tier A doit correspondre aux conséquences de perte, corruption ou
-substitution décrites dans `ASSURANCE.md`.
+substitution décrites dans `docs/ASSURANCE.md`.
 
 Ne pas ajouter un mécanisme coûteux uniquement parce qu'il est techniquement
 possible.
@@ -129,7 +129,7 @@ Ne jamais justifier une réparation Tier A uniquement par :
 - proximité ;
 - index dérivé.
 
-Consulter `RECOVERY.md` avant toute modification d'un chemin de recovery.
+Consulter `docs/RECOVERY.md` avant toute modification d'un chemin de recovery.
 
 ## 7. Expériences
 
@@ -143,7 +143,7 @@ Enregistrer dans `experiments/` :
 - hypothèses testées ;
 - références externes.
 
-Promouvoir dans `KNOWLEDGE.md` seulement les conclusions qui ont une conséquence
+Promouvoir dans `docs/KNOWLEDGE.md` seulement les conclusions qui ont une conséquence
 réutilisable.
 
 ## 8. Validation
